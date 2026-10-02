@@ -58,6 +58,11 @@ export interface CsmCaseRow {
   /** Affected WSO2 product (e.g. "WSO2 Identity Server"). Used for list filtering. */
   product: string;
   /**
+   * Catalogue name (`deployedProduct.product.name`), without the version the
+   * display label appends. The GitHub repo lookup prefers this.
+   */
+  productCatalogueName?: string;
+  /**
    * `"unset"` when the source has no severity value at all (empty/missing),
    * or the value doesn't match anything `severityFromBe` recognizes — a
    * distinct fact from "the severity really is S3/Medium", never collapsed

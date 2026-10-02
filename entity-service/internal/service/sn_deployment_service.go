@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -161,7 +162,9 @@ type snCreateDeploymentPayload struct {
 type snCreateDeploymentResponse struct {
 	Message    string `json:"message"`
 	Deployment struct {
-		ID        string `json:"id"`
+		ID string `json:"id"`
+		// Number is the record's own number (e.g. DEP...), carried in the
+		// upstream create reply. It is not exposed on the public response.
 		Number    string `json:"number"`
 		CreatedOn string `json:"createdOn"`
 		CreatedBy string `json:"createdBy"`
@@ -247,22 +250,27 @@ func (s *snDeploymentService) createDeploymentSNFirstDetails(ctx context.Context
 	if err != nil {
 		return "", "", "", time.Time{}, err
 	}
-	createdOn, err = time.Parse(snCreatedOnLayout, snResp.Deployment.CreatedOn)
-	if err != nil {
-		return "", "", "", time.Time{}, fmt.Errorf("sn create deployment: parse createdOn %q: %w", snResp.Deployment.CreatedOn, err)
-	}
+	// The reply's createdOn is deliberately ignored: it is a wall-clock time in
+	// a non-UTC zone, and parsing it as UTC would store created_on hours in the
+	// future. The current time is used instead.
 	// deployment.number is NOT NULL UNIQUE on the Postgres side (see
-	// createDeploymentSNFirst's own doc comment) -- an empty id/number here
-	// would either fail the Postgres insert with an opaque constraint
-	// violation or, worse, succeed with a blank number that later collides
-	// with a real one. Caught here, before it ever reaches the repository.
+	// createDeploymentSNFirst's own doc comment), so a reply without an
+	// id/number cannot be stored. The create has already happened upstream by
+	// now, so this is a partial creation needing reconciliation, not a
+	// rejected client request: reported as a downstream error and logged,
+	// never as a validation error. Nothing reaches the repository.
 	if snResp.Deployment.ID == "" {
-		return "", "", "", time.Time{}, &apierror.ValidationError{Msg: "sn create deployment: response id is required"}
+		slog.ErrorContext(ctx, "sn create deployment: create reply carried no id; nothing written to Postgres",
+			"projectId", req.ProjectID)
+		return "", "", "", time.Time{}, &apierror.DownstreamError{Msg: "The upstream service returned an invalid response to the deployment create request."}
 	}
-	if snResp.Deployment.Number == "" {
-		return "", "", "", time.Time{}, &apierror.ValidationError{Msg: "sn create deployment: response number is required"}
+	number = snResp.Deployment.Number
+	if number == "" {
+		slog.ErrorContext(ctx, "sn create deployment: ServiceNow deployment created but the create reply carried no number; nothing written to Postgres, needs reconciliation",
+			"deploymentId", snResp.Deployment.ID, "projectId", req.ProjectID)
+		return "", "", "", time.Time{}, &apierror.DownstreamError{Msg: "The deployment was created but its number was not returned by the upstream service, so it could not be stored. It needs to be reconciled."}
 	}
-	return sysidToUUID(snResp.Deployment.ID), snResp.Deployment.Number, snResp.Deployment.CreatedBy, createdOn, nil
+	return sysidToUUID(snResp.Deployment.ID), number, snResp.Deployment.CreatedBy, time.Now().UTC(), nil
 }
 
 // snUpdateDeploymentPayload is the Choreo PATCH /deployments/{id} request body.

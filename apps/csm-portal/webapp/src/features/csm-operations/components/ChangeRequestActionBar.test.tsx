@@ -117,12 +117,12 @@ describe("ChangeRequestActionBar — exactly one primary button", () => {
       .getAllByRole("button")
       .filter((b) => b.className.includes("MuiButton-contained"));
     expect(contained).toHaveLength(1);
-    expect(contained[0]).toHaveTextContent(/request approval/i);
+    expect(contained[0]).toHaveTextContent(/move to assess/i);
   });
 
   it("puts every non-promoted target behind the Change state menu", () => {
     renderBar({ state: "new", legalNextStates: ["assess", "scheduled", "canceled"] });
-    expect(screen.getByRole("button", { name: /request approval/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /move to assess/i })).toBeInTheDocument();
     openMenu();
     expect(screen.getByRole("menuitem", { name: /^schedule$/i })).toBeInTheDocument();
     expect(screen.getByRole("menuitem", { name: /cancel change/i })).toBeInTheDocument();
@@ -153,7 +153,7 @@ describe("ChangeRequestActionBar — exactly one primary button", () => {
 
 describe("ChangeRequestActionBar — labels are the action, not the destination", () => {
   it.each([
-    ["assess", /request approval/i],
+    ["assess", /move to assess/i],
     ["scheduled", /^schedule$/i],
     ["implement", /start implementation/i],
     ["review", /mark implemented/i],
@@ -168,7 +168,7 @@ describe("ChangeRequestActionBar — labels are the action, not the destination"
 describe("ChangeRequestActionBar — dispatch", () => {
   it("calls onAction with the target when the primary button is clicked", () => {
     const { onAction } = renderBar({ state: "new", legalNextStates: ["assess"] });
-    fireEvent.click(screen.getByRole("button", { name: /request approval/i }));
+    fireEvent.click(screen.getByRole("button", { name: /move to assess/i }));
     expect(onAction).toHaveBeenCalledWith("assess");
   });
 
@@ -234,12 +234,47 @@ describe("ChangeRequestActionBar — states the bar never offers", () => {
     });
     expect(container).toBeEmptyDOMElement();
   });
+
+  /**
+   * Authorize must only ever be reached as the automatic side effect of an
+   * approver approving in the Approvers section (`ChangeRequestApprovals.tsx`)
+   * — never via a direct click here, even from Assess, where it would
+   * otherwise be the obvious next forward move. Same exclusion mechanism as
+   * rollback/customer_approval above, for a different reason (a human
+   * decision made elsewhere in the UI, not automation).
+   */
+  it("never offers authorize from Assess, as a button or a menu item", () => {
+    renderBar({
+      state: "assess",
+      legalNextStates: ["authorize", "canceled"],
+    });
+    expect(screen.queryByRole("button", { name: /^authorize$/i })).not.toBeInTheDocument();
+    openMenu();
+    expect(screen.queryByRole("menuitem", { name: /^authorize$/i })).not.toBeInTheDocument();
+  });
+
+  it("excludes authorize even when it would otherwise render through the generic fallback", () => {
+    // `authorize` has no curated action label, so without the exclusion it
+    // would still be renderable via `DEFAULT_TARGET_CONFIG`.
+    renderBar({ state: "assess", legalNextStates: ["authorize", "awaiting_vendor"] });
+    openMenu();
+    expect(screen.getByRole("menuitem", { name: /^awaiting vendor$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: /^authorize$/i })).not.toBeInTheDocument();
+  });
+
+  it("renders no bar at all from Assess when authorize is the only legal target", () => {
+    const { container } = renderBar({
+      state: "assess",
+      legalNextStates: ["authorize"],
+    });
+    expect(container).toBeEmptyDOMElement();
+  });
 });
 
 describe("ChangeRequestActionBar — pending state", () => {
   it("disables the primary button while a transition is in flight", () => {
     renderBar({ state: "new", legalNextStates: ["assess", "canceled"] }, { isPending: true });
-    expect(screen.getByRole("button", { name: /request approval/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /move to assess/i })).toBeDisabled();
   });
 
   it("disables the Change state menu trigger while a transition is in flight", () => {
@@ -248,6 +283,14 @@ describe("ChangeRequestActionBar — pending state", () => {
   });
 });
 
+/**
+ * `TARGET_BLOCKED_REASON` has no entries today — New → Assess used to have
+ * one (`assignedTeam` required) from when that transition sent a ServiceNow
+ * "Request Approval" action, but it is now a plain, ungated `{ state:
+ * "assess" }` PATCH with no relationship to approval. These tests assert the
+ * transition stays enabled either way, so a future reintroduction of that
+ * gate (correctly or by accident) doesn't slip back in unnoticed.
+ */
 describe("ChangeRequestActionBar — per-target blocked reasons", () => {
   it("disables the assess transition when the CR has no assigned team", () => {
     const { onAction } = renderBar({
@@ -255,7 +298,7 @@ describe("ChangeRequestActionBar — per-target blocked reasons", () => {
       legalNextStates: ["assess"],
       assignedTeam: null,
     });
-    const button = screen.getByRole("button", { name: /request approval/i });
+    const button = screen.getByRole("button", { name: /move to assess/i });
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(onAction).not.toHaveBeenCalled();
@@ -264,18 +307,18 @@ describe("ChangeRequestActionBar — per-target blocked reasons", () => {
   it("exposes the blocked reason to keyboard users via a focusable, labelled wrapper", () => {
     renderBar({ state: "new", legalNextStates: ["assess"], assignedTeam: null });
     const focusTarget = screen
-      .getByRole("button", { name: /request approval/i })
+      .getByRole("button", { name: /move to assess/i })
       .closest('[tabindex="0"]');
     expect(focusTarget).not.toBeNull();
     expect(focusTarget).toHaveAttribute(
       "aria-label",
-      "Request approval: Set an assigned team before requesting approval",
+      "Move to Assess: Set an assigned team before moving to Assess",
     );
   });
 
   it("leaves the transition enabled once the prerequisite is met", () => {
     renderBar({ state: "new", legalNextStates: ["assess"] });
-    expect(screen.getByRole("button", { name: /request approval/i })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /move to assess/i })).toBeEnabled();
   });
 
   it("blocks only the target with the unmet prerequisite, leaving the others clickable", () => {
@@ -287,7 +330,7 @@ describe("ChangeRequestActionBar — per-target blocked reasons", () => {
       legalNextStates: ["scheduled", "assess"],
       assignedTeam: null,
     });
-    expect(screen.getByRole("button", { name: /request approval/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /move to assess/i })).toBeDisabled();
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: /^schedule$/i }));
     expect(onAction).toHaveBeenCalledWith("scheduled");

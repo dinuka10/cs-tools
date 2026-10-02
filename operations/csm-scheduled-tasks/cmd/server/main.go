@@ -39,12 +39,17 @@ import (
 
 	"github.com/adhocore/gronx"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/announcementpublish"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/cloudstatus"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/engine"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/entitycases"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/housekeeping"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/ledger"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/notify"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/opencases"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagecomm"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagecommtask"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagenotify"
+	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/outagenotifytask"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/registry"
 	"github.com/wso2-open-operations/cs-tools/operations/csm-scheduled-tasks/internal/stalecases"
 )
@@ -103,6 +108,37 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Outage internal-stakeholder notification. Its own narrow client: the
+	// sweep is a completely different question from case search or the
+	// query-hour recompute, and shares no endpoint with either.
+	outageNotifyClient, err := outagenotify.NewClient(outagenotify.Config{
+		BaseURL:      entityServiceBaseURL,
+		TokenURL:     oauthTokenURL,
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		Scopes:       entityServiceScopes,
+	})
+	if err != nil {
+		slog.Error("failed to construct entity-service outage-notification client", "err", err)
+		os.Exit(1)
+	}
+
+	// Outage COMMUNICATION -- the SRE-facing declaration/resolution pair,
+	// and a different ServiceNow flow from the stakeholder notifier above.
+	// Its own client because it is its own endpoint; the two sweeps answer
+	// different questions and will diverge.
+	outageCommClient, err := outagecomm.NewClient(outagecomm.Config{
+		BaseURL:      entityServiceBaseURL,
+		TokenURL:     oauthTokenURL,
+		ClientID:     oauthClientID,
+		ClientSecret: oauthClientSecret,
+		Scopes:       entityServiceScopes,
+	})
+	if err != nil {
+		slog.Error("failed to construct entity-service outage-communication client", "err", err)
+		os.Exit(1)
+	}
+
 	// Same entity-service deployment and credentials again — a fourth,
 	// separate client for the same reason entityCasesClient is its own:
 	// this one's Bearer token must satisfy entity-service's own
@@ -119,6 +155,67 @@ func main() {
 	if err != nil {
 		slog.Error("failed to construct entity-service announcement-publish client", "err", err)
 		os.Exit(1)
+	}
+
+	// Cloud status: a fifth entity-service client, and the first outbound
+	// integration this component has -- see internal/cloudstatus's package
+	// doc. cloudStatusEnabled is the double-fire guard: ServiceNow's
+	// `Cloud Status Event Notification Flow` is still live, and two systems
+	// posting the same event to a PUBLIC status page is the most visible
+	// possible way to get a cutover wrong. It stays false until that flow is
+	// deactivated, and turning it on is a paired change with deactivating it.
+	cloudStatusEnabled := envBool("CLOUD_STATUS_ENABLED", false)
+	var cloudStatusClient *cloudstatus.Client
+	var cloudStatusWebhook *cloudstatus.Webhook
+	if cloudStatusEnabled {
+		cloudStatusClient, err = cloudstatus.NewClient(cloudstatus.Config{
+			BaseURL:      entityServiceBaseURL,
+			TokenURL:     oauthTokenURL,
+			ClientID:     oauthClientID,
+			ClientSecret: oauthClientSecret,
+			Scopes:       entityServiceScopes,
+		})
+		if err != nil {
+			slog.Error("failed to construct entity-service cloud-status client", "err", err)
+			os.Exit(1)
+		}
+		// *** A BAD MAP MUST STOP STARTUP, NOT BURN THE RETRY BUDGET. ***
+		// parseStringMap returns nil on malformed JSON, and NewWebhook
+		// accepts an empty map. With the feature enabled that combination
+		// records every pending webhook as a "no dashboard URL" failure, and
+		// after cloudStatusMaxAttempts entity-service stops handing the
+		// event out -- so one config typo loses every outage event
+		// permanently, silently, and unrecoverably. Exiting is the only
+		// honest response: the component is being told to publish to a
+		// public status page and cannot.
+		cloudStatusURLs := parseStringMap("CLOUD_STATUS_WEBHOOK_URLS", os.Getenv("CLOUD_STATUS_WEBHOOK_URLS"))
+		if len(cloudStatusURLs) == 0 {
+			slog.Error("CLOUD_STATUS_ENABLED is true but CLOUD_STATUS_WEBHOOK_URLS is empty or unparseable",
+				"hint", "expected a JSON object of cloud slug to base URL")
+			os.Exit(1)
+		}
+		cloudStatusSecrets := parseStringMap("CLOUD_STATUS_WEBHOOK_SECRETS", os.Getenv("CLOUD_STATUS_WEBHOOK_SECRETS"))
+		if len(cloudStatusSecrets) == 0 {
+			// Unsigned posts are rejected with 401 by the dashboard, so an
+			// empty secret map is the same permanent-loss failure as an
+			// empty URL map.
+			slog.Error("CLOUD_STATUS_ENABLED is true but CLOUD_STATUS_WEBHOOK_SECRETS is empty or unparseable",
+				"hint", `expected a JSON object, e.g. {"default":"Secret <token>"}`)
+			os.Exit(1)
+		}
+
+		cloudStatusWebhook, err = cloudstatus.NewWebhook(cloudstatus.WebhookConfig{
+			BaseURLs: cloudStatusURLs,
+			Secrets:  cloudStatusSecrets,
+		})
+		if err != nil {
+			// Unlike the parse helpers, a bad URL here is fatal. The component
+			// is being told to post to a public status page; starting up with
+			// a URL that failed validation and discovering it at send time is
+			// the wrong order to find out.
+			slog.Error("failed to construct cloud status webhook poster", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	// Global kill switch for every failure alert email — see
@@ -162,6 +259,12 @@ func main() {
 	const housekeepingTaskName = "housekeeping_cleanup"
 	housekeepingTo, housekeepingCc := recipientsFor(recipientOverrides, housekeepingTaskName)
 
+	const outageNotifyTaskName = "outage_internal_notification"
+	outageNotifyTo, outageNotifyCc := recipientsFor(recipientOverrides, outageNotifyTaskName)
+
+	const outageCommTaskName = "outage_communication"
+	outageCommTo, outageCommCc := recipientsFor(recipientOverrides, outageCommTaskName)
+
 	const staleCasesTaskName = "stale_cases_report"
 	staleCasesTo, staleCasesCc := recipientsFor(recipientOverrides, staleCasesTaskName)
 	// Fixed, not env-configurable — unlike HOUSEKEEPING_RETENTION_DAYS, there's
@@ -175,6 +278,9 @@ func main() {
 
 	const publishScheduledAnnouncementsTaskName = "publish_scheduled_announcements"
 	publishScheduledAnnouncementsTo, publishScheduledAnnouncementsCc := recipientsFor(recipientOverrides, publishScheduledAnnouncementsTaskName)
+
+	const cloudStatusTaskName = "cloud_status_webhooks"
+	cloudStatusTo, cloudStatusCc := recipientsFor(recipientOverrides, cloudStatusTaskName)
 
 	tasks := []registry.Task{
 		// This component's first real sub-cron: deletes rows from
@@ -236,6 +342,71 @@ func main() {
 			To:       publishScheduledAnnouncementsTo,
 			Cc:       publishScheduledAnnouncementsCc,
 		},
+		// The internal-stakeholder outage notice.
+		//
+		// Every 5 minutes, not hourly: an outage declaration that arrives an
+		// hour late has missed the event it is announcing. The sweep is cheap
+		// — only outages opted into notification and not yet resolved — so the
+		// cadence costs little.
+		//
+		// SUB_CRON_RECIPIENTS here is the REPORT AUDIENCE, not failure alerts:
+		// an empty `to` skips the sweep entirely, which matters because
+		// sweeping marks decisions as sent and would consume notices nobody
+		// receives.
+		//
+		// NOT yet a paired ServiceNow deactivation. Registering this is a
+		// paired change with turning off `Internal Stakeholders Email
+		// Notification - Outage Communication`, per the double-fire rule.
+		{
+			Name:     outageNotifyTaskName,
+			Schedule: scheduleFor(scheduleOverrides, outageNotifyTaskName, "*/5 * * * *"),
+			Handler: outagenotifytask.SendNotices(
+				outageNotifyClient, emailClient, outageNotifyTo, outageNotifyCc, alertsEnabled,
+			),
+			To: outageNotifyTo,
+			Cc: outageNotifyCc,
+		},
+		// The SECOND outage notifier. Same cadence, different flow: this one
+		// announces an outage to the SRE group and then announces its
+		// resolution, where the task above mails internal stakeholders a
+		// one-line notice.
+		//
+		// *** IT IS SAFE TO DEPLOY BEFORE IT IS CONFIGURED. *** With no
+		// SUB_CRON_RECIPIENTS entry the `to` list is empty, and the handler
+		// returns before it sweeps -- so no email goes out AND no
+		// communication-log row is written. That ordering matters: sweeping
+		// with nowhere to deliver would mark outages as announced to nobody
+		// and they would never be announced again.
+		//
+		// It is also inert until digiops-cs maps outage.outage_communication:
+		// without that column the repository degrades to "nothing to send".
+		{
+			Name:     outageCommTaskName,
+			Schedule: scheduleFor(scheduleOverrides, outageCommTaskName, "*/5 * * * *"),
+			Handler: outagecommtask.SendCommunications(
+				outageCommClient, emailClient, outageCommTo, outageCommCc, alertsEnabled,
+			),
+			To: outageCommTo,
+			Cc: outageCommCc,
+		},
+	}
+
+	// Registered only when enabled, rather than registered-and-inert, so the
+	// ledger shows no run at all for a task that is switched off -- an inert
+	// task recording successful no-op runs every tick would read, months from
+	// now, as evidence the port was working.
+	//
+	// Every 5 minutes: this is the only task whose output is public and
+	// time-critical, and its real promptness is bounded by this component's
+	// Choreo trigger cadence anyway (see CLAUDE.md, "The core mechanism").
+	if cloudStatusEnabled {
+		tasks = append(tasks, registry.Task{
+			Name:     cloudStatusTaskName,
+			Schedule: scheduleFor(scheduleOverrides, cloudStatusTaskName, "*/5 * * * *"),
+			Handler:  cloudstatus.DeliverDue(cloudStatusClient, cloudStatusWebhook),
+			To:       cloudStatusTo,
+			Cc:       cloudStatusCc,
+		})
 	}
 
 	var tasksWithRecipients []string
@@ -278,6 +449,27 @@ func main() {
 	start := time.Now()
 	eng.Tick(ctx, start)
 	slog.Info("tick complete", "elapsed", time.Since(start).String())
+}
+
+// parseStringMap decodes a flat JSON object of string values, the same shape
+// and the same failure philosophy as parseSubCronSchedules: a malformed value
+// is logged and treated as empty rather than stopping the component.
+//
+// The consequences differ per caller and are handled by the caller, not here.
+// An unparseable CLOUD_STATUS_WEBHOOK_URLS leaves every cloud unroutable, and
+// each undeliverable webhook is then recorded with a reason and surfaces in
+// the failure alert -- loud, but not a crash loop, and every OTHER scheduled
+// task in this component keeps running.
+func parseStringMap(name, raw string) map[string]string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out map[string]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		slog.Error("ignoring malformed configuration value; treating it as unset", "key", name, "err", err)
+		return nil
+	}
+	return out
 }
 
 func mustEnv(key string) string {

@@ -103,14 +103,7 @@ func NewAnnouncementRequestService(repo repository.AnnouncementRequestRepository
 // short of "internal service" that would be safe to hand this out under, the
 // same rationale sla_status_service.go's own copy documents.
 func (s *announcementRequestService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.access.ResolveScope(ctx)
-	if err != nil {
-		return err
-	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "auto-publish is only available to internal services"}
-	}
-	return nil
+	return RequireInternalCaller(ctx, s.access, "auto-publish is only available to internal services")
 }
 
 // CreateDraft implements AnnouncementRequestService.

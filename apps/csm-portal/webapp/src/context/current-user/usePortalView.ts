@@ -33,20 +33,36 @@ export type PortalView = "cs-abt" | "sales-sa";
  * nav and RootLanding's default destination — see both for where this is
  * consumed.
  *
- * Real detection reads the "sales_solutions" portal role off `GET /users/me`
- * (the same server-authoritative `roles` array `usePortalAccess` reads the
- * other 8 portal roles from — see `internal/handler/access.go`'s
- * `AccessConfig.SalesSolutions`), not a client-side Asgardeo-groups decode —
- * so this can never disagree with what the backend itself thinks the caller
- * is. `AUTH_SALES_SOLUTIONS_ROLES` unset is a normal, supported state (every
- * caller resolves to "cs-abt"), not a misconfiguration.
+ * Detection reads a portal role off `GET /users/me` (the same
+ * server-authoritative `roles` array `usePortalAccess` reads the other 8
+ * portal roles from — see `internal/handler/access.go`'s `AccessConfig`),
+ * not a client-side Asgardeo-groups decode — so this can never disagree
+ * with what the backend itself thinks the caller is.
  *
- * NOT YET migrated: the actual `/spl/*` route/API enforcement
- * (`SplRouteGuard`/`useSplAccess`, and the backend's own `internal/splauth`)
- * still checks raw Asgardeo groups, unrelated to this role — a real,
- * currently-open follow-up (see the Asgardeo Role Catalogue memory note).
- * Until that migrates too, this hook only decides which NAV renders; it is
- * not itself a security boundary for SPL's data.
+ * The routing rule: "cs_engineer" is CS/ABT staff's own portal-selector
+ * role and always wins when present; "viewer" is Sales/SA staff's, and
+ * only decides the view when cs_engineer is absent. This precedence is the
+ * point, not a stopgap — CS engineers are expected to also hold Viewer
+ * (it's the baseline read role composed into most staff role sets), so a
+ * plain "does the caller hold viewer" check would misroute them into the
+ * SPL nav the moment that happens. Checking cs_engineer first is what keeps
+ * CS/ABT staff landing on "cs-abt" by default regardless of which other
+ * read-capability roles (viewer, escalator, attachment-downloader,
+ * usage-metrics-viewer, ...) they also carry — those are orthogonal
+ * capability grants, not portal selectors, and apply the same way inside
+ * whichever portal a user lands in (see `access.go`'s `PermEscalate`,
+ * `PermDownloadAttachment`, `PermUsageMetricsViewer`, none of which are
+ * gated by cs_engineer or viewer specifically).
+ *
+ * This governs the *default landing nav only* — it is not a hard audience
+ * block. See `useAccess.ts` and `internal/handler/access.go`'s
+ * `PermSPLAccess` for the actual SPL audience gate: it grants access on
+ * "viewer" alone, unconditionally, with no cs_engineer exclusion, so a CS
+ * engineer who also holds viewer still lands on "cs-abt" here but isn't
+ * blocked from an SPL screen reached directly. There's no in-app nav
+ * control yet for a CS engineer to deliberately switch into the SPL view —
+ * worth adding once SPL itself is further along; Sales/SA staff getting a
+ * working SPL is the current priority.
  *
  * `devViewOverride` (authConfig.ts) lets local testing force either view
  * regardless of the signed-in account's real roles — set
@@ -66,5 +82,6 @@ export function usePortalView(): PortalView {
   }
   if (devViewOverride) return devViewOverride;
   if (devBypassAccessCheck) return "cs-abt";
-  return roles?.includes("sales_solutions") ? "sales-sa" : "cs-abt";
+  if (roles?.includes("cs_engineer")) return "cs-abt";
+  return roles?.includes("viewer") ? "sales-sa" : "cs-abt";
 }

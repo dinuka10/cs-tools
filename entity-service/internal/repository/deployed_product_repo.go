@@ -27,7 +27,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -363,11 +362,13 @@ func (r *deployedProductRepo) SearchDeployedProductUsageCounts(ctx context.Conte
 }
 
 type deployedProductRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewDeployedProductRepository constructs a DeployedProductRepository backed by the given connection pool.
-func NewDeployedProductRepository(db *pgxpool.Pool) DeployedProductRepository {
+// NewDeployedProductRepository constructs a DeployedProductRepository whose
+// every query runs under the caller identity on ctx (deployed_product has
+// row-level security, migration 0176).
+func NewDeployedProductRepository(db *Scoped) DeployedProductRepository {
 	return &deployedProductRepo{db: db}
 }
 
@@ -392,12 +393,20 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 		argIdx++
 	}
 
-	// TODO(phase 2): req.ProductCategories is not applied here. The deployed_product
-	// schema has no category column today, so deployedProductService rejects any
-	// non-empty ProductCategories before this method is ever called (see
-	// deployed_product_service.go) rather than silently ignoring it. Filter it in here
-	// once the Postgres cohort's product-category modeling lands, and drop that
-	// rejection at the same time.
+	// deployed_product.product_category (deployed_product_category_enum:
+	// PDP/MS/PS/CL/PC) is already selected below -- the request's own
+	// lowercase values (SearchDeployedProductsRequest.ProductCategories'
+	// doc comment: e.g. "pdp") are upper-cased before the enum cast, same
+	// convention every other enum-array filter in this codebase uses.
+	if len(req.ProductCategories) > 0 {
+		categories := make([]string, len(req.ProductCategories))
+		for i, c := range req.ProductCategories {
+			categories[i] = strings.ToUpper(c)
+		}
+		where += fmt.Sprintf(" AND dp.product_category = ANY($%d::text[]::deployed_product_category_enum[])", argIdx)
+		filterArgs = append(filterArgs, categories)
+		argIdx++
+	}
 
 	countQuery := "SELECT COUNT(*) FROM deployed_product dp " + where
 
@@ -466,6 +475,7 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 					SupportEoLDate: pvEoLDate,
 				}
 			}
+			dp.Category = lowercaseCategory(dp.Category)
 			result = append(result, dp)
 		}
 		if err := rows.Err(); err != nil {
@@ -480,6 +490,21 @@ func (r *deployedProductRepo) SearchDeployedProducts(ctx context.Context, req do
 	}
 
 	return deployedProducts, total, nil
+}
+
+// lowercaseCategory converts deployed_product_category_enum's UPPER-case
+// label ("MS", "PDP", ...) read from the database into the lower-case code
+// the rest of the contract uses: the search request's ProductCategories
+// filter values and ProjectFeatures.SrProductCategories/
+// DefaultCaseProductCategories are all lower case, and clients compare the
+// returned category against them case-sensitively. A nil (NULL) category
+// stays nil, never an empty string. The input is not mutated.
+func lowercaseCategory(c *string) *string {
+	if c == nil {
+		return nil
+	}
+	v := strings.ToLower(*c)
+	return &v
 }
 
 // SearchProjectsByProductVersion implements DeployedProductRepository.

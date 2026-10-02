@@ -20,10 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
@@ -66,8 +66,33 @@ type ProjectMembershipRepository interface {
 	// not treat a later RESTORED/replayed event carrying the same Salesforce
 	// LastModifiedDate as already ingested. An unknown id is a no-op (the
 	// membership was never ingested), so a DELETED event is idempotent.
-	DeactivateBySfID(ctx context.Context, membershipSfID string) (bool, error)
+	//
+	// In the same transaction it re-derives the affected user's
+	// account-level admin role (syncDerivedAdminRole), so a user whose last
+	// ADMIN membership was deleted loses customer_admin / partner_admin now
+	// rather than at their next membership event. basis supplies what the
+	// database cannot (the contact's account classification and isCsAdmin);
+	// nil, or a basis that reports !ok, skips the re-derivation.
+	DeactivateBySfID(ctx context.Context, membershipSfID string, basis AdminRoleBasisFunc) (bool, error)
 }
+
+// AdminRoleBasis is what re-deriving a contact's account-level admin role
+// needs beyond the database: the admin role the contact's account
+// classification maps to, the managed pair it is chosen from, and the
+// contact's own Salesforce isCsAdmin flag (an admin grant on its own).
+type AdminRoleBasis struct {
+	AdminRole string
+	Managed   []string
+	IsCsAdmin bool
+}
+
+// AdminRoleBasisFunc resolves the AdminRoleBasis of one contact by its
+// Salesforce Contact Id. ok is false when it cannot be resolved -- the
+// contact is gone from Salesforce too, or the read failed -- and the caller
+// then leaves the admin roles as they are: revoking on a guessed isCsAdmin
+// would strip a real admin. The next contact or membership event re-derives
+// them either way.
+type AdminRoleBasisFunc func(ctx context.Context, contactSfID string) (basis AdminRoleBasis, ok bool)
 
 // ErrMembershipCommitFailed marks the one failure mode this write ordering
 // cannot roll back: Salesforce was written and the database commit then
@@ -116,22 +141,34 @@ type MembershipWriteContext struct {
 // still the last thing that happens.
 type MembershipWritePlan func(ctx context.Context, wc MembershipWriteContext) (domain.SalesforceMembershipUpsert, domain.UpsertOnboardingStepRequest, error)
 
+// projectMembershipRepo's writes (Upsert, UpsertWithin, DeactivateBySfID) run
+// as the system, whoever triggered them: the Salesforce webhook and retry
+// worker carry no identity, and a customer's own membership registration
+// reaches Upsert on that customer's identity, which must not change the
+// result. Their only read of an RLS-protected table is projectReferencedOrder/
+// accountReferencedOrder's EXISTS over work_item, which ranks duplicate sf_id
+// rows and so must see every work_item. Authorization of a portal write stays
+// in the service layer (requireInternalCaller), as it was before RLS.
+// GetMembershipByEmail and ResolveWriteContext read no protected table and
+// use the caller's own identity.
 type projectMembershipRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewProjectMembershipRepository constructs a ProjectMembershipRepository backed by the pool.
-func NewProjectMembershipRepository(db *pgxpool.Pool) ProjectMembershipRepository {
+// NewProjectMembershipRepository constructs a ProjectMembershipRepository backed by the scoped pool.
+func NewProjectMembershipRepository(db *Scoped) ProjectMembershipRepository {
 	return &projectMembershipRepo{db: db}
 }
 
-func (r *projectMembershipRepo) DeactivateBySfID(ctx context.Context, membershipSfID string) (bool, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return false, fmt.Errorf("deactivate project contact: begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+func (r *projectMembershipRepo) DeactivateBySfID(ctx context.Context, membershipSfID string, basis AdminRoleBasisFunc) (bool, error) {
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (bool, error) {
+		return deactivateBySfIDTx(ctx, tx, membershipSfID, basis)
+	})
+}
 
+// deactivateBySfIDTx is DeactivateBySfID's body, run inside tx.
+func deactivateBySfIDTx(ctx context.Context, tx pgx.Tx, membershipSfID string, basis AdminRoleBasisFunc) (bool, error) {
 	tag, err := tx.Exec(ctx, `
 		UPDATE project_contact
 		SET state = $2::project_contact_state_enum, updated_on = NOW(), updated_by = $3
@@ -155,19 +192,56 @@ func (r *projectMembershipRepo) DeactivateBySfID(ctx context.Context, membership
 		return false, fmt.Errorf("mark DATABASE step deleted: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("deactivate project contact: commit: %w", err)
+	if basis != nil {
+		if err := rederiveAdminAfterDeactivate(ctx, tx, membershipSfID, basis); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }
 
-func (r *projectMembershipRepo) Upsert(ctx context.Context, in domain.SalesforceMembershipUpsert, step domain.UpsertOnboardingStepRequest) (domain.SalesforceMembershipUpsertResult, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.SalesforceMembershipUpsertResult{}, fmt.Errorf("upsert membership: begin tx: %w", err)
+// rederiveAdminAfterDeactivate re-runs syncDerivedAdminRole for the user
+// behind a membership DeactivateBySfID has just set to DEACTIVATED. The
+// deactivated row no longer counts (the derivation skips DEACTIVATED), so a
+// user whose only ADMIN membership this was loses the admin role here.
+func rederiveAdminAfterDeactivate(ctx context.Context, tx querier, membershipSfID string, basis AdminRoleBasisFunc) error {
+	var userID, contactSfID string
+	err := tx.QueryRow(ctx, `
+		SELECT u.id, COALESCE(NULLIF(TRIM(ac.sf_id), ''), NULLIF(TRIM(u.sf_id), ''), '')
+		FROM project_contact pc
+		JOIN account_contact ac ON ac.id = pc.account_contact_id
+		JOIN "user" u ON LOWER(u.user_name) = LOWER(ac.user_name)
+		WHERE pc.sf_id = $1
+		ORDER BY pc.created_on
+		LIMIT 1`, membershipSfID).Scan(&userID, &contactSfID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	if err != nil {
+		return fmt.Errorf("deactivate project contact: resolve user: %w", err)
+	}
+	if contactSfID == "" {
+		return nil
+	}
+	b, ok := basis(ctx, contactSfID)
+	if !ok {
+		return nil
+	}
+	if _, err := syncDerivedAdminRole(ctx, tx, userID, b.AdminRole, b.Managed, b.IsCsAdmin, domain.SalesforceSyncActor); err != nil {
+		return err
+	}
+	return nil
+}
 
+func (r *projectMembershipRepo) Upsert(ctx context.Context, in domain.SalesforceMembershipUpsert, step domain.UpsertOnboardingStepRequest) (domain.SalesforceMembershipUpsertResult, error) {
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (domain.SalesforceMembershipUpsertResult, error) {
+		return upsertTx(ctx, tx, in, step)
+	})
+}
+
+// upsertTx is Upsert's body, run inside tx.
+func upsertTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMembershipUpsert, step domain.UpsertOnboardingStepRequest) (domain.SalesforceMembershipUpsertResult, error) {
 	res, err := upsertMembershipTx(ctx, tx, in)
 	if err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
@@ -178,21 +252,36 @@ func (r *projectMembershipRepo) Upsert(ctx context.Context, in domain.Salesforce
 	if _, err := upsertOnboardingStep(ctx, tx, step); err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return domain.SalesforceMembershipUpsertResult{}, fmt.Errorf("upsert membership: commit: %w", err)
-	}
 	return res, nil
 }
 
 // UpsertWithin implements ProjectMembershipRepository.
 func (r *projectMembershipRepo) UpsertWithin(ctx context.Context, projectID, email string, plan MembershipWritePlan) (domain.SalesforceMembershipUpsertResult, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.SalesforceMembershipUpsertResult{}, fmt.Errorf("membership write: begin tx: %w", err)
+	var res domain.SalesforceMembershipUpsertResult
+	// planned records that the write ran to the end -- the plan, and with it the
+	// Salesforce half, completed -- so any error InTx still returns can only be
+	// the commit. That is the one failure ErrMembershipCommitFailed reports, and
+	// InTx alone would fold it into an ordinary error.
+	planned := false
+	// The identity is stamped on the transaction only; plan keeps the caller's ctx.
+	err := r.db.InTx(WithSystemIdentity(ctx), func(tx pgx.Tx) error {
+		var err error
+		res, err = upsertWithinTx(ctx, tx, projectID, email, plan)
+		planned = err == nil
+		return err
+	})
+	switch {
+	case err == nil:
+		return res, nil
+	case planned:
+		return res, fmt.Errorf("%w: %v", ErrMembershipCommitFailed, err)
+	default:
+		return domain.SalesforceMembershipUpsertResult{}, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+}
 
+// upsertWithinTx is UpsertWithin's body, run inside tx.
+func upsertWithinTx(ctx context.Context, tx pgx.Tx, projectID, email string, plan MembershipWritePlan) (domain.SalesforceMembershipUpsertResult, error) {
 	if err := lockMembershipWriteKey(ctx, tx, projectID, email); err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
 	}
@@ -207,8 +296,8 @@ func (r *projectMembershipRepo) UpsertWithin(ctx context.Context, projectID, ema
 	}
 
 	// The Salesforce half. An error here leaves both systems untouched: the
-	// deferred Rollback discards whatever this transaction has read, and
-	// nothing has been written to either side yet.
+	// rollback discards whatever this transaction has read, and nothing has
+	// been written to either side yet.
 	in, step, err := plan(ctx, MembershipWriteContext{Target: target, Existing: existing})
 	if err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
@@ -223,10 +312,6 @@ func (r *projectMembershipRepo) UpsertWithin(ctx context.Context, projectID, ema
 	step.ProjectContactID = &res.ProjectContactID
 	if _, err := upsertOnboardingStep(ctx, tx, step); err != nil {
 		return domain.SalesforceMembershipUpsertResult{}, err
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return res, fmt.Errorf("%w: %v", ErrMembershipCommitFailed, err)
 	}
 	return res, nil
 }
@@ -389,6 +474,13 @@ func membershipByEmail(ctx context.Context, q querier, projectID, email string) 
 // upsertMembershipTx runs the resolution/write steps inside tx.
 func upsertMembershipTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMembershipUpsert) (domain.SalesforceMembershipUpsertResult, error) {
 	var res domain.SalesforceMembershipUpsertResult
+	// The Contact writer's lock, so this and a concurrent Contact event for
+	// the same new contact cannot both miss the "user" lookup and both insert.
+	// UpsertWithin already holds its (project, email) key here; nothing takes
+	// the two in the other order, so the nesting cannot deadlock.
+	if err := lockSalesforceContact(ctx, tx, in.ContactSfID); err != nil {
+		return res, err
+	}
 	actor := in.Actor
 	if actor == "" {
 		actor = domain.SalesforceSyncActor
@@ -404,11 +496,13 @@ func upsertMembershipTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMemb
 			return res, &apierror.NotFoundError{Msg: "project not found"}
 		}
 	} else {
+		var copies int64
 		err = tx.QueryRow(ctx, `
-		SELECT id, account_id FROM project
-		WHERE (key = $1 AND $1 <> '') OR (sf_id = $2 AND $2 <> '')
-		ORDER BY CASE WHEN key = $1 THEN 0 ELSE 1 END
-		LIMIT 1`, in.ProjectKey, in.ProjectSfID).Scan(&res.ProjectID, &projectAccountID)
+		SELECT p.id, p.account_id, count(*) FILTER (WHERE p.sf_id = $2) OVER () FROM project p
+		WHERE (p.key = $1 AND $1 <> '') OR (p.sf_id = $2 AND $2 <> '')
+		ORDER BY CASE WHEN p.key = $1 THEN 0 ELSE 1 END, `+projectReferencedOrder+`
+		LIMIT 1`, in.ProjectKey, in.ProjectSfID).Scan(&res.ProjectID, &projectAccountID, &copies)
+		warnDuplicateSfID(ctx, "project", in.ProjectSfID, res.ProjectID, copies)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return res, &apierror.NotFoundError{Msg: fmt.Sprintf("project not found for key %q / sfId %q", in.ProjectKey, in.ProjectSfID)}
 		}
@@ -420,9 +514,12 @@ func upsertMembershipTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMemb
 	// 2. account — the contact's own account by sf_id; an own contact falls
 	// back to the project's account.
 	if in.ContactAccountSfID != "" {
-		err = tx.QueryRow(ctx, `SELECT id FROM account WHERE sf_id = $1`, in.ContactAccountSfID).Scan(&res.AccountID)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		accountID, err := resolveIDBySfID(ctx, tx, resolveAccountBySfIDQuery, "account", in.ContactAccountSfID)
+		if err != nil {
 			return res, fmt.Errorf("upsert membership: resolve account: %w", err)
+		}
+		if accountID != nil {
+			res.AccountID = *accountID
 		}
 	}
 	if res.AccountID == "" {
@@ -440,14 +537,15 @@ func upsertMembershipTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMemb
 		return res, err
 	}
 
-	// 4. global roles (external + customer/partner). The admin role is NOT
-	// decided here — see step 8.
-	if err := syncGlobalRoles(ctx, tx, res.UserID, in.GlobalRoles, actor); err != nil {
+	// 4. global roles (external + customer/partner, the pair managed when
+	// the account classification is known). The admin role is NOT decided
+	// here — see step 8.
+	if err := syncGlobalRoles(ctx, tx, res.UserID, in.GlobalRoles, in.ManagedGlobalRoles, actor); err != nil {
 		return res, err
 	}
 
 	// 5. account_contact — by sf_id, then (account, user_name), else insert.
-	res.AccountContactID, res.CreatedAccountContact, err = upsertAccountContact(ctx, tx, in.ContactSfID, res.AccountID, userName, actor)
+	res.AccountContactID, res.CreatedAccountContact, err = upsertAccountContact(ctx, tx, in.ContactSfID, res.AccountID, userName, in.IsPrimaryContact, actor)
 	if err != nil {
 		return res, err
 	}
@@ -472,16 +570,21 @@ func upsertMembershipTx(ctx context.Context, tx pgx.Tx, in domain.SalesforceMemb
 	return res, nil
 }
 
-func upsertMembershipUser(ctx context.Context, tx pgx.Tx, in domain.SalesforceMembershipUpsert, actor string) (id, userName string, created bool, err error) {
+func upsertMembershipUser(ctx context.Context, tx querier, in domain.SalesforceMembershipUpsert, actor string) (id, userName string, created bool, err error) {
 	email := strings.ToLower(strings.TrimSpace(in.ContactEmail))
 	if email == "" {
 		return "", "", false, &apierror.ValidationError{Msg: "contact email is required to resolve the user"}
 	}
 
-	err = tx.QueryRow(ctx, `SELECT id, user_name FROM "user" WHERE sf_id = $1`, in.ContactSfID).Scan(&id, &userName)
+	// One copy per sf_id: active first, then oldest (an account_contact EXISTS has no index here).
+	var copies int64
+	err = tx.QueryRow(ctx, `
+		SELECT id, user_name, count(*) OVER () FROM "user" WHERE sf_id = $1
+		ORDER BY is_active IS TRUE DESC, created_on, id LIMIT 1`, in.ContactSfID).Scan(&id, &userName, &copies)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", "", false, fmt.Errorf("upsert membership: resolve user by sf_id: %w", err)
 	}
+	warnDuplicateSfID(ctx, "user", in.ContactSfID, id, copies)
 	if id == "" {
 		rows, qerr := tx.Query(ctx, `SELECT id, user_name FROM "user" WHERE LOWER(email) = $1 LIMIT 2`, email)
 		if qerr != nil {
@@ -538,10 +641,16 @@ func upsertMembershipUser(ctx context.Context, tx pgx.Tx, in domain.SalesforceMe
 }
 
 // syncGlobalRoles grants every role in wanted that the user does not already
-// hold. It revokes nothing: the only roles this write path is allowed to take
-// away are the two admin roles, and those are decided by syncDerivedAdminRole
-// from the user's whole set of memberships, not from the one being written.
-func syncGlobalRoles(ctx context.Context, tx pgx.Tx, userID string, wanted []string, actor string) error {
+// hold, and revokes every role in managed that wanted does not list.
+//
+// managed is the {customer, partner} pair when the contact's account
+// classification is known (both writers, the Contact writer and the
+// membership upsert, compute it from the same basis), so a reclassified
+// account flips the role instead of leaving the user with both. It is empty
+// when the classification is unknown, and then nothing is revoked. The admin
+// pair is never managed here: syncDerivedAdminRole decides it from the
+// user's whole set of memberships.
+func syncGlobalRoles(ctx context.Context, tx querier, userID string, wanted, managed []string, actor string) error {
 	if len(wanted) > 0 {
 		roleIDs := map[string]string{}
 		rows, err := tx.Query(ctx, `SELECT id, name FROM role WHERE name = ANY($1::text[])`, wanted)
@@ -596,82 +705,79 @@ func syncGlobalRoles(ctx context.Context, tx pgx.Tx, userID string, wanted []str
 		}
 	}
 
+	var revoke []string
+	for _, m := range managed {
+		if !slices.Contains(wanted, m) {
+			revoke = append(revoke, m)
+		}
+	}
+	if len(revoke) > 0 {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM user_role ur USING role r
+			WHERE ur.role_id = r.id AND ur.user_id = $1 AND r.name = ANY($2::text[])`, userID, revoke); err != nil {
+			return fmt.Errorf("upsert membership: revoke roles: %w", err)
+		}
+	}
 	return nil
 }
 
-// syncDerivedAdminRole decides the user's account-level admin roles from ALL
-// of their memberships and grants or revokes each one accordingly.
+// syncDerivedAdminRole decides the user's account-level admin role from ALL
+// of their memberships and grants or revokes the managed roles accordingly.
 //
 // Admin is stored per project (the ADMIN project_role, reached through the
 // Admin project_group — migration 0128). The account-level role is derived
-// from it: admin on ANY project under an account means admin on EVERY project
-// under that account, and nothing outside it.
+// from it: the user is an admin when ANY of their live (non-DEACTIVATED)
+// memberships carries the ADMIN project role, or when the contact's own
+// Salesforce isCsAdmin flag is set.
 //
-// "Nothing outside it" is why the two managed roles are decided SEPARATELY,
-// each from the memberships that could support it. A membership is a partner
-// one exactly when the contact's account is not the project's (the same test
-// membershipByEmail applies), so an ADMIN membership of that kind supports
-// partner_admin and one of the other kind supports customer_admin. Deciding
-// both from a single "is this user an admin anywhere" answer, and then
-// keeping whichever role the membership in hand happens to map to, let one
-// account's admin rights be traded for another's: processing a non-admin
-// PARTNER CONTACT membership for a user who is a customer admin elsewhere
-// would grant partner_admin, which no ADMIN membership supports, and revoke
-// the customer_admin they had earned.
+// WHICH admin role that is — customer_admin or partner_admin — is adminRole,
+// chosen by the caller from the contact's account classification (Partner
+// gives partner_admin, anything else customer_admin), the same basis the
+// {customer, partner} pair follows. The role describes the kind of
+// organisation the person belongs to, so it is one role, not one per kind of
+// membership: every managed role other than adminRole is revoked, and
+// adminRole itself is revoked when the user is not an admin. (It used to be
+// split by `ac.account_id <> p.account_id` per membership, which disagreed
+// with the classification for a partner's employee on the partner's own
+// project and for a related contact on another account's project.)
 //
 // This also replaces an older revoke rule that read `managed - wanted` from
 // the single membership being processed, which meant processing one
 // non-admin membership stripped the user's admin on every project they had.
-// Neither query here can do that: both are computed over the user's
-// memberships, run after the membership in hand has already been written, so
-// the answer accounts for the change being made and for every project not
-// involved in it. Do not narrow either of them to the membership in hand.
-//
-// The contact's own Salesforce isCsAdmin flag is an additional grant of the
-// role this membership maps to (adminRole), never a revocation condition,
-// and is the reason this takes it as a parameter rather than reading it back
-// too.
+// The query here cannot do that: it is computed over the user's memberships,
+// run after the membership in hand has already been written, so the answer
+// accounts for the change being made and for every project not involved in
+// it. Do not narrow it to the membership in hand.
 //
 // adminRole empty (an integration user) means the whole admin question does
 // not apply: nothing is granted and nothing is revoked. The bool returned is
-// whether the user ends up holding adminRole — the decision for the
-// membership just written.
+// whether the user ends up holding adminRole.
 func syncDerivedAdminRole(ctx context.Context, tx querier, userID, adminRole string, managed []string, isCsAdmin bool, actor string) (bool, error) {
 	if adminRole == "" {
 		return false, nil
 	}
 
-	var customerAdmin, partnerAdmin bool
+	var adminMembership bool
 	if err := tx.QueryRow(ctx, `
-		SELECT
-			COALESCE(bool_or(ac.account_id = p.account_id), FALSE),
-			COALESCE(bool_or(ac.account_id <> p.account_id), FALSE)
-		FROM "user" u
-		JOIN account_contact ac ON LOWER(ac.user_name) = LOWER(u.user_name)
-		JOIN project_contact pc ON pc.account_contact_id = ac.id
-		JOIN project p ON p.id = pc.project_id
-		JOIN project_contact_group pcg ON pcg.project_contact_id = pc.id
-		JOIN project_group_role pgr ON pgr.project_group_id = pcg.project_group_id
-		JOIN project_role pr ON pr.id = pgr.project_role_id
-		WHERE u.id = $1
-		  AND pr.role = 'ADMIN'::project_role_enum
-		  AND (pc.state IS NULL OR pc.state <> 'DEACTIVATED'::project_contact_state_enum)`,
-		userID).Scan(&customerAdmin, &partnerAdmin); err != nil {
+		SELECT EXISTS (
+			SELECT 1
+			FROM "user" u
+			JOIN account_contact ac ON LOWER(ac.user_name) = LOWER(u.user_name)
+			JOIN project_contact pc ON pc.account_contact_id = ac.id
+			JOIN project_contact_group pcg ON pcg.project_contact_id = pc.id
+			JOIN project_group_role pgr ON pgr.project_group_id = pcg.project_group_id
+			JOIN project_role pr ON pr.id = pgr.project_role_id
+			WHERE u.id = $1
+			  AND pr.role = 'ADMIN'::project_role_enum
+			  AND (pc.state IS NULL OR pc.state <> 'DEACTIVATED'::project_contact_state_enum))`,
+		userID).Scan(&adminMembership); err != nil {
 		return false, fmt.Errorf("upsert membership: derive account admin role: %w", err)
 	}
-
-	earned := map[string]bool{
-		globalRoleCustomerAdmin: customerAdmin,
-		globalRolePartnerAdmin:  partnerAdmin,
-	}
-	// isCsAdmin grants the role THIS membership maps to, and only that one.
-	if isCsAdmin {
-		earned[adminRole] = true
-	}
+	isAdmin := adminMembership || isCsAdmin
 
 	var revoke []string
 	for _, m := range managed {
-		if earned[m] {
+		if isAdmin && m == adminRole {
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO user_role (id, created_on, updated_on, created_by, updated_by, user_id, role_id)
 				SELECT gen_random_uuid(), NOW(), NOW(), $1, $1, $2, r.id
@@ -692,23 +798,24 @@ func syncDerivedAdminRole(ctx context.Context, tx querier, userID, adminRole str
 			return false, fmt.Errorf("upsert membership: revoke roles: %w", err)
 		}
 	}
-	return earned[adminRole], nil
+	return isAdmin, nil
 }
 
-// The two derived account-level admin role names. internal/service owns the
-// Salesforce-to-role mapping and the repository must not import it, so the
-// names are spelled here too — syncDerivedAdminRole has to know which of the
-// managed roles a partner membership supports and which a customer one does.
-const (
-	globalRoleCustomerAdmin = "customer_admin"
-	globalRolePartnerAdmin  = "partner_admin"
-)
-
-func upsertAccountContact(ctx context.Context, tx pgx.Tx, contactSfID, accountID, userName, actor string) (id string, created bool, err error) {
-	err = tx.QueryRow(ctx, `SELECT id FROM account_contact WHERE sf_id = $1 AND account_id = $2`, contactSfID, accountID).Scan(&id)
+// upsertAccountContact resolves the contact's account_contact row on
+// accountID (by sf_id, then by user_name), inserting it when absent, and
+// marks it active. isPrimary is Salesforce's primary_contact__c: written on
+// insert and on update when known, FALSE on insert and untouched on update
+// when nil.
+func upsertAccountContact(ctx context.Context, tx querier, contactSfID, accountID, userName string, isPrimary *bool, actor string) (id string, created bool, err error) {
+	var copies int64
+	err = tx.QueryRow(ctx, `
+		SELECT ac.id, count(*) OVER () FROM account_contact ac WHERE ac.sf_id = $1 AND ac.account_id = $2
+		ORDER BY EXISTS (SELECT 1 FROM project_contact pc WHERE pc.account_contact_id = ac.id) DESC, ac.created_on, ac.id
+		LIMIT 1`, contactSfID, accountID).Scan(&id, &copies)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", false, fmt.Errorf("upsert membership: resolve account_contact by sf_id: %w", err)
 	}
+	warnDuplicateSfID(ctx, "account_contact", contactSfID, id, copies)
 	if id == "" {
 		err = tx.QueryRow(ctx, `
 			SELECT id FROM account_contact WHERE account_id = $1 AND LOWER(user_name) = LOWER($2)
@@ -721,16 +828,19 @@ func upsertAccountContact(ctx context.Context, tx pgx.Tx, contactSfID, accountID
 		err = tx.QueryRow(ctx, `
 			INSERT INTO account_contact (id, created_on, updated_on, created_by, updated_by,
 				is_active, user_name, is_primary_contact, account_id, sf_id)
-			VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, TRUE, $2, FALSE, $3, $4)
-			RETURNING id`, actor, userName, accountID, contactSfID).Scan(&id)
+			VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, TRUE, $2, COALESCE($5::boolean, FALSE), $3, $4)
+			RETURNING id`, actor, userName, accountID, contactSfID, isPrimary).Scan(&id)
 		if err != nil {
 			return "", false, fmt.Errorf("upsert membership: insert account_contact: %w", err)
 		}
 		return id, true, nil
 	}
 	if _, err = tx.Exec(ctx, `
-		UPDATE account_contact SET is_active = TRUE, sf_id = $2, updated_on = NOW(), updated_by = $3 WHERE id = $1`,
-		id, contactSfID, actor); err != nil {
+		UPDATE account_contact
+		SET is_active = TRUE, sf_id = $2, is_primary_contact = COALESCE($4::boolean, is_primary_contact),
+		    updated_on = NOW(), updated_by = $3
+		WHERE id = $1`,
+		id, contactSfID, actor, isPrimary); err != nil {
 		return "", false, fmt.Errorf("upsert membership: update account_contact: %w", err)
 	}
 	return id, false, nil
@@ -742,10 +852,15 @@ func upsertAccountContact(ctx context.Context, tx pgx.Tx, contactSfID, accountID
 // apart from "this is our own portal write coming back".
 func upsertProjectContact(ctx context.Context, tx pgx.Tx, in domain.SalesforceMembershipUpsert, projectID, accountContactID, actor string) (id string, created bool, previousState string, err error) {
 	var prior *string
-	err = tx.QueryRow(ctx, `SELECT id, state::text FROM project_contact WHERE sf_id = $1`, in.MembershipSfID).Scan(&id, &prior)
+	var copies int64
+	err = tx.QueryRow(ctx, `
+		SELECT pc.id, pc.state::text, count(*) OVER () FROM project_contact pc WHERE pc.sf_id = $1
+		ORDER BY EXISTS (SELECT 1 FROM project_contact_group g WHERE g.project_contact_id = pc.id) DESC, pc.created_on, pc.id
+		LIMIT 1`, in.MembershipSfID).Scan(&id, &prior, &copies)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return "", false, "", fmt.Errorf("upsert membership: resolve project_contact by sf_id: %w", err)
 	}
+	warnDuplicateSfID(ctx, "project_contact", in.MembershipSfID, id, copies)
 	if id == "" {
 		err = tx.QueryRow(ctx, `
 			SELECT id, state::text FROM project_contact WHERE project_id = $1 AND account_contact_id = $2

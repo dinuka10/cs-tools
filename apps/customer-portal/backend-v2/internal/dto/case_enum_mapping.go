@@ -296,13 +296,19 @@ func caseSeverityRef(label *string) *IDLabelRef {
 // caseIssueTypeRef mirrors caseStatusRef for issue type, matching
 // entity-service's own snIssueTypeToEnum transform (lowercase, spaces to
 // underscores) rather than a lookup table of raw labels.
+//
+// Label goes through displayLabelOr the same way caseStatusRef's does --
+// echoing the raw input here (as this used to) rather than resolving it
+// through caseIssueTypeDisplayLabels meant a Postgres-mode caller (raw
+// UPPER_SNAKE enum labels) saw e.g. "PERFORMANCE_DEGRADATION" verbatim on
+// every case card instead of "Performance Degradation".
 func caseIssueTypeRef(label *string) *IDLabelRef {
 	if label == nil || *label == "" {
 		return nil
 	}
 	enum := strings.ToLower(strings.ReplaceAll(*label, " ", "_"))
 	if id, ok := caseIssueTypeIDs[enum]; ok {
-		return &IDLabelRef{ID: id, Label: *label}
+		return &IDLabelRef{ID: id, Label: displayLabelOr(caseIssueTypeDisplayLabels, enum)}
 	}
 	return &IDLabelRef{Label: *label}
 }
@@ -313,13 +319,20 @@ func caseIssueTypeRef(label *string) *IDLabelRef {
 // transform (lowercase, spaces and slashes to underscores) is this backend's
 // own best-effort match against caseEngagementTypeIDs's domain.EngagementType
 // keys, not a mirror of an existing entity-service function.
+//
+// Label goes through displayLabelOr the same way caseStatusRef's does --
+// echoing the raw input here (as this used to) rather than resolving it
+// through caseEngagementTypeDisplayLabels meant a Postgres-mode caller saw
+// the raw enum label (e.g. "new_feature_improvement" or
+// "NEW_FEATURE_IMPROVEMENT") verbatim on every engagement card instead of
+// "New Feature Improvement".
 func caseEngagementTypeRef(label *string) *IDLabelRef {
 	if label == nil || *label == "" {
 		return nil
 	}
 	enum := strings.ToLower(strings.NewReplacer(" ", "_", "/", "_").Replace(*label))
 	if id, ok := caseEngagementTypeIDs[enum]; ok {
-		return &IDLabelRef{ID: id, Label: *label}
+		return &IDLabelRef{ID: id, Label: displayLabelOr(caseEngagementTypeDisplayLabels, enum)}
 	}
 	return &IDLabelRef{Label: *label}
 }

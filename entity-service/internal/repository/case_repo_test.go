@@ -31,7 +31,7 @@ import (
 func TestOnboardingStatusEnumLabels(t *testing.T) {
 	// The dashboard sends ServiceNow's spellings; each must land on the enum
 	// label, regardless of case or separator.
-	got, err := onboardingStatusEnumLabels([]string{"Not-Started", "In-Progress", "Completed", "OnHold", "Not-Applicable", "Expired", "Cancelled", " on_hold ", "IN PROGRESS"})
+	got, err := onboardingStatusEnumLabels("projectOnboardingStatus", []string{"Not-Started", "In-Progress", "Completed", "OnHold", "Not-Applicable", "Expired", "Cancelled", " on_hold ", "IN PROGRESS"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -42,7 +42,7 @@ func TestOnboardingStatusEnumLabels(t *testing.T) {
 
 	// An unknown value must fail loudly: silently matching nothing would
 	// widen a notIn.
-	_, err = onboardingStatusEnumLabels([]string{"Completed", "Bogus"})
+	_, err = onboardingStatusEnumLabels("projectOnboardingStatus", []string{"Completed", "Bogus"})
 	var ve *apierror.ValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("err = %v, want *apierror.ValidationError", err)

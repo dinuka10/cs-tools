@@ -24,7 +24,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
 // mockEntityScheduleClient stands in for entity-service, recording what the
@@ -294,116 +295,60 @@ func TestSearchScheduleAbsences(t *testing.T) {
 	})
 }
 
-func TestDeleteScheduleAbsence(t *testing.T) {
-	t.Run("requires an authenticated user", func(t *testing.T) {
-		h := NewScheduleHandler(&mockEntityScheduleClient{})
-		w := httptest.NewRecorder()
-		h.DeleteScheduleAbsence(w, httptest.NewRequest(http.MethodDelete, "/team-schedule/absences/a1", nil))
-		assertStatus(t, w, http.StatusUnauthorized)
-	})
-
-	t.Run("forwards the id and note, and answers 204", func(t *testing.T) {
-		var gotID, gotNote string
-		h := NewScheduleHandler(&mockEntityScheduleClient{
-			deleteAbsenceFn: func(_ context.Context, id, note string) ([]byte, error) {
-				gotID, gotNote = id, note
-				return nil, nil
-			},
-		})
-		r := withUser(httptest.NewRequest(http.MethodDelete, "/team-schedule/absences/a1?note=removed", nil))
-		r.SetPathValue("id", "a1")
-		w := httptest.NewRecorder()
-		h.DeleteScheduleAbsence(w, r)
-		assertStatus(t, w, http.StatusNoContent)
-		if gotID != "a1" || gotNote != "removed" {
-			t.Fatalf("forwarded id %q note %q, want a1 / removed", gotID, gotNote)
-		}
-	})
-
-	t.Run("a lead of another team gets the upstream 403", func(t *testing.T) {
-		h := NewScheduleHandler(&mockEntityScheduleClient{
-			deleteAbsenceFn: func(context.Context, string, string) ([]byte, error) {
-				return nil, &apierror.Error{StatusCode: http.StatusForbidden}
-			},
-		})
-		r := withUser(httptest.NewRequest(http.MethodDelete, "/team-schedule/absences/a1", nil))
-		r.SetPathValue("id", "a1")
-		w := httptest.NewRecorder()
-		h.DeleteScheduleAbsence(w, r)
-		assertStatus(t, w, http.StatusForbidden)
-	})
+type mockViewerScheduleClient struct {
+	schedule                                              servicenow.ABTTeamScheduleData
+	err                                                   error
+	gotFrom, gotDuration, gotTeamID, gotEventType, gotURL string
 }
 
-func TestCreateScheduleAbsenceKind(t *testing.T) {
-	body := `{"shortCode":"Trn","label":"Training","bucket":"ALLOCATION","colourToken":"INT"}`
-
-	t.Run("forwards the body untouched and answers 201", func(t *testing.T) {
-		var got string
-		h := NewScheduleHandler(&mockEntityScheduleClient{
-			createKindFn: func(_ context.Context, b []byte) ([]byte, error) {
-				got = string(b)
-				return []byte(`{"code":"TRAINING"}`), nil
-			},
-		})
-		w := httptest.NewRecorder()
-		h.CreateScheduleAbsenceKind(w, withUser(httptest.NewRequest(http.MethodPost, "/team-schedule/absence-kinds", strings.NewReader(body))))
-		assertStatus(t, w, http.StatusCreated)
-		if got != body {
-			t.Fatalf("forwarded %s, want %s", got, body)
-		}
-	})
-
-	t.Run("a tag that already exists stays a 409", func(t *testing.T) {
-		h := NewScheduleHandler(&mockEntityScheduleClient{
-			createKindFn: func(context.Context, []byte) ([]byte, error) {
-				return nil, &apierror.Error{StatusCode: http.StatusConflict}
-			},
-		})
-		w := httptest.NewRecorder()
-		h.CreateScheduleAbsenceKind(w, withUser(httptest.NewRequest(http.MethodPost, "/team-schedule/absence-kinds", strings.NewReader(body))))
-		assertStatus(t, w, http.StatusConflict)
-	})
-
-	t.Run("rejects a body that is not JSON before calling upstream", func(t *testing.T) {
-		called := false
-		h := NewScheduleHandler(&mockEntityScheduleClient{
-			createKindFn: func(context.Context, []byte) ([]byte, error) { called = true; return nil, nil },
-		})
-		w := httptest.NewRecorder()
-		h.CreateScheduleAbsenceKind(w, withUser(httptest.NewRequest(http.MethodPost, "/team-schedule/absence-kinds", strings.NewReader("{not json"))))
-		assertStatus(t, w, http.StatusBadRequest)
-		if called {
-			t.Fatal("an invalid body reached entity-service")
-		}
-	})
+func (m *mockViewerScheduleClient) GetABTTeamSchedule(ctx context.Context, from, duration, teamID, eventType, teamScheduleURL string) (servicenow.ABTTeamScheduleData, error) {
+	m.gotFrom, m.gotDuration, m.gotTeamID, m.gotEventType, m.gotURL = from, duration, teamID, eventType, teamScheduleURL
+	return m.schedule, m.err
 }
 
-func TestDeleteScheduleAbsenceKind(t *testing.T) {
-	t.Run("forwards the code and answers 204", func(t *testing.T) {
-		var got string
-		h := NewScheduleHandler(&mockEntityScheduleClient{
-			deleteKindFn: func(_ context.Context, code string) ([]byte, error) { got = code; return nil, nil },
-		})
-		r := withUser(httptest.NewRequest(http.MethodDelete, "/team-schedule/absence-kinds/TRAINING", nil))
-		r.SetPathValue("code", "TRAINING")
-		w := httptest.NewRecorder()
-		h.DeleteScheduleAbsenceKind(w, r)
-		assertStatus(t, w, http.StatusNoContent)
-		if got != "TRAINING" {
-			t.Fatalf("forwarded %q, want TRAINING", got)
-		}
-	})
+func TestGetABTTeamSchedule_PassesParamsAndConfiguredURL(t *testing.T) {
+	mock := &mockViewerScheduleClient{schedule: servicenow.ABTTeamScheduleData{SnURL: "https://sn.example.com"}}
+	h := NewViewerScheduleHandler(mock, viewerAccessGuard, "https://sn.example.com")
+	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule?from=2024-01-01&duration=7d&teamId=team-1&eventType=oncall", nil))
+	w := httptest.NewRecorder()
 
-	t.Run("a tag still in use stays a 409", func(t *testing.T) {
-		h := NewScheduleHandler(&mockEntityScheduleClient{
-			deleteKindFn: func(context.Context, string) ([]byte, error) {
-				return nil, &apierror.Error{StatusCode: http.StatusConflict}
-			},
-		})
-		r := withUser(httptest.NewRequest(http.MethodDelete, "/team-schedule/absence-kinds/TRAINING", nil))
-		r.SetPathValue("code", "TRAINING")
-		w := httptest.NewRecorder()
-		h.DeleteScheduleAbsenceKind(w, r)
-		assertStatus(t, w, http.StatusConflict)
-	})
+	h.GetABTTeamSchedule(w, req)
+
+	assertStatus(t, w, http.StatusOK)
+	if mock.gotFrom != "2024-01-01" || mock.gotTeamID != "team-1" || mock.gotURL != "https://sn.example.com" {
+		t.Errorf("client called with from=%q teamID=%q url=%q", mock.gotFrom, mock.gotTeamID, mock.gotURL)
+	}
+}
+
+func TestGetABTTeamSchedule_AllParamsOptional(t *testing.T) {
+	mock := &mockViewerScheduleClient{}
+	h := NewViewerScheduleHandler(mock, viewerAccessGuard, "https://sn.example.com")
+	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule", nil))
+	w := httptest.NewRecorder()
+
+	h.GetABTTeamSchedule(w, req)
+
+	assertStatus(t, w, http.StatusOK)
+}
+
+func TestGetABTTeamSchedule_RejectsUnsafeTeamID(t *testing.T) {
+	h := NewViewerScheduleHandler(&mockViewerScheduleClient{}, viewerAccessGuard, "")
+	req := withUser(httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule?teamId=team%5E1", nil))
+	w := httptest.NewRecorder()
+
+	h.GetABTTeamSchedule(w, req)
+
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
+func TestGetABTTeamSchedule_RejectsMissingSPLAccess(t *testing.T) {
+	h := NewViewerScheduleHandler(&mockViewerScheduleClient{}, viewerAccessGuard, "")
+	req := httptest.NewRequest(http.MethodGet, "/spl/abt-team-schedule", nil)
+	// Authenticated but holds no role granting PermViewerAccess.
+	req = req.WithContext(middleware.WithUserInfo(req.Context(), &middleware.UserInfo{Email: "nobody@example.com", UserID: "u-nobody"}))
+	w := httptest.NewRecorder()
+
+	h.GetABTTeamSchedule(w, req)
+
+	assertStatus(t, w, http.StatusForbidden)
 }

@@ -285,7 +285,7 @@ describe("AuthGuard's response to a /users/me failure once signed in", () => {
     currentUserState.user = undefined;
   });
 
-  it("shows the not-authorized page for a signed-in user holding neither a CS Portal role nor sales_solutions", async () => {
+  it("shows the not-authorized page for a signed-in user holding no portal role at all", async () => {
     currentUserState.user = { roles: [] };
     let rerender!: ReturnType<typeof renderAuthGuard>["rerender"];
 
@@ -305,8 +305,13 @@ describe("AuthGuard's response to a /users/me failure once signed in", () => {
     ).toBeInTheDocument();
   });
 
-  it("does NOT show the not-authorized page for a sales_solutions-only user — they're headed for the Sales/SA nav, not CS Portal's", async () => {
-    currentUserState.user = { roles: ["sales_solutions"] };
+  // The Sales/SA (SPL) audience gate checks plain "viewer", not
+  // "sales_solutions" (see usePortalView.ts's own doc comment) -- "viewer"
+  // is already one of getPortalAccess's 8 checked roles, so a Sales/SA
+  // user holding it passes with no special case needed, and a
+  // sales_solutions-only user (holding neither) has nowhere left to land.
+  it("does NOT show the not-authorized page for a viewer-only user — they're headed for the Sales/SA nav", async () => {
+    currentUserState.user = { roles: ["viewer"] };
     let rerender!: ReturnType<typeof renderAuthGuard>["rerender"];
 
     await act(async () => {
@@ -323,6 +328,26 @@ describe("AuthGuard's response to a /users/me failure once signed in", () => {
     expect(
       screen.queryByText("You don't have access to this portal yet"),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows the not-authorized page for a sales_solutions-only user — without viewer they can't reach SPL either", async () => {
+    currentUserState.user = { roles: ["sales_solutions"] };
+    let rerender!: ReturnType<typeof renderAuthGuard>["rerender"];
+
+    await act(async () => {
+      ({ rerender } = renderAuthGuard());
+    });
+    await act(async () => {
+      rerender(
+        <MemoryRouter initialEntries={["/some/protected/path"]}>
+          <AuthGuard />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(
+      screen.getByText("You don't have access to this portal yet"),
+    ).toBeInTheDocument();
   });
 
   it("shows the not-authorized page when /users/me fails with 401 (a token useAuthApiClient's own recovery chain could not fix)", async () => {

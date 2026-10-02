@@ -14,11 +14,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import { useEffect } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import EventSourcePolyfill from "@sanity/eventsource";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiConfig } from "@config/apiConfig";
 import { ApiQueryKeys } from "@constants/apiConstants";
+import { useIsCaseTabVisible } from "@context/case-tabs/CaseTabVisibilityContext";
 import { useAuthTokens } from "@hooks/useAuthTokens";
 import { useLogger } from "@hooks/useLogger";
 
@@ -37,6 +38,20 @@ const RECONNECT_MAX_DELAY_MS = 30_000;
 function reconnectDelay(attempt: number): number {
   const capped = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * 2 ** attempt);
   return Math.random() * capped;
+}
+
+function subscribePageVisibility(onChange: () => void): () => void {
+  document.addEventListener("visibilitychange", onChange);
+  return () => document.removeEventListener("visibilitychange", onChange);
+}
+
+/** Whether the browser tab itself is in the foreground. */
+function usePageVisible(): boolean {
+  return useSyncExternalStore(
+    subscribePageVisibility,
+    () => document.visibilityState !== "hidden",
+    () => true,
+  );
 }
 
 /**
@@ -74,6 +89,15 @@ function reconnectDelay(attempt: number): number {
  * instead of this hook just retrying forever with no way to ever recover
  * and no visible signal that anything's wrong.
  *
+ * The connection is held only while it can be seen: this page is the active
+ * case tab (`useIsCaseTabVisible` — the workspace keeps every opened tab's page
+ * mounted, hidden with CSS) AND the browser tab is in the foreground. Each
+ * open stream permanently occupies one of the browser's per-host connections
+ * (6 on HTTP/1.1), so one stream per mounted hidden tab starved every other
+ * request once six case tabs were open. Going inactive closes the stream and
+ * cancels any pending reconnect; coming back invalidates the queries once,
+ * because events emitted in the meantime were not delivered.
+ *
  * A no-op when `caseId` is unset, `apiConfig.streamEnabled` is false (the
  * feature's master switch, `CSM_PORTAL_STREAM_ENABLED` — defaults off), or
  * `apiConfig.streamUrl` isn't configured (Event Hub — and therefore this
@@ -84,9 +108,26 @@ export function useCaseActivityStream(caseId: string | undefined): void {
   const queryClient = useQueryClient();
   const getTokens = useAuthTokens();
   const logger = useLogger();
+  // Both hooks run unconditionally (no `&&` short-circuit between the calls).
+  const caseTabVisible = useIsCaseTabVisible();
+  const pageVisible = usePageVisible();
+  const active = caseTabVisible && pageVisible;
+  // True while the stream is deliberately closed (tab hidden / case tab
+  // deactivated), so the run that reactivates it knows it missed events.
+  const wasInactiveRef = useRef(false);
 
   useEffect(() => {
     if (!caseId || !apiConfig.streamEnabled || !apiConfig.streamUrl) return;
+    if (!active) {
+      wasInactiveRef.current = true;
+      return;
+    }
+
+    if (wasInactiveRef.current) {
+      wasInactiveRef.current = false;
+      void queryClient.invalidateQueries({ queryKey: [ApiQueryKeys.CSM_CASE_COMMENTS, caseId] });
+      void queryClient.invalidateQueries({ queryKey: [ApiQueryKeys.CSM_CASE_ACTIVITIES, caseId] });
+    }
 
     let cancelled = false;
     let source: EventSourcePolyfill | null = null;
@@ -156,5 +197,5 @@ export function useCaseActivityStream(caseId: string | undefined): void {
       clearTimeout(reconnectTimer);
       source?.close();
     };
-  }, [caseId, queryClient, getTokens, logger]);
+  }, [caseId, active, queryClient, getTokens, logger]);
 }

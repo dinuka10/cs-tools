@@ -72,20 +72,20 @@ type deployedProductSNCreator interface {
 }
 
 // SearchDeployedProducts implements DeployedProductService.
+//
+// Deliberately reads from Postgres even under DATA_SOURCE=postgres-servicenow-dual-write
+// -- see deploymentService.SearchDeployments' own doc comment for the
+// reasoning: only deployed products this Postgres mirror actually knows
+// about should be selectable, so case creation (whose deployed_product_id
+// FK requires a matching Postgres row) can never be offered one it would
+// then fail to link. A deployed product created before dual-write launched
+// won't appear here until Postgres is backfilled.
 func (s *deployedProductService) SearchDeployedProducts(ctx context.Context, req domain.SearchDeployedProductsRequest) (domain.SearchDeployedProductsResponse, error) {
 	if err := normalizePagination(&req.Pagination); err != nil {
 		return domain.SearchDeployedProductsResponse{}, err
 	}
 	if err := validateUUIDs("deploymentIds", req.DeploymentIDs); err != nil {
 		return domain.SearchDeployedProductsResponse{}, err
-	}
-	// The PostgreSQL-backed deployed_products schema has no category column yet
-	// (see the repository's TODO(phase 2)), so a category filter can't be honored here.
-	// Reject it explicitly rather than silently ignoring it and returning products
-	// outside the requested category.
-	if len(req.ProductCategories) > 0 {
-		return domain.SearchDeployedProductsResponse{},
-			&apierror.ValidationError{Msg: "productCategories filtering is not supported for the PostgreSQL data source"}
 	}
 
 	views, total, err := s.repo.SearchDeployedProducts(ctx, req)
@@ -311,6 +311,15 @@ func (s *deployedProductService) resolveActorEmail(ctx context.Context) (string,
 // comment on resolveDeployedProductNodes for how a deployed product's
 // instances are resolved.
 func (s *deployedProductService) SearchDeployedProductMetrics(ctx context.Context, id string, req domain.DeployedProductMetricsRequest) (domain.DeployedProductMetricsResponse, error) {
+	// DATA_SOURCE=postgres-servicenow-dual-write reads from ServiceNow, not
+	// hourly_usage_summary/deployment_information -- those tables have no
+	// row linked to a real deployment_node anywhere in this database (a
+	// confirmed, environment-wide gap, not specific to any one deployment),
+	// while ServiceNow has always had the complete history.
+	if s.snMirror != nil {
+		return s.snMirror.SearchDeployedProductMetrics(ctx, id, req)
+	}
+
 	if err := validateUUIDs("id", []string{id}); err != nil {
 		return domain.DeployedProductMetricsResponse{}, err
 	}
@@ -325,8 +334,13 @@ func (s *deployedProductService) SearchDeployedProductMetrics(ctx context.Contex
 }
 
 // SearchDeployedProductUsageCounts implements DeployedProductService, same
-// resolution and validation as SearchDeployedProductMetrics.
+// resolution and validation as SearchDeployedProductMetrics -- and the same
+// dual-write ServiceNow-read reasoning.
 func (s *deployedProductService) SearchDeployedProductUsageCounts(ctx context.Context, id string, req domain.DeployedProductUsageCountsRequest) (domain.DeployedProductUsageCountsResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchDeployedProductUsageCounts(ctx, id, req)
+	}
+
 	if err := validateUUIDs("id", []string{id}); err != nil {
 		return domain.DeployedProductUsageCountsResponse{}, err
 	}

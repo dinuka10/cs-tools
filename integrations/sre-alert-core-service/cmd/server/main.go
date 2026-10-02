@@ -31,6 +31,7 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gocql/gocql"
 
+	"alert-core-service/internal/auth"
 	"alert-core-service/internal/cassandra"
 	"alert-core-service/internal/config"
 	"alert-core-service/internal/csm"
@@ -78,6 +79,10 @@ func main() {
 		logger.Error("failed to initialise incident repository", "error", err)
 		os.Exit(1)
 	}
+	// Backfill version=0 on any pre-existing NULL row before anything mutates incidents_processed, or casUpdate's "IF version = 0" never matches.
+	if err := incidents.BackfillVersions(context.Background()); err != nil {
+		logger.Warn("failed to backfill incident versions, will retry on next restart", "error", err)
+	}
 	// Backfill pending index for pre-existing rows; startup continues if this fails as it will retry on next restart.
 	if err := incidents.BackfillPendingIndex(context.Background()); err != nil {
 		logger.Warn("failed to backfill pending incident index, will retry on next restart", "error", err)
@@ -96,18 +101,19 @@ func main() {
 		Scopes:       splitComma(os.Getenv("CSM_INTEGRATION_SCOPES")),
 	})
 	notifier := notify.New(base.With("component", "notify"), csmClient, notify.Config{
-		CallerID:         mustEnv(logger, "CSM_CALLER_ID"),
-		UnknownServiceID: mustEnv(logger, "CSM_UNKNOWN_SERVICE_ID"),
-		ServiceCacheTTL:  depCfg.Notify.ServiceCacheTTL.Duration(),
-		MaxAttempts:      depCfg.Notify.MaxAttempts,
-		RetryBaseDelay:   depCfg.Notify.RetryBaseDelay.Duration(),
-		HTTPTimeout:      depCfg.Notify.HTTPTimeout.Duration(),
+		CallerID:             mustEnv(logger, "CSM_CALLER_ID"),
+		UnknownServiceID:     mustEnv(logger, "CSM_UNKNOWN_SERVICE_ID"),
+		ServiceCacheTTL:      depCfg.Notify.ServiceCacheTTL.Duration(),
+		MaxAttempts:          depCfg.Notify.MaxAttempts,
+		RetryBaseDelay:       depCfg.Notify.RetryBaseDelay.Duration(),
+		HTTPTimeout:          depCfg.Notify.HTTPTimeout.Duration(),
+		ChatThreadingEnabled: depCfg.Notify.ChatThreadingEnabled,
 	})
 	eng := engine.New(base.With("component", "engine"), alerts, incidents, notifier, defaults, depCfg.Notify.MaxCSMAttempts, depCfg.Notify.StateCheckInterval.Duration(), depCfg.Engine.DedupWindow.Duration(), engine.CSMRetryConfig{
 		BaseDelay:  depCfg.Notify.CSMRetryBaseDelay.Duration(),
 		Multiplier: depCfg.Notify.CSMRetryMultiplier,
 		MaxDelay:   depCfg.Notify.CSMRetryMaxDelay.Duration(),
-	})
+	}, depCfg.Notify.ChatThreadingEnabled)
 	poller, err := poll.New(base.With("component", "poll"), session, eng, processorLease, poll.Settings{
 		Interval:            depCfg.Poll.Interval.Duration(),
 		Concurrency:         depCfg.Poll.Concurrency,
@@ -156,7 +162,10 @@ func main() {
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
-	mux.HandleFunc("/alert", h.ServeAlert)
+	// alert-ingestion authenticates against integration_users, the same store its
+	// vendor webhooks use. The endpoint is Public, so this is its only protection.
+	userRepo := auth.NewUserRepo(session)
+	mux.Handle("/alertz", auth.RequireAuth(userRepo, base.With("component", "auth"))(http.HandlerFunc(h.ServeAlert)))
 
 	port := os.Getenv("PORT")
 	if port == "" {

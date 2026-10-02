@@ -16,7 +16,7 @@
 
 import { useState } from "react";
 import { useNavigate } from "react-router";
-import { useSearchProjects } from "../api/useSplProjectsApi";
+import { useSearchSplProjects } from "../api/useProjectsApi";
 import DefaultTable from "./DefaultTable";
 import ProjectSearch from "./ProjectSearch";
 
@@ -26,7 +26,7 @@ export default function ProjectsTable() {
   const [showTable, setShowTable] = useState(true);
   const navigate = useNavigate();
 
-  const { data, isLoading, error } = useSearchProjects({ offset: page * rowsPerPage, limit: rowsPerPage });
+  const { data, isLoading, error } = useSearchSplProjects({ offset: page * rowsPerPage, limit: rowsPerPage });
 
   return (
     <>

@@ -221,17 +221,6 @@ func (r *Resolver) ChangeRequestLink(audience, changeRequestID, projectID string
 	return fmt.Sprintf("%s/operations/change-requests/%s", r.csmBase, url.PathEscape(changeRequestID))
 }
 
-// IncidentLink builds the CSM portal's incident link directly — the same
-// no-recipient reasoning as CSMLink, applied to incident.created's Google
-// Chat alert. A publisher only supplies the incident's own identity
-// (EntityID); this service is the one that knows the CSM portal's base URL
-// and builds the "Open in Portal" button target itself, the same way it
-// already does for case.created rather than trusting a caller-supplied
-// link — see dispatch.handleIncidentCreated.
-func (r *Resolver) IncidentLink(incidentID string) string {
-	return fmt.Sprintf("%s/operations/incidents/%s", r.csmBase, url.PathEscape(incidentID))
-}
-
 // emailDomain returns the part of email after its last "@", lowercased —
 // "" for an address with no "@" at all, which wso2EmailDomain will simply
 // never match (see linkFor).

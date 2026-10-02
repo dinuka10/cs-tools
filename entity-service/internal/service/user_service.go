@@ -39,6 +39,41 @@ import (
 // backend (`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`).
 var emailRE = regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
 
+// internalUserTypeRoles are the role names recompute_user_type's trigger
+// (migration 0011_users_add_user_type.sql) resolves to user_type = INTERNAL.
+var internalUserTypeRoles = []string{"admin", "internal"}
+
+// requestsInternalUserType reports whether granting roles at user creation
+// would resolve the new user's user_type to INTERNAL via that trigger.
+func requestsInternalUserType(roles []domain.UserRole) bool {
+	for _, role := range roles {
+		for _, internal := range internalUserTypeRoles {
+			if strings.EqualFold(string(role), internal) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// externalUserTypeRoles are the role names recompute_user_type's trigger
+// resolves to user_type = EXTERNAL. Creating an EXTERNAL-type user via this
+// endpoint is temporarily disabled -- see requestsExternalUserType.
+var externalUserTypeRoles = []string{"external", "partner", "customer", "partner_admin", "customer_admin"}
+
+// requestsExternalUserType reports whether granting roles at user creation
+// would resolve the new user's user_type to EXTERNAL via that trigger.
+func requestsExternalUserType(roles []domain.UserRole) bool {
+	for _, role := range roles {
+		for _, external := range externalUserTypeRoles {
+			if strings.EqualFold(string(role), external) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // validateEmail returns a ValidationError unless email is present and matches
 // emailRE. Used where a caller-supplied address is documented as
 // `format: email` in openapi.yaml and would otherwise be forwarded upstream
@@ -334,6 +369,12 @@ func (s *userService) CreateUser(ctx context.Context, req domain.CreateUserReque
 	}
 	if len(req.Roles) > 50 {
 		return domain.User{}, &apierror.ValidationError{Msg: "roles cannot contain more than 50 values"}
+	}
+	if requestsInternalUserType(req.Roles) && !strings.HasSuffix(strings.ToLower(req.Email), wso2EmailDomain) {
+		return domain.User{}, &apierror.ValidationError{Msg: "an internal-type user must have a " + wso2EmailDomain + " email address"}
+	}
+	if requestsExternalUserType(req.Roles) {
+		return domain.User{}, &apierror.ValidationError{Msg: "creating an external-type user is not available at this time"}
 	}
 
 	return s.repo.CreateUser(ctx, req, actor)

@@ -24,15 +24,28 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/entity"
 )
 
 // A closed case's attachments are read-only. entity-service still accepts the
 // write and the webapp only disables the controls, so these tests cover the
 // direct-API path this backend is responsible for closing — including that a
-// rejected request never reaches entity-service at all, and that the guard's
-// own lookup failing does not block a legitimate write (caseIsClosed fails
-// open, matching the Ballerina backend's guard).
+// rejected request never reaches entity-service at all.
+//
+// CreateCaseAttachment/PatchCaseAttachment are nested under an
+// already-authorized /cases/{caseId}/... path, so their own closed-case
+// guard (caseIsClosed) deliberately fails OPEN on a lookup error — a failed
+// business-rule check must not block an otherwise-legitimate write, matching
+// the Ballerina backend's own guard.
+//
+// DeleteAttachment is different: it is not nested under any case/project
+// path at all, so the same GetCase lookup that recovers the case also IS the
+// authorization check (see authorizeAttachmentAccess in attachments.go) and
+// must fail CLOSED — any way that lookup comes up short (the attachment
+// lookup failing, no referenceId, or a referenceId entity-service can't
+// resolve to a case the caller may see) denies the delete rather than
+// letting it through.
 
 const testAttachmentID = "33333333-3333-3333-3333-333333333333"
 
@@ -205,13 +218,14 @@ func (f *fakeClosedCaseAttachmentClient) DeleteAttachment(ctx context.Context, i
 
 // TestDeleteAttachment_ClosedCase covers DELETE /attachments/{id}, which is not
 // nested under a case: the case has to be recovered from the attachment's own
-// referenceId first. Every way that recovery can come up short — the attachment
-// lookup failing, no referenceId, or a referenceId that names a deployment
-// rather than a case (GetCase 404s) — must leave the delete working.
+// referenceId first, and that same recovery doubles as the authorization
+// check (authorizeAttachmentAccess) — so every way it can come up short now
+// denies the delete outright (404-shaped) rather than letting it through.
 func TestDeleteAttachment_ClosedCase(t *testing.T) {
 	tests := map[string]struct {
 		client     fakeClosedCaseAttachmentClient
 		wantStatus int
+		wantDenied bool // true: access denied outright, no closed-case message expected
 	}{
 		"closed case": {
 			client:     fakeClosedCaseAttachmentClient{referenceID: testCaseID, caseState: "closed"},
@@ -225,17 +239,20 @@ func TestDeleteAttachment_ClosedCase(t *testing.T) {
 			client:     fakeClosedCaseAttachmentClient{referenceID: testCaseID, caseState: "open"},
 			wantStatus: http.StatusOK,
 		},
-		"reference is not a case": {
-			client:     fakeClosedCaseAttachmentClient{referenceID: testCaseID, getCaseErr: errors.New("404 not found")},
-			wantStatus: http.StatusOK,
+		"reference is not a case the caller can see, denied": {
+			client:     fakeClosedCaseAttachmentClient{referenceID: testCaseID, getCaseErr: &apierror.Error{StatusCode: http.StatusNotFound}},
+			wantStatus: http.StatusNotFound,
+			wantDenied: true,
 		},
-		"attachment lookup fails": {
-			client:     fakeClosedCaseAttachmentClient{getAttachmentErr: errors.New("upstream down")},
-			wantStatus: http.StatusOK,
+		"attachment lookup fails, denied": {
+			client:     fakeClosedCaseAttachmentClient{getAttachmentErr: &apierror.Error{StatusCode: http.StatusNotFound}},
+			wantStatus: http.StatusNotFound,
+			wantDenied: true,
 		},
-		"attachment has no reference": {
+		"attachment has no reference, denied": {
 			client:     fakeClosedCaseAttachmentClient{referenceID: "", caseState: "closed"},
-			wantStatus: http.StatusOK,
+			wantStatus: http.StatusNotFound,
+			wantDenied: true,
 		},
 	}
 
@@ -255,17 +272,22 @@ func TestDeleteAttachment_ClosedCase(t *testing.T) {
 			if rec.Code != tc.wantStatus {
 				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.wantStatus, rec.Body.String())
 			}
-			if tc.wantStatus == http.StatusBadRequest {
+			switch {
+			case tc.wantDenied:
+				if fake.deleted {
+					t.Error("entity-service DeleteAttachment was called for a denied request")
+				}
+			case tc.wantStatus == http.StatusBadRequest:
 				if msg := decodeMessage(t, rec); msg != ErrMsgCaseClosedForAttachmentDelete {
 					t.Errorf("message = %q, want %q", msg, ErrMsgCaseClosedForAttachmentDelete)
 				}
 				if fake.deleted {
 					t.Error("entity-service DeleteAttachment was called for a closed case's attachment")
 				}
-				return
-			}
-			if !fake.deleted {
-				t.Error("entity-service DeleteAttachment was not called")
+			default:
+				if !fake.deleted {
+					t.Error("entity-service DeleteAttachment was not called")
+				}
 			}
 		})
 	}

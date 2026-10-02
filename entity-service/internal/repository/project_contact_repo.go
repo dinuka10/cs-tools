@@ -72,7 +72,7 @@ const accountLevelRoleNames = `ARRAY['external','customer','partner','customer_a
 type ProjectContactRepository interface {
 	// SearchProjectContacts returns a filtered, paginated slice of
 	// projectID's contacts together with the total count of matching rows
-	// before pagination. callerEmail is threaded down for a future
+	// before pagination. DEACTIVATED memberships are not listed. callerEmail is threaded down for a future
 	// authorization decision -- see AccountContactRepository's own doc
 	// comment for the same convention; not enforced yet.
 	SearchProjectContacts(ctx context.Context, projectID string, req domain.SearchProjectContactsRequest, callerEmail string) ([]ProjectContactRow, int, error)
@@ -129,9 +129,17 @@ func scanProjectContact(row interface{ Scan(...any) error }) (ProjectContactRow,
 	return c, nil
 }
 
+// searchProjectContactsBaseWhere scopes the contacts list to one project's
+// live memberships. DEACTIVATED rows are left out: the ServiceNow era
+// hard-deleted them, so no portal screen has ever listed one (neither
+// portal has a Deactivated chip, filter or action), and the Salesforce
+// ingest now keeps them as a soft delete. Re-inviting a deactivated contact
+// goes through the membership write path, which still finds the row.
+const searchProjectContactsBaseWhere = "WHERE pc.project_id = $1 AND (pc.state IS NULL OR pc.state <> 'DEACTIVATED'::project_contact_state_enum)"
+
 // SearchProjectContacts implements ProjectContactRepository.
 func (r *projectContactRepo) SearchProjectContacts(ctx context.Context, projectID string, req domain.SearchProjectContactsRequest, _ string) ([]ProjectContactRow, int, error) {
-	where := "WHERE pc.project_id = $1"
+	where := searchProjectContactsBaseWhere
 	args := []any{projectID}
 	argIdx := 2
 

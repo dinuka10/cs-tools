@@ -1992,7 +1992,12 @@ export function toUtcStartOfDay(date: Date): string {
     throw new TypeError(`toUtcStartOfDay: invalid Date argument — ${String(date)}`);
   }
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T00:00:00Z`;
+  // The year is zero-padded too, not just month/day: getFullYear() can
+  // legitimately return fewer than 4 digits (e.g. a Date constructed from a
+  // partially-typed year), and an un-padded short year here previously
+  // serialized straight into a malformed RFC3339 string (e.g.
+  // "2-01-10T00:00:00Z") that entity-service's own filter parser rejects.
+  return `${String(date.getFullYear()).padStart(4, "0")}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T00:00:00Z`;
 }
 
 export function toUtcEndOfDay(date: Date): string {
@@ -2004,8 +2009,14 @@ export function toUtcEndOfDay(date: Date): string {
   // ServiceNow applies a strict < comparison on the date portion, so
   // "2026-06-10T23:59:59Z" becomes < 2026-06-10 (excludes Jun 10).
   // Sending "2026-06-11T00:00:00Z" becomes < 2026-06-11 (includes Jun 10).
-  const next = new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1);
-  return `${next.getFullYear()}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T00:00:00Z`;
+  // Built with setDate on a copy, not `new Date(year, month, day+1)` --
+  // that 3-arg form re-triggers the Date constructor's year special-casing
+  // (a year argument 0-99 becomes 1900+year), which would silently corrupt
+  // an already-short year a second time.
+  const next = new Date(date.getTime());
+  next.setDate(next.getDate() + 1);
+  // Year zero-padded too -- see toUtcStartOfDay's identical comment above.
+  return `${String(next.getFullYear()).padStart(4, "0")}-${pad(next.getMonth() + 1)}-${pad(next.getDate())}T00:00:00Z`;
 }
 
 /**

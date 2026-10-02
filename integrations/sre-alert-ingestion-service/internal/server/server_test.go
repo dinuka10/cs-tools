@@ -188,6 +188,76 @@ type denyAll struct{}
 
 func (denyAll) Authenticate(*http.Request, string) error { return auth.ErrUnauthorized }
 
+type allowAll struct{}
+
+func (allowAll) Authenticate(*http.Request, string) error { return nil }
+
+// countingReader reports how much of the body was actually consumed.
+type countingReader struct {
+	data []byte
+	read int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.read >= len(c.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, c.data[c.read:])
+	c.read += n
+	return n, nil
+}
+
+// A rejected webhook must not read its body, so an unauthenticated caller cannot make
+// a replica allocate max_body_bytes per request.
+func TestVendorRoute_AuthRejectionNeverReadsBody(t *testing.T) {
+	s := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Auth: denyAll{},
+		Pipeline: &fakePipeline{}, Vendors: []string{"aws"}, MaxBodyBytes: 1 << 20,
+	})
+	body := &countingReader{data: []byte(strings.Repeat("x", 4096))}
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", VendorRoutePrefix+"aws", body))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if body.read != 0 {
+		t.Errorf("read %d body bytes on a 401; auth must run before the body is read", body.read)
+	}
+}
+
+// A 401 must carry a Basic challenge. GCP Cloud Monitoring only sends its webhook
+// credentials after a 401 with this header, and AWS SNS sends the first request of a
+// subscription confirmation without credentials; both retry once challenged.
+func TestVendorRoute_UnauthorizedSendsBasicChallenge(t *testing.T) {
+	s := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Auth: denyAll{},
+		Pipeline: &fakePipeline{}, Vendors: []string{"aws"}, MaxBodyBytes: 1024,
+	})
+	rec := do(t, s, "POST", VendorRoutePrefix+"aws", "{}")
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	challenge := rec.Header().Get("WWW-Authenticate")
+	if !strings.HasPrefix(challenge, "Basic ") || !strings.Contains(challenge, "realm=") {
+		t.Errorf("WWW-Authenticate = %q, want a Basic challenge with a realm", challenge)
+	}
+}
+
+// An accepted webhook must not be challenged.
+func TestVendorRoute_AuthorizedHasNoChallenge(t *testing.T) {
+	s := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Auth: allowAll{},
+		Pipeline: &fakePipeline{result: Result{Status: http.StatusCreated}},
+		Vendors:  []string{"aws"}, MaxBodyBytes: 1024,
+	})
+	rec := do(t, s, "POST", VendorRoutePrefix+"aws", "{}")
+	if got := rec.Header().Get("WWW-Authenticate"); got != "" {
+		t.Errorf("WWW-Authenticate = %q on a %d, want none", got, rec.Code)
+	}
+}
+
 func TestVendorRoute_AuthHookRunsBeforePipeline(t *testing.T) {
 	p := &fakePipeline{result: Result{Status: http.StatusCreated}}
 	s := New(Options{

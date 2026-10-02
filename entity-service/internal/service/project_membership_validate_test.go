@@ -57,20 +57,6 @@ func assertNothingWritten(t *testing.T, h *writeHarness) {
 	}
 }
 
-func TestValidateInvitation_RejectsNonInternalCallers(t *testing.T) {
-	h := newWriteHarness(t, stubAccess{scope: AccessScope{ProjectIDs: []string{writeProjectID}}})
-
-	_, err := h.svc.ValidateInvitation(context.Background(), writeProjectID, domain.ValidateProjectMembershipRequest{Email: "new@acme.com"})
-
-	var fe *apierror.ForbiddenError
-	if !errors.As(err, &fe) {
-		t.Fatalf("err = %v, want ForbiddenError", err)
-	}
-	if h.repo.resolves != 0 || len(h.se.contactSearchs) != 0 {
-		t.Error("nothing downstream may be read for a caller that is refused")
-	}
-}
-
 func TestValidateInvitation_RejectsBadInput(t *testing.T) {
 	cases := []struct {
 		name      string

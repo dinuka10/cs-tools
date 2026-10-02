@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -58,11 +57,11 @@ type ConversationRepository interface {
 }
 
 type conversationRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewConversationRepository constructs a ConversationRepository backed by the given connection pool.
-func NewConversationRepository(db *pgxpool.Pool) ConversationRepository {
+func NewConversationRepository(db *Scoped) ConversationRepository {
 	return &conversationRepo{db: db}
 }
 
@@ -344,34 +343,41 @@ func (r *conversationRepo) GetConversation(ctx context.Context, id string) (doma
 
 // UpdateConversation implements ConversationRepository.
 func (r *conversationRepo) UpdateConversation(ctx context.Context, id string, state domain.ConversationState, actorEmail string) (domain.UpdatedConversation, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.UpdatedConversation{}, fmt.Errorf("update conversation: begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	if _, err := tx.Exec(ctx,
-		`UPDATE conversation SET state = $1::text::conversation_state_enum WHERE id = $2`,
-		conversationStateToEnum(state), id,
-	); err != nil {
-		return domain.UpdatedConversation{}, fmt.Errorf("update conversation state: %w", err)
-	}
-
 	var number string
 	var updatedOn time.Time
-	err = tx.QueryRow(ctx,
-		`UPDATE work_item SET updated_on = NOW(), updated_by = $1 WHERE id = $2 AND type = 'CONVERSATION' RETURNING number, updated_on`,
-		actorEmail, id,
-	).Scan(&number, &updatedOn)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.UpdatedConversation{}, &apierror.NotFoundError{Msg: "conversation not found"}
-	}
-	if err != nil {
-		return domain.UpdatedConversation{}, fmt.Errorf("update conversation work_item: %w", err)
-	}
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		ct, err := tx.Exec(ctx,
+			`UPDATE conversation SET state = $1::text::conversation_state_enum WHERE id = $2`,
+			conversationStateToEnum(state), id,
+		)
+		if err != nil {
+			return fmt.Errorf("update conversation state: %w", err)
+		}
+		// conversation's RLS USING clause (migration 0146) silently
+		// excludes a row the caller isn't a project member of -- a plain
+		// Exec with no RETURNING never surfaces that as pgx.ErrNoRows the
+		// way the work_item UPDATE below does, so it must be checked
+		// explicitly here or a non-member caller would see a false
+		// "success" with the state left unchanged (same fix already applied
+		// to PatchChangeRequest, migration 0145).
+		if ct.RowsAffected() == 0 {
+			return &apierror.NotFoundError{Msg: "conversation not found"}
+		}
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.UpdatedConversation{}, fmt.Errorf("update conversation: commit: %w", err)
+		err = tx.QueryRow(ctx,
+			`UPDATE work_item SET updated_on = NOW(), updated_by = $1 WHERE id = $2 AND type = 'CONVERSATION' RETURNING number, updated_on`,
+			actorEmail, id,
+		).Scan(&number, &updatedOn)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return &apierror.NotFoundError{Msg: "conversation not found"}
+		}
+		if err != nil {
+			return fmt.Errorf("update conversation work_item: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.UpdatedConversation{}, err
 	}
 
 	stateStr := string(state)

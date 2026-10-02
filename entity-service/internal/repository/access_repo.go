@@ -121,3 +121,36 @@ func (r *accessRepo) RegisteredProjectIDs(ctx context.Context, email string) ([]
 	}
 	return out, rows.Err()
 }
+
+// AccountAdminRepository answers whether a caller is an account admin.
+// The role has no account column; callers pair it with project membership.
+type AccountAdminRepository interface {
+	// HoldsAccountAdminRole reports whether an active user with this email
+	// holds customer_admin or partner_admin.
+	HoldsAccountAdminRole(ctx context.Context, email string) (bool, error)
+}
+
+// NewAccountAdminRepository constructs an AccountAdminRepository.
+func NewAccountAdminRepository(db *pgxpool.Pool) AccountAdminRepository {
+	return &accessRepo{db: db}
+}
+
+// HoldsAccountAdminRole implements AccountAdminRepository.
+func (r *accessRepo) HoldsAccountAdminRole(ctx context.Context, email string) (bool, error) {
+	if r.db == nil {
+		return false, r.errNoPool()
+	}
+	var ok bool
+	err := r.db.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM "user" u
+		   JOIN user_role ur ON ur.user_id = u.id
+		   JOIN role rl ON rl.id = ur.role_id
+		   WHERE LOWER(u.email) = LOWER($1)
+		     AND u.is_active IS DISTINCT FROM FALSE
+		     AND rl.name IN ('customer_admin', 'partner_admin'))`, email).Scan(&ok)
+	if err != nil {
+		return false, fmt.Errorf("access: account admin role: %w", err)
+	}
+	return ok, nil
+}

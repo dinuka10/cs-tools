@@ -23,11 +23,11 @@ export interface SlaReportParams {
   from: string;
   to: string;
   /** Query stays disabled until this flips true (the source app's own
-   * form-first / report-after-submit flow — see SplSlaReportPage). */
+   * form-first / report-after-submit flow — see SlaReportPage). */
   enabled: boolean;
 }
 
-/** `GET /spl/generate-sla-report` — see internal/servicenow/reports.go. */
+/** `GET /generate-sla-report` — see internal/servicenow/reports.go. */
 export function useGetSlaReport(
   params: SlaReportParams,
 ): UseQueryResult<SLAReportResponse, Error> {
@@ -39,7 +39,7 @@ export function useGetSlaReport(
     queryFn: () => {
       const query = new URLSearchParams({ projectSysId, from, to });
       return api.get<SLAReportResponse>(
-        `/spl/generate-sla-report?${query.toString()}`,
+        `/generate-sla-report?${query.toString()}`,
       ) as Promise<SLAReportResponse>;
     },
     enabled,

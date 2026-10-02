@@ -14,23 +14,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Package auth is the vendor-route auth hook. Only "none" exists today: the
-// vendor URLs are public until an auth method is chosen, and the Choreo gateway rate limit is
-// the only protection. Adding Basic auth or a shared-secret header later is a new
-// Authenticator selected by auth.mode, not a restructure of the router.
+// Package auth checks vendor webhooks against alerts-core's integration_users table (AUTH_ENABLED).
 package auth
 
 import (
 	"errors"
-	"fmt"
+	"log/slog"
 	"net/http"
 )
 
 // ErrUnauthorized is returned by an Authenticator that rejects a request; the router answers 401.
 var ErrUnauthorized = errors.New("unauthorized")
 
-// Authenticator decides whether a vendor webhook request may proceed. It runs after the
-// router has matched the vendor and before the body is transformed.
+// Authenticator decides whether a vendor webhook may proceed, before the body is read.
 type Authenticator interface {
 	Authenticate(r *http.Request, vendor string) error
 }
@@ -41,13 +37,24 @@ type None struct{}
 // Authenticate always succeeds.
 func (None) Authenticate(*http.Request, string) error { return nil }
 
-// New returns the Authenticator for auth.mode, or an error for an unknown mode so a typo in
-// config.toml fails at startup instead of silently leaving the routes open.
-func New(mode string) (Authenticator, error) {
-	switch mode {
-	case "none":
-		return None{}, nil
-	default:
-		return nil, fmt.Errorf("unknown auth.mode %q", mode)
+// Audit logs what it would reject but never rejects, so enabling auth can't drop alerts.
+type Audit struct {
+	inner  Authenticator
+	logger *slog.Logger
+}
+
+// NewAudit wraps inner so it logs what it would reject without rejecting anything.
+func NewAudit(inner Authenticator, logger *slog.Logger) Authenticator {
+	return Audit{inner: inner, logger: logger}
+}
+
+// Authenticate always returns nil, logging what the wrapped Authenticator would reject.
+func (a Audit) Authenticate(r *http.Request, vendor string) error {
+	if err := a.inner.Authenticate(r, vendor); err != nil {
+		a.logger.Warn("auth would reject request",
+			"vendor", vendor,
+			"path", r.URL.Path,
+			"reason", err.Error())
 	}
+	return nil
 }

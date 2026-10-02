@@ -232,6 +232,17 @@ func (s *deploymentService) resolveActorEmail(ctx context.Context) (string, erro
 }
 
 // SearchDeployments implements DeploymentService.
+//
+// Deliberately reads from Postgres even under DATA_SOURCE=postgres-servicenow-dual-write
+// (unlike deployed_product_service.go's read methods, which still read
+// ServiceNow) -- explicit product decision: only deployments this Postgres
+// mirror actually knows about should be selectable at all, so that case
+// creation (which requires a matching Postgres row for its deployment_id
+// FK) can never be offered a deployment it would then fail to link. The
+// cost is real and accepted: a deployment created before dual-write
+// launched (or synced from elsewhere) simply won't appear here until
+// Postgres is backfilled, even though it's a real, valid deployment in
+// ServiceNow.
 func (s *deploymentService) SearchDeployments(ctx context.Context, req domain.SearchDeploymentsRequest) (domain.SearchDeploymentsResponse, error) {
 	if err := normalizePagination(&req.Pagination); err != nil {
 		return domain.SearchDeploymentsResponse{}, err

@@ -21,6 +21,8 @@ package apierror
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 )
 
 // ErrorResponse is the JSON body returned for all error responses.
@@ -38,6 +40,16 @@ type ValidationError struct {
 
 // Error implements the error interface.
 func (e *ValidationError) Error() string { return e.Msg }
+
+// InvalidValue names a rejected input value and the accepted ones, e.g.
+// `sortOrder: "up" is not a valid sort order; use one of asc, desc`.
+func InvalidValue(field, value, what string, accepted []string) *ValidationError {
+	use := "use " + strings.Join(accepted, ", ")
+	if len(accepted) > 1 {
+		use = "use one of " + strings.Join(accepted, ", ")
+	}
+	return &ValidationError{Msg: field + ": " + strconv.Quote(value) + " is not a valid " + what + "; " + use}
+}
 
 // NotFoundError signals that the requested resource does not exist and should
 // be reported as HTTP 404. The Msg is safe to log and return to the caller.

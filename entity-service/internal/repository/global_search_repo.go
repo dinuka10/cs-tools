@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
 )
@@ -53,9 +52,21 @@ func caseTypeRef(workItemType string) domain.ReferenceTableItem {
 // SearchScope restricts a search to some projects. Unrestricted means all of
 // them; otherwise only ProjectIDs, and an empty list matches nothing (it is
 // never treated as "no filter").
+//
+// ViewerEmail is the resolved caller's own email (populated alongside
+// ProjectIDs in AccessService.scopeForUser) -- set here rather than
+// re-derived from auth.IdentityFromContext at the repository layer, so
+// identity resolution stays in the one place resolveScopeForID's own doc
+// comment already designates for it. Only announcement-visibility reads
+// (case_repo.go's setAnnouncementVisibility) currently use it; every other
+// scoped query still only reads Unrestricted/ProjectIDs. It is left empty
+// for an Unrestricted caller resolved from an internal client credential
+// with no attached user token -- safe, since Unrestricted alone already
+// grants that path full access regardless of email.
 type SearchScope struct {
 	Unrestricted bool
 	ProjectIDs   []string
+	ViewerEmail  string
 }
 
 // scopePredicate is the single place the "row belongs to one of the caller's
@@ -90,11 +101,11 @@ type GlobalSearchRepository interface {
 }
 
 type globalSearchRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewGlobalSearchRepository constructs a GlobalSearchRepository backed by the given connection pool.
-func NewGlobalSearchRepository(db *pgxpool.Pool) GlobalSearchRepository {
+func NewGlobalSearchRepository(db *Scoped) GlobalSearchRepository {
 	return &globalSearchRepo{db: db}
 }
 
@@ -129,8 +140,23 @@ func orderDirection(desc bool) string {
 	return "ASC"
 }
 
-// runSearch executes the count and page queries concurrently.
-func runSearch[T any](ctx context.Context, db *pgxpool.Pool, countSQL, pageSQL string, f searchFilter, pagination domain.Pagination, scan func(pgx.Rows) (T, error)) ([]T, int, error) {
+// runSearch executes the count and page queries concurrently, each through
+// Scoped so the caller's identity (stamped onto ctx from the explicit scope
+// parameter below) is set correctly -- required so any table these queries
+// touch that carries a caller-scoped row-level-security policy (currently
+// `announcement` and, once work_item's own RLS is in play, SearchCases'
+// join more broadly) is evaluated correctly. This applies unconditionally,
+// including for SearchProjects, which doesn't currently need it: the cost
+// is negligible, and it means a future RLS policy on another table this
+// function's callers might one day join against needs no further change
+// here.
+func runSearch[T any](ctx context.Context, db *Scoped, scope SearchScope, countSQL, pageSQL string, f searchFilter, pagination domain.Pagination, scan func(pgx.Rows) (T, error)) ([]T, int, error) {
+	// WithCallerIdentity from the explicit scope parameter, not whatever
+	// identity ctx already carries -- same convention as case_repo.go's
+	// GetCaseByID/SearchCases, which take an identical explicit parameter
+	// for the same reason.
+	ctx = WithCallerIdentity(ctx, scope)
+
 	pageArgs := append(append([]any{}, f.args...), pagination.Limit, pagination.Offset)
 	pageSQL = fmt.Sprintf("%s LIMIT $%d OFFSET $%d", pageSQL, len(f.args)+1, len(f.args)+2)
 
@@ -203,7 +229,7 @@ func (r *globalSearchRepo) SearchProjects(ctx context.Context, scope SearchScope
 	                   pt.id, pt.name, a.id, a.name` + from + ` ` + f.where +
 		fmt.Sprintf(` ORDER BY %s %s NULLS LAST, p.id`, col, orderDirection(desc))
 
-	return runSearch(ctx, r.db, countSQL, pageSQL, f, pagination, func(rows pgx.Rows) (domain.GlobalSearchProject, error) {
+	return runSearch(ctx, r.db, scope, countSQL, pageSQL, f, pagination, func(rows pgx.Rows) (domain.GlobalSearchProject, error) {
 		var (
 			p                   domain.GlobalSearchProject
 			name, description   *string
@@ -250,7 +276,20 @@ func (r *globalSearchRepo) SearchCases(ctx context.Context, scope SearchScope, q
 	}
 
 	f := searchFilter{where: `WHERE wi.type = ANY(` + caseLikeWorkItemTypes + `)`}
-	f.scope("wi.project_id", scope)
+	// No f.scope("wi.project_id", scope) call here any more -- work_item's
+	// own RLS policy (migration 0147) already applies the identical
+	// is_project_member check to every statement this repository's Scoped
+	// connection issues, so a second hand-written copy would only be a
+	// second place for the two to drift. The early return above still
+	// short-circuits the round trip for a scoped caller with zero
+	// registered projects; it's an optimization, not the enforcement.
+	//
+	// See announcementVisibilityLeakGuard's own doc comment (case_repo.go).
+	// Applies to both countSQL and pageSQL below, via this same f.where.
+	f.where += " AND " + announcementLeakGuardFor(scope)
+	// Planner hint for external callers only (see viewerProjectHint); RLS
+	// remains the authorization boundary.
+	f.where += viewerProjectHint("wi", scope)
 	if query != "" {
 		f.args = append(f.args, containsPattern(query))
 		n := len(f.args)
@@ -275,7 +314,7 @@ func (r *globalSearchRepo) SearchCases(ctx context.Context, scope SearchScope, q
 	                   a.id, a.name` + from + ` ` + f.where +
 		fmt.Sprintf(` ORDER BY %s %s NULLS LAST, wi.id`, col, orderDirection(desc))
 
-	return runSearch(ctx, r.db, countSQL, pageSQL, f, pagination, func(rows pgx.Rows) (domain.GlobalSearchCase, error) {
+	return runSearch(ctx, r.db, scope, countSQL, pageSQL, f, pagination, func(rows pgx.Rows) (domain.GlobalSearchCase, error) {
 		var (
 			cs                       domain.GlobalSearchCase
 			internalID, title, descr *string

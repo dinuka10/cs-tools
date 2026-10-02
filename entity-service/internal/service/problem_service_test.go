@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -451,5 +452,35 @@ func TestProblemService_UpdateProblem_MirrorDispatchedEvenWhenReReadFails(t *tes
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("mirror.UpdateProblem was never called despite the Postgres write succeeding -- the re-read failure must not skip the mirror dispatch")
+	}
+}
+
+// TestProblemService_CreateProblem_RejectsBeforeServiceNowWhenPostgresWouldFail
+// proves values the Postgres insert cannot store are rejected BEFORE the
+// ServiceNow call, so no ServiceNow-only record is left behind.
+func TestProblemService_CreateProblem_RejectsBeforeServiceNowWhenPostgresWouldFail(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	bad := "bogus"
+	cases := map[string]func(*domain.CreateProblemRequest){
+		"subject over 512 characters": func(r *domain.CreateProblemRequest) { r.Subject = strings.Repeat("a", 513) },
+		"unknown category":            func(r *domain.CreateProblemRequest) { r.Category = &bad },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			mirror := &stubMirrorProblemService{
+				createProblem: func(context.Context, domain.CreateProblemRequest) (domain.ProblemDetail, error) {
+					t.Fatal("ServiceNow must not be called")
+					return domain.ProblemDetail{}, nil
+				},
+			}
+			svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, mirror, nil)
+			req := validCreateProblemRequest()
+			mutate(&req)
+			_, err := svc.CreateProblem(ctx, req)
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected ValidationError, got %T: %v", err, err)
+			}
+		})
 	}
 }

@@ -173,10 +173,17 @@ describe("useCustomerPermissions & Permission Matrix", () => {
         expect(hasCustomerPermission(roles, "time_cards", "update")).toBe(false);
         expect(hasCustomerPermission(roles, "time_cards", "delete")).toBe(false);
 
-        // Projects: Read Only
+        // Projects: Read Only, EXCEPT customer_admin also gets Update --
+        // PATCH /projects/{id} (the route this permission gates) only ever
+        // touches the project's own AI Assistant settings (hasAgent/
+        // hasKbReferences), not general project data, so a customer's own
+        // Admin is allowed to toggle those for their own project.
+        const isCustomerAdminRole = roles.includes("customer_admin");
         expect(hasCustomerPermission(roles, "projects", "read")).toBe(true);
         expect(hasCustomerPermission(roles, "projects", "create")).toBe(false);
-        expect(hasCustomerPermission(roles, "projects", "update")).toBe(false);
+        expect(hasCustomerPermission(roles, "projects", "update")).toBe(
+          isCustomerAdminRole,
+        );
         expect(hasCustomerPermission(roles, "projects", "delete")).toBe(false);
 
         // Change Requests: Read Only

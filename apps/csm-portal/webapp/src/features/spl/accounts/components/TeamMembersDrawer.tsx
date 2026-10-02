@@ -27,7 +27,7 @@ import {
   Typography,
 } from "@wso2/oxygen-ui";
 import { useColorScheme } from "@mui/material/styles";
-import { useGetAbtTeamMembers } from "../api/useSplAccountsApi";
+import { useGetAbtTeamMembers } from "../api/useAccountsApi";
 
 export default function TeamMembersDrawer({
   open,

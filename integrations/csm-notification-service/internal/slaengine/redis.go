@@ -50,6 +50,19 @@ const tierKeyPrefix = "sla:tier:"
 // two replicas can both read the same stale value in between.
 const tierClaimKeyPrefix = "sla:tier-claimed:"
 
+// emailClaimKeyPrefix namespaces one key per (caseID, clockType, tier) —
+// claimed via ClaimEmail's own Redis SETNX, independently of
+// tierClaimKeyPrefix above. Engine.alertTier attempts the breach emails
+// regardless of whether the Chat alert itself succeeded (a Chat outage must
+// not also suppress email — see that function's own doc comment), but a
+// Chat failure still causes processStatus to release the tier claim and
+// retry the whole tier on the next Tick; without a separate claim here,
+// that retry would resend an already-attempted email every time Chat kept
+// failing. Claimed once per tier regardless of the email send's own
+// outcome (mirrors sendBreachEmails' own best-effort, not-retried
+// contract) — only Chat failures are ever retried by this mechanism.
+const emailClaimKeyPrefix = "sla:email-claimed:"
+
 // tierTTL bounds how long a clock's cursor survives with no further Tick
 // touching it — entity-service's GET /sla-status only ever returns
 // currently-active clocks, so a clock that completes/closes simply stops
@@ -83,6 +96,10 @@ func tierKey(caseID, clockType string) string {
 
 func tierClaimKey(caseID, clockType string, tier int) string {
 	return tierClaimKeyPrefix + caseID + "|" + clockType + "|" + strconv.Itoa(tier)
+}
+
+func emailClaimKey(caseID, clockType string, tier int) string {
+	return emailClaimKeyPrefix + caseID + "|" + clockType + "|" + strconv.Itoa(tier)
 }
 
 // GetTier returns the last tier recorded for (caseID, clockType), and
@@ -129,4 +146,15 @@ func (s *TierStore) ClaimTier(ctx context.Context, caseID, clockType string, tie
 // cycle.
 func (s *TierStore) ReleaseTier(ctx context.Context, caseID, clockType string, tier int) error {
 	return s.rdb.Del(ctx, tierClaimKey(caseID, clockType, tier)).Err()
+}
+
+// ClaimEmail atomically claims (caseID, clockType, tier) for the breach
+// email step via Redis SETNX — claimed=true means this call is the first
+// to attempt the email for this tier and should go on to send it;
+// claimed=false means a previous call (on this replica or another) already
+// attempted it, regardless of whether that attempt succeeded. See
+// emailClaimKeyPrefix's own doc comment for why this is a separate claim
+// from ClaimTier above, and why there is no corresponding ReleaseEmail.
+func (s *TierStore) ClaimEmail(ctx context.Context, caseID, clockType string, tier int) (claimed bool, err error) {
+	return s.rdb.SetNX(ctx, emailClaimKey(caseID, clockType, tier), 1, tierTTL).Result()
 }

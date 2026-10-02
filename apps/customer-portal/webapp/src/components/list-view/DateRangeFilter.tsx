@@ -44,6 +44,21 @@ function parseUtcIsoEndDate(value: string | undefined): Date | null {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+// MUI's DatePicker has keyboard-editable year/month/day sections, so onChange
+// can fire mid-typing with a technically-valid, non-NaN Date whose year is
+// still incomplete (e.g. the user typed "2" and tabbed away before finishing
+// "2026") -- `!isNaN(date.getTime())` alone doesn't catch this, since year 2
+// AD is a legal JS Date. toUtcStartOfDay/toUtcEndOfDay zero-pad month/day but
+// not the year, so a short year used to serialize straight into a malformed
+// filter value (e.g. "2-01-10T00:00:00Z") and reach entity-service as a 400.
+// Treating an incomplete year the same as an invalid one -- waiting for the
+// rest of the digits rather than forwarding a technically-parseable but
+// nonsensical date -- is the correct fix; padding it to "0002-01-10" would
+// only make the malformed value syntactically valid, not correct.
+function isCompleteCalendarDate(date: unknown): date is Date {
+  return date instanceof Date && !isNaN(date.getTime()) && date.getFullYear() >= 1000;
+}
+
 export type DateRangeFilterProps = {
   label: string;
   startDate: string | undefined;
@@ -90,7 +105,7 @@ export default function DateRangeFilter({
             value={parsedStart}
             maxDate={parsedEnd ?? undefined}
             onChange={(date) => {
-              onStartChange(date instanceof Date && !isNaN(date.getTime()) ? toUtcStartOfDay(date) : undefined);
+              onStartChange(isCompleteCalendarDate(date) ? toUtcStartOfDay(date) : undefined);
             }}
             slotProps={{
               textField: { size: "small", fullWidth: true },
@@ -102,7 +117,7 @@ export default function DateRangeFilter({
             value={parsedEnd}
             minDate={parsedStart ?? undefined}
             onChange={(date) => {
-              onEndChange(date instanceof Date && !isNaN(date.getTime()) ? toUtcEndOfDay(date) : undefined);
+              onEndChange(isCompleteCalendarDate(date) ? toUtcEndOfDay(date) : undefined);
             }}
             slotProps={{
               textField: { size: "small", fullWidth: true },

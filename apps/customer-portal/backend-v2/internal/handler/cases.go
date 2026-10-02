@@ -62,9 +62,9 @@ func NewCaseHandler(entity entityCaseClient) *CaseHandler {
 // resolveWatchListUserIDs translates a caller-supplied watch list — email
 // addresses, picked from the project-contact onboarding service (a Salesforce-backed
 // identity space, not entity-service's own) — into entity-service's own "user"
-// table ids, which is what CreateCase/UpdateCase's own WatchList field actually
-// requires (validated there as UUIDs). Without this, every watch-list write was
-// rejected outright with "watchList contains invalid UUID: <email>".
+// table ids, which is what UpdateCase's WatchList field requires (validated
+// there as UUIDs). Used by PatchCase only: CreateCase forwards the emails
+// as-is because entity-service resolves them itself on create.
 //
 // A contact whose email doesn't resolve to any entity-service user (not yet a
 // registered platform user — a real, valid state for a project contact) is
@@ -318,17 +318,10 @@ func (h *CaseHandler) CreateCase(w http.ResponseWriter, r *http.Request) {
 	// request body (the struct's json:"-" tag means a client-supplied value
 	// would be silently dropped anyway, but set it explicitly for clarity).
 	entityReq.CreatedBy = user.Email
-	// req.WatchList carries project-contact emails, not entity-service user
-	// ids — resolve before forwarding (see resolveWatchListUserIDs). A lookup
-	// failure must stop the create, not silently proceed as if no watchers
-	// had been requested.
-	watchListIDs, err := h.resolveWatchListUserIDs(r.Context(), req.WatchList)
-	if err != nil {
-		slog.ErrorContext(r.Context(), "resolving watch-list emails failed", "userID", user.UserID, "err", summarizeErr(err))
-		mapUpstreamError(w, err, "Failed to resolve watch list.")
-		return
-	}
-	entityReq.WatchList = watchListIDs
+	// entityReq.WatchList (copied from req.WatchList above) is forwarded as the
+	// project-contact emails the caller submitted. entity-service resolves them
+	// itself for each data source on create, so no id round trip is needed here
+	// (that lookup is also gated to internal roles for the caller's own token).
 
 	result, err := h.entity.CreateCase(r.Context(), entityReq)
 	if err != nil {

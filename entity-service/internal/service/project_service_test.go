@@ -128,7 +128,7 @@ func TestSearchProjectsExcludeClosureStatesAndProjectKeysPassThrough(t *testing.
 // comment on StartDate above already describes and fixes for that field.
 func TestSearchProjects_ClosureStateReachesResponse(t *testing.T) {
 	closureState := "Suspended"
-	repo := &recordingProjectRepo{toReturn: []domain.Project{{ID: "p1", ClosureState: &closureState}}}
+	repo := &recordingProjectRepo{toReturn: []domain.Project{{ID: "p1", ProjectClosureFields: domain.ProjectClosureFields{ClosureState: &closureState}}}}
 	svc := NewProjectService(repo, alwaysUnrestrictedAccess{})
 
 	resp, err := svc.SearchProjects(t.Context(), domain.SearchProjectsRequest{})
@@ -137,5 +137,70 @@ func TestSearchProjects_ClosureStateReachesResponse(t *testing.T) {
 	}
 	if len(resp.Projects) != 1 || resp.Projects[0].ClosureState == nil || *resp.Projects[0].ClosureState != closureState {
 		t.Fatalf("Projects[0].ClosureState = %+v, want %q", resp.Projects, closureState)
+	}
+}
+
+// TestSearchProjects_MapsParityFields pins the v1.0 fields the Postgres path now returns.
+func TestSearchProjects_MapsParityFields(t *testing.T) {
+	str := func(v string) *string { return &v }
+	partner := true
+	repo := &recordingProjectRepo{toReturn: []domain.Project{
+		{
+			ID: "p1", SfID: "a0X1", ActiveCasesCount: 3, OnboardingStatus: str("In-Progress"),
+			Account: &domain.ProjectSearchAccountRef{ID: "a1", Name: "Acme", Region: str("EMEA"), SubRegion: str("UK"), IsPartner: &partner},
+			ProjectClosureFields: domain.ProjectClosureFields{
+				ClosureState: str("Suspended"), EndDateClosureState: str("Closed"),
+				InvoiceDueDateClosureState: str("Pending Notified"), ComplianceViolationClosureState: str("Open"),
+				ComplianceViolationDate: str("2026-09-01"),
+			},
+		},
+		{ID: "p2"},
+	}}
+	svc := NewProjectService(repo, alwaysUnrestrictedAccess{})
+
+	resp, err := svc.SearchProjects(t.Context(), domain.SearchProjectsRequest{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := resp.Projects[0]
+	if got.SfID == nil || *got.SfID != "a0X1" || got.ActiveCasesCount != 3 || *got.OnboardingStatus != "In-Progress" {
+		t.Fatalf("sfId/activeCasesCount/onboardingStatus not mapped: %+v", got)
+	}
+	if got.Account == nil || got.Account.Name != "Acme" || *got.Account.SubRegion != "UK" || !*got.Account.IsPartner {
+		t.Fatalf("account not mapped: %+v", got.Account)
+	}
+	if *got.InvoiceDueDateClosureState != "Pending Notified" || *got.ComplianceViolationDate != "2026-09-01" {
+		t.Fatalf("closure fields not mapped: %+v", got.ProjectClosureFields)
+	}
+	if resp.Projects[1].SfID != nil || resp.Projects[1].Account != nil {
+		t.Fatalf("empty sfId/account must map to null: %+v", resp.Projects[1])
+	}
+}
+
+// TestSearchProjects_ValidatesV10Filters pins that closureStatus/sortBy/sortOrder accept
+// exactly v1.0's values and that invalid ones never reach the repository.
+func TestSearchProjects_ValidatesV10Filters(t *testing.T) {
+	cases := []struct {
+		name    string
+		req     domain.SearchProjectsRequest
+		wantErr bool
+	}{
+		{"closureStatus Suspended", domain.SearchProjectsRequest{ClosureStatus: "Suspended"}, false},
+		{"closureStatus lowercase", domain.SearchProjectsRequest{ClosureStatus: "suspended"}, true},
+		{"sort by endDate desc", domain.SearchProjectsRequest{SortBy: "endDate", SortOrder: "desc"}, false},
+		{"sort by injected column", domain.SearchProjectsRequest{SortBy: "name; DROP TABLE project"}, true},
+		{"bad sortOrder", domain.SearchProjectsRequest{SortBy: "endDate", SortOrder: "sideways"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &recordingProjectRepo{}
+			_, err := NewProjectService(repo, alwaysUnrestrictedAccess{}).SearchProjects(t.Context(), tc.req)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if repo.called == tc.wantErr {
+				t.Fatalf("repo.called = %v, want %v", repo.called, !tc.wantErr)
+			}
+		})
 	}
 }

@@ -52,7 +52,7 @@ afterEach(() => {
 });
 
 describe("usePortalView", () => {
-  it("resolves to cs-abt when the caller holds no sales_solutions role", () => {
+  it("resolves to cs-abt when the caller holds no viewer role", () => {
     mockRoles = ["support_engineer"];
     const { result } = renderHook(() => usePortalView());
     expect(result.current).toBe("cs-abt");
@@ -64,8 +64,8 @@ describe("usePortalView", () => {
     expect(result.current).toBe("cs-abt");
   });
 
-  it("resolves to sales-sa when the caller holds the sales_solutions role", () => {
-    mockRoles = ["sales_solutions"];
+  it("resolves to sales-sa when the caller holds the viewer role", () => {
+    mockRoles = ["viewer"];
     const { result } = renderHook(() => usePortalView());
     expect(result.current).toBe("sales-sa");
   });
@@ -76,6 +76,24 @@ describe("usePortalView", () => {
     expect(result.current).toBe("sales-sa");
   });
 
+  it("sales_solutions alone, without viewer, does not resolve to sales-sa", () => {
+    mockRoles = ["sales_solutions"];
+    const { result } = renderHook(() => usePortalView());
+    expect(result.current).toBe("cs-abt");
+  });
+
+  it("cs_engineer takes precedence over viewer, resolving to cs-abt", () => {
+    mockRoles = ["cs_engineer", "viewer"];
+    const { result } = renderHook(() => usePortalView());
+    expect(result.current).toBe("cs-abt");
+  });
+
+  it("cs_engineer alone (no viewer) resolves to cs-abt", () => {
+    mockRoles = ["cs_engineer"];
+    const { result } = renderHook(() => usePortalView());
+    expect(result.current).toBe("cs-abt");
+  });
+
   it("devViewOverride wins regardless of the caller's real roles", () => {
     mockRoles = ["support_engineer"];
     mockDevViewOverride = "sales-sa";
@@ -84,7 +102,7 @@ describe("usePortalView", () => {
   });
 
   it("devBypassAccessCheck alone (no explicit override) defaults to cs-abt", () => {
-    mockRoles = ["sales_solutions"];
+    mockRoles = ["viewer"];
     mockDevBypassAccessCheck = true;
     const { result } = renderHook(() => usePortalView());
     expect(result.current).toBe("cs-abt");

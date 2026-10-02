@@ -53,35 +53,30 @@ type fixtureMembership struct {
 	state string
 	admin bool
 	// partner marks a membership whose contact belongs to an account other
-	// than the project's -- the SQL's `ac.account_id <> p.account_id`. Only
-	// such a membership can support partner_admin; the rest support
-	// customer_admin.
+	// than the project's. It no longer affects the decision -- which admin
+	// role applies is the caller's adminRole, from the contact's account
+	// classification -- and the fixtures keep it to show exactly that.
 	partner bool
 	userID  string
 }
 
-type twoBoolRow struct {
-	customerAdmin bool
-	partnerAdmin  bool
-	err           error
+type oneBoolRow struct {
+	value bool
+	err   error
 }
 
-func (r twoBoolRow) Scan(dest ...any) error {
+func (r oneBoolRow) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	if len(dest) != 2 {
+	if len(dest) != 1 {
 		return errors.New("unexpected scan destination")
 	}
-	c, ok := dest[0].(*bool)
+	b, ok := dest[0].(*bool)
 	if !ok {
 		return errors.New("unexpected scan destination")
 	}
-	p, ok := dest[1].(*bool)
-	if !ok {
-		return errors.New("unexpected scan destination")
-	}
-	*c, *p = r.customerAdmin, r.partnerAdmin
+	*b = r.value
 	return nil
 }
 
@@ -89,15 +84,10 @@ func (q *adminQuerier) QueryRow(_ context.Context, sql string, args ...any) pgx.
 	q.queries = append(q.queries, sql)
 	q.queryArgs = append(q.queryArgs, args)
 	userID, _ := args[0].(string)
-	row := twoBoolRow{err: q.scanErr}
+	row := oneBoolRow{err: q.scanErr}
 	for _, m := range q.memberships {
-		if m.userID != userID || !m.admin || m.state == "DEACTIVATED" {
-			continue
-		}
-		if m.partner {
-			row.partnerAdmin = true
-		} else {
-			row.customerAdmin = true
+		if m.userID == userID && m.admin && m.state != "DEACTIVATED" {
+			row.value = true
 		}
 	}
 	return row
@@ -217,30 +207,47 @@ func TestSyncDerivedAdminRole(t *testing.T) {
 			wantRevoke:  []string{globalRoleCustomerAdminName},
 		},
 		{
-			// The cross-account case. Admin on their OWN account's project
-			// earns customer_admin; the partner membership being processed
-			// carries no ADMIN role, so it earns nothing -- and must not
-			// trade the role they did earn for one they did not.
-			name: "a non-admin partner membership neither grants partner_admin nor revokes an earned customer_admin",
+			// Decision D1: the admin role follows the contact's account
+			// classification (adminRole), not whether the ADMIN membership
+			// sits on the contact's own account. A Partner-classified
+			// contact who is admin on their own account's project is a
+			// partner_admin; customer_admin used to be granted here.
+			name: "a Partner-classified contact admin on an own-account project holds partner_admin, not customer_admin",
 			memberships: []fixtureMembership{
 				{userID: user, state: "REGISTERED", admin: true},
 				{userID: user, state: "INVITED", admin: false, partner: true},
 			},
 			adminRole:  globalRolePartnerAdminName,
-			wantAdmin:  false,
+			wantAdmin:  true,
+			wantGrant:  []string{globalRolePartnerAdminName},
+			wantRevoke: []string{globalRoleCustomerAdminName},
+		},
+		{
+			// The mirror case: a customer-classified contact whose ADMIN
+			// membership is on another account's project (a related
+			// contact, say) is a customer_admin; partner_admin used to be
+			// granted here, which no ServiceNow rule ever did.
+			name: "a customer-classified contact admin only on another account's project holds customer_admin",
+			memberships: []fixtureMembership{
+				{userID: user, state: "REGISTERED", admin: true, partner: true},
+			},
+			adminRole:  globalRoleCustomerAdminName,
+			wantAdmin:  true,
 			wantGrant:  []string{globalRoleCustomerAdminName},
 			wantRevoke: []string{globalRolePartnerAdminName},
 		},
 		{
-			// Both are earned on their own evidence, so both are held.
-			name: "admin on both an own and a partner project holds both roles",
+			// One organisation, one role: admin memberships on both kinds of
+			// project no longer earn both roles.
+			name: "admin on both an own and a partner project holds only the classification's role",
 			memberships: []fixtureMembership{
 				{userID: user, state: "REGISTERED", admin: true},
 				{userID: user, state: "REGISTERED", admin: true, partner: true},
 			},
-			adminRole: globalRoleCustomerAdminName,
-			wantAdmin: true,
-			wantGrant: []string{globalRoleCustomerAdminName, globalRolePartnerAdminName},
+			adminRole:  globalRoleCustomerAdminName,
+			wantAdmin:  true,
+			wantGrant:  []string{globalRoleCustomerAdminName},
+			wantRevoke: []string{globalRolePartnerAdminName},
 		},
 		{
 			name:        "an integration user has no admin role to decide at all",
@@ -275,11 +282,11 @@ func TestSyncDerivedAdminRole(t *testing.T) {
 }
 
 // TestSyncDerivedAdminRoleQueriesEveryMembership pins the shape of the rule's
-// one query: a single aggregate over the USER's memberships, keyed only on
-// the user id, splitting them by whether the contact's account is the
-// project's. Binding the membership being processed would reintroduce the bug
-// this replaced -- the decision must not depend on which membership happens
-// to be in hand.
+// one query: a single existence check over the USER's memberships, keyed only
+// on the user id. Binding the membership being processed would reintroduce
+// the bug this replaced -- the decision must not depend on which membership
+// happens to be in hand -- and splitting by `ac.account_id <> p.account_id`
+// would bring back the per-membership partner test D1 replaced.
 func TestSyncDerivedAdminRoleQueriesEveryMembership(t *testing.T) {
 	q := &adminQuerier{memberships: []fixtureMembership{{userID: "user-1", state: "INVITED", admin: true}}}
 	if _, err := syncDerivedAdminRole(context.Background(), q, "user-1", globalRoleCustomerAdminName,
@@ -291,12 +298,14 @@ func TestSyncDerivedAdminRoleQueriesEveryMembership(t *testing.T) {
 	}
 	sql := q.queries[0]
 	for _, want := range []string{
-		"bool_or", "ac.account_id = p.account_id", "ac.account_id <> p.account_id",
-		"project_contact", "project_contact_group", "project_role", "ADMIN", "DEACTIVATED",
+		"EXISTS", "project_contact", "project_contact_group", "project_role", "ADMIN", "DEACTIVATED",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("query must mention %q:\n%s", want, sql)
 		}
+	}
+	if strings.Contains(sql, "p.account_id") {
+		t.Errorf("the admin role no longer depends on the project's account:\n%s", sql)
 	}
 	if args := q.queryArgs[0]; len(args) != 1 || args[0] != "user-1" {
 		t.Errorf("query args = %v, want only the user id", args)
@@ -317,11 +326,11 @@ func TestSyncDerivedAdminRolePropagatesQueryFailure(t *testing.T) {
 	}
 }
 
-// The two role names, aliased to the repository's own constants so a rename
-// cannot leave the fixtures testing yesterday's vocabulary.
+// The two role names as seeded in the role table. The repository no longer
+// spells them itself: which one a user holds is the caller's adminRole.
 const (
-	globalRoleCustomerAdminName = globalRoleCustomerAdmin
-	globalRolePartnerAdminName  = globalRolePartnerAdmin
+	globalRoleCustomerAdminName = "customer_admin"
+	globalRolePartnerAdminName  = "partner_admin"
 )
 
 func equalStrings(a, b []string) bool {

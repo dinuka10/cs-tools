@@ -42,6 +42,17 @@ func NewPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("parse pool config: %w", err)
 	}
 
+	// JIT off: row-level-security policies inflate the planner's cost
+	// estimates into the millions even for queries that touch a few rows, which
+	// crosses jit_above_cost and makes Postgres compile ~100 functions per
+	// request. Measured on the real-data copy, that compile time was 60-90% of
+	// the latency of cases/search and global search (e.g. 1.5s with JIT vs
+	// 0.38s without). These are short OLTP queries; JIT never pays for itself.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	cfg.ConnConfig.RuntimeParams["jit"] = "off"
+
 	cfg.MaxConns = poolMaxConns
 	cfg.MinConns = poolMinConns
 	cfg.MaxConnLifetime = poolMaxConnLifetime

@@ -16,7 +16,7 @@
 
 import { useState } from "react";
 import { useNavigate } from "react-router";
-import { useSearchAccounts } from "../api/useSplAccountsApi";
+import { useSearchSplAccounts } from "../api/useAccountsApi";
 import AccountSearch from "./AccountSearch";
 import AccountsDataTable from "./AccountsDataTable";
 
@@ -26,7 +26,7 @@ export default function ListAccounts({ active }: { active: boolean }) {
   const [showTable, setShowTable] = useState(true);
   const navigate = useNavigate();
 
-  const { data, isLoading, error } = useSearchAccounts({
+  const { data, isLoading, error } = useSearchSplAccounts({
     offset: page * rowsPerPage,
     limit: rowsPerPage,
     active,

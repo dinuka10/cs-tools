@@ -457,13 +457,13 @@ func TestCreateCaseCommentInlineImagesDisabledByDefault(t *testing.T) {
 			return []byte(`{}`), nil
 		},
 	}
-	h := NewCaseHandler(entity) // no WithInlineImageProcessor call
+	h := NewCaseHandler(entity).WithAccessGuard(viewerAccessGuard) // no WithInlineImageProcessor call
 
 	b64 := tinyPNGBase64(16)
 	content := dataURIImg("png", b64)
 	reqBody := `{"type":"comment","content":` + jsonString(content) + `}`
 
-	req := withUser(httptest.NewRequest(http.MethodPost, "/cases/"+caseID+"/comments", strings.NewReader(reqBody)))
+	req := withCsEngineerUser(httptest.NewRequest(http.MethodPost, "/cases/"+caseID+"/comments", strings.NewReader(reqBody)))
 	req.SetPathValue("id", caseID)
 	w := httptest.NewRecorder()
 
@@ -497,12 +497,12 @@ func TestCreateCaseCommentExtractsInlineImageWhenEnabled(t *testing.T) {
 		},
 	}
 	sftpgoMock := &mockSftpgoClient{}
-	h := NewCaseHandler(entity).WithInlineImageProcessor(NewInlineImageProcessor(entity, sftpgoMock))
+	h := NewCaseHandler(entity).WithInlineImageProcessor(NewInlineImageProcessor(entity, sftpgoMock)).WithAccessGuard(viewerAccessGuard)
 
 	content := dataURIImg("png", tinyPNGBase64(16))
 	reqBody := `{"type":"comment","content":` + jsonString(content) + `}`
 
-	req := withUser(httptest.NewRequest(http.MethodPost, "/cases/"+caseID+"/comments", strings.NewReader(reqBody)))
+	req := withCsEngineerUser(httptest.NewRequest(http.MethodPost, "/cases/"+caseID+"/comments", strings.NewReader(reqBody)))
 	req.SetPathValue("id", caseID)
 	req.Header.Set(jwtAssertionHeader, "raw-jwt")
 	w := httptest.NewRecorder()
@@ -541,13 +541,13 @@ func TestCreateCaseCommentInlineImageFailureRejectsComment(t *testing.T) {
 		},
 	}
 	sftpgoMock := &mockSftpgoClient{}
-	h := NewCaseHandler(entity).WithInlineImageProcessor(NewInlineImageProcessor(entity, sftpgoMock))
+	h := NewCaseHandler(entity).WithInlineImageProcessor(NewInlineImageProcessor(entity, sftpgoMock)).WithAccessGuard(viewerAccessGuard)
 
 	// An unsupported subtype forces InlineImageProcessor to reject.
 	content := dataURIImg("bmp", tinyPNGBase64(16))
 	reqBody := `{"type":"comment","content":` + jsonString(content) + `}`
 
-	req := withUser(httptest.NewRequest(http.MethodPost, "/cases/"+caseID+"/comments", strings.NewReader(reqBody)))
+	req := withCsEngineerUser(httptest.NewRequest(http.MethodPost, "/cases/"+caseID+"/comments", strings.NewReader(reqBody)))
 	req.SetPathValue("id", caseID)
 	req.Header.Set(jwtAssertionHeader, "raw-jwt")
 	w := httptest.NewRecorder()

@@ -16,16 +16,18 @@
 
 import { useMutation, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
-import type { ActionItemComment, RiskActionItem } from "./splCustomerHealthTypes";
+import type { ActionItemComment, RiskActionItem } from "./customerHealthTypes";
 
-// GET /spl/customer-health/accounts/{accountSysId}/action-items
+// GET /customer-health/accounts/{accountSysId}/action-items
 export function useAccountActionItems(accountId: string | undefined): UseQueryResult<RiskActionItem[], Error> {
   const backendApi = useBackendApi();
   return useQuery<RiskActionItem[], Error>({
     queryKey: ["spl-customer-health-action-items", accountId],
     enabled: Boolean(accountId),
     queryFn: async () =>
-      (await backendApi.get<RiskActionItem[]>(`/spl/customer-health/accounts/${accountId}/action-items`)) ?? [],
+      (await backendApi.get<RiskActionItem[]>(
+        `/customer-health/accounts/${encodeURIComponent(accountId ?? "")}/action-items`,
+      )) ?? [],
   });
 }
 
@@ -39,19 +41,19 @@ export interface CreateActionItemPayload {
   accountSysId: string;
 }
 
-// POST /spl/customer-health/risks/{riskId}/action-items — riskId is an INTEGER.
+// POST /customer-health/risks/{riskId}/action-items — riskId is an INTEGER.
 export function useCreateActionItem() {
   const backendApi = useBackendApi();
   return useMutation<RiskActionItem, Error, { riskId: number; payload: CreateActionItemPayload }>({
     mutationFn: ({ riskId, payload }) =>
       backendApi.post<CreateActionItemPayload, RiskActionItem>(
-        `/spl/customer-health/risks/${riskId}/action-items`,
+        `/customer-health/risks/${riskId}/action-items`,
         payload,
       ),
   });
 }
 
-// PUT /spl/customer-health/action-items/{actionItemId}/status — actionItemId is an INTEGER.
+// PUT /customer-health/action-items/{actionItemId}/status — actionItemId is an INTEGER.
 export function useUpdateActionItemStatus() {
   const backendApi = useBackendApi();
   return useMutation<
@@ -61,13 +63,13 @@ export function useUpdateActionItemStatus() {
   >({
     mutationFn: ({ actionItemId, status, resolutionComment }) =>
       backendApi.put<{ status: string; resolutionComment: string | null }, RiskActionItem>(
-        `/spl/customer-health/action-items/${actionItemId}/status`,
+        `/customer-health/action-items/${actionItemId}/status`,
         { status, resolutionComment },
       ),
   });
 }
 
-// GET/POST /spl/customer-health/action-items/{actionItemId}/comments — actionItemId is an INTEGER.
+// GET/POST /customer-health/action-items/{actionItemId}/comments — actionItemId is an INTEGER.
 export function useActionItemComments(actionItemId: number, enabled: boolean): UseQueryResult<ActionItemComment[], Error> {
   const backendApi = useBackendApi();
   return useQuery<ActionItemComment[], Error>({
@@ -75,7 +77,7 @@ export function useActionItemComments(actionItemId: number, enabled: boolean): U
     enabled,
     queryFn: async () =>
       (await backendApi.get<ActionItemComment[]>(
-        `/spl/customer-health/action-items/${actionItemId}/comments`,
+        `/customer-health/action-items/${actionItemId}/comments`,
       )) ?? [],
   });
 }
@@ -85,7 +87,7 @@ export function useCreateActionItemComment() {
   return useMutation<ActionItemComment, Error, { actionItemId: number; comment: string }>({
     mutationFn: ({ actionItemId, comment }) =>
       backendApi.post<{ comment: string }, ActionItemComment>(
-        `/spl/customer-health/action-items/${actionItemId}/comments`,
+        `/customer-health/action-items/${actionItemId}/comments`,
         { comment },
       ),
   });

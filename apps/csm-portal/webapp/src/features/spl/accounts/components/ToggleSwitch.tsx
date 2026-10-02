@@ -16,7 +16,7 @@
 
 import * as React from "react";
 import { Tab, Tabs } from "@wso2/oxygen-ui";
-import type { ToggleSwitchState } from "../api/splAccountTypes";
+import type { ToggleSwitchState } from "../api/accountTypes";
 
 type ToggleSwitchProps = {
   onSwitchClick?: (state: ToggleSwitchState) => void;

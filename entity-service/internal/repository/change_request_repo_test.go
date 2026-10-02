@@ -104,6 +104,7 @@ type fakeChangeRequestDetailRow struct {
 	startOn, endOn                                                     *time.Time
 	impact, state, changeModel                                         *string
 	createdOn, updatedOn                                               time.Time
+	agID, agName                                                       *string
 	createdBy                                                          string
 	justification, impactDescription, serviceOutage                    *string
 	communicationPlan, rollbackPlan, testPlan                          *string
@@ -132,6 +133,7 @@ func (f fakeChangeRequestDetailRow) Scan(dest ...any) error {
 		f.aeID, f.aeName,
 		f.startOn, f.endOn, f.impact, f.state, f.changeModel,
 		f.createdOn, f.updatedOn,
+		f.agID, f.agName,
 		f.createdBy, f.justification, f.impactDescription, f.serviceOutage, f.communicationPlan, f.rollbackPlan, f.testPlan,
 		f.isCustomerApproved, f.isCustomerReviewed,
 		f.implementationPlan, f.priority, f.category,
@@ -181,6 +183,7 @@ func TestScanChangeRequestViewAndDetail_FieldParityAdditions(t *testing.T) {
 		row := fakeChangeRequestDetailRow{
 			id: "CR-1", number: "CHG0001", subject: strPtrCR("s"), description: strPtrCR("d"),
 			createdOn: now, updatedOn: now, createdBy: "actor@wso2.com",
+			agID: strPtrCR("team-1"), agName: strPtrCR("Devops"),
 			implementationPlan: strPtrCR("do the thing"), priority: strPtrCR("HIGH"), category: strPtrCR("SOFTWARE"),
 			rbID: strPtrCR("user-1"), rbName: strPtrCR("Jane Doe"),
 			affectedServicesText: strPtrCR("svc-a"), affectedComponentsText: strPtrCR("comp-a"), rollbackDurationText: strPtrCR("2h"),
@@ -206,6 +209,15 @@ func TestScanChangeRequestViewAndDetail_FieldParityAdditions(t *testing.T) {
 		}
 		if cr.RequestedBy == nil || cr.RequestedBy.ID != "user-1" || cr.RequestedBy.Name != "Jane Doe" {
 			t.Errorf("RequestedBy = %+v, want {user-1 Jane Doe}", cr.RequestedBy)
+		}
+		// Real, reported bug: the CSM Portal's own action bar requires
+		// AssignedTeam to be set before Assess can be requested at all, but
+		// this repository never selected work_item.assignment_group_id back,
+		// so no change request could ever be promoted past New through the
+		// portal on this data source, regardless of what ServiceNow itself
+		// (or csm-sync-service, mirroring it into Postgres) actually had set.
+		if cr.AssignedTeam == nil || cr.AssignedTeam.ID != "team-1" || cr.AssignedTeam.Name != "Devops" {
+			t.Errorf("AssignedTeam = %+v, want {team-1 Devops}", cr.AssignedTeam)
 		}
 		if cr.CustomerGroup == nil || cr.CustomerGroup.ID != "group-1" || cr.CustomerGroup.Name != "SRE Team" {
 			t.Errorf("CustomerGroup = %+v, want {group-1 SRE Team}", cr.CustomerGroup)
@@ -248,6 +260,9 @@ func TestScanChangeRequestViewAndDetail_FieldParityAdditions(t *testing.T) {
 		}
 		if cr.RequestedBy != nil || cr.CustomerGroup != nil {
 			t.Errorf("RequestedBy/CustomerGroup = %+v/%+v, want both nil", cr.RequestedBy, cr.CustomerGroup)
+		}
+		if cr.AssignedTeam != nil {
+			t.Errorf("AssignedTeam = %+v, want nil (no assignment group set)", cr.AssignedTeam)
 		}
 		if cr.ImplementationPlan != nil || cr.Priority != nil || cr.GitReference != nil {
 			t.Errorf("expected NULL field-parity columns to stay nil, got ImplementationPlan=%v Priority=%v GitReference=%v",
@@ -330,11 +345,20 @@ func TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus
 	}
 	updatedOn := time.Date(2026, 9, 20, 10, 0, 0, 0, time.UTC)
 	approvers := []changeRequestApprovalApproverRow{
-		{id: "appr-1", stageID: strPtrApproval("stage-1"), approverName: "Alice", rawStatus: strPtrApproval("approved"), updatedOn: updatedOn},
-		{id: "appr-2", stageID: strPtrApproval("stage-2"), approverName: "Bob", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
-		{id: "appr-3", stageID: strPtrApproval("stage-2"), approverName: "Carol", rawStatus: strPtrApproval("rejected"), updatedOn: updatedOn},
+		// appr-1's approverUserID ("user-1") must end up as the domain
+		// approver's own ID -- not "appr-1" itself (the junction row's own
+		// id) -- see changeRequestApprovalApproversQuery's own doc comment
+		// for the real bug this guards against: isMyPendingApproval
+		// (webapp) can only ever match a real user id, never a junction
+		// row's id.
+		{id: "appr-1", stageID: strPtrApproval("stage-1"), approverUserID: strPtrApproval("user-1"), approverName: "Alice", rawStatus: strPtrApproval("approved"), updatedOn: updatedOn},
+		{id: "appr-2", stageID: strPtrApproval("stage-2"), approverUserID: strPtrApproval("user-2"), approverName: "Bob", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
+		// approverUserID nil (approver_user_id null, or a since-deleted
+		// user) -- must fall back to the junction row's own id rather than
+		// an empty string.
+		{id: "appr-3", stageID: strPtrApproval("stage-2"), approverUserID: nil, approverName: "Carol", rawStatus: strPtrApproval("rejected"), updatedOn: updatedOn},
 		// stage_id NULL -- must be dropped, not attached to any stage.
-		{id: "appr-4", stageID: nil, approverName: "Orphan", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
+		{id: "appr-4", stageID: nil, approverUserID: strPtrApproval("user-4"), approverName: "Orphan", rawStatus: strPtrApproval("requested"), updatedOn: updatedOn},
 	}
 
 	got := buildChangeRequestApprovals(stages, approvers)
@@ -356,6 +380,9 @@ func TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus
 	if len(a0.Approvers) != 1 || a0.Approvers[0].RespondedOn == nil {
 		t.Errorf("stage 0 approvers = %+v, want 1 approver with a non-nil RespondedOn", a0.Approvers)
 	}
+	if got := a0.Approvers[0].ID; got != "user-1" {
+		t.Errorf("stage 0 approver ID = %q, want the resolved user id %q, not the junction row's own id", got, "user-1")
+	}
 
 	a1 := got.Approvals[1]
 	if a1.Stage != "Authorize" || a1.ApproverType != domain.ChangeRequestApproverTypeStaticGroup {
@@ -372,6 +399,18 @@ func TestBuildChangeRequestApprovals_PositionalLabelsAndFirstResponderWinsStatus
 	for _, ap := range a1.Approvers {
 		if ap.Status == "REQUESTED" && ap.RespondedOn != nil {
 			t.Errorf("REQUESTED approver %q has non-nil RespondedOn %v, want nil", ap.Name, *ap.RespondedOn)
+		}
+		switch ap.Name {
+		case "Bob":
+			if ap.ID != "user-2" {
+				t.Errorf("Bob's ID = %q, want the resolved user id %q", ap.ID, "user-2")
+			}
+		case "Carol":
+			// approverUserID was nil for this row -- falls back to the
+			// junction row's own id ("appr-3"), never an empty string.
+			if ap.ID != "appr-3" {
+				t.Errorf("Carol's ID = %q, want the junction row's own id %q (approverUserID was nil)", ap.ID, "appr-3")
+			}
 		}
 	}
 

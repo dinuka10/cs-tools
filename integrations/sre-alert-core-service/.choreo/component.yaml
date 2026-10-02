@@ -17,10 +17,10 @@
 schemaVersion: 1.2
 
 endpoints:
-  - name: alert
-    displayName: Alert
+  - name: alertz
+    displayName: Alertz
     service:
-      basePath: /alert
+      basePath: /alertz
       port: 8080
     type: REST
     networkVisibilities:

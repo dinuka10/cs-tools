@@ -33,19 +33,19 @@ type alertReader interface {
 	Get(ctx context.Context, id string) (model.Alert, error)
 }
 
-// incidentStore lets tests fake *store.IncidentRepo without the full repo type.
+// incidentStore lets tests fake *store.IncidentRepo without the full repo type; every mutating method returns the row's new version or store.ErrStaleWrite when another replica wrote first.
 type incidentStore interface {
 	FindByFingerprint(ctx context.Context, fingerprint string) (model.Incident, bool, error)
 	Upsert(ctx context.Context, alertID string, a model.Alert, severityNum int) (model.Incident, bool, error)
-	RecordAlertID(ctx context.Context, existing model.Incident, alertID string) error
-	RecordCSMIncident(ctx context.Context, fingerprint, incidentID, incidentNumber string) error
-	RecordCSMAttemptStarted(ctx context.Context, fingerprint string, attempts int) error
-	RecordCSMAttemptFailure(ctx context.Context, fingerprint string, attempts, maxAttempts int, permanent bool) error
-	SyncStatus(ctx context.Context, fingerprint, status string, checkedAt time.Time) error
-	RecordStateChecked(ctx context.Context, fingerprint string, checkedAt time.Time) error
-	AppendWorkNote(ctx context.Context, existing model.Incident, note string) error
-	ClearPendingNotes(ctx context.Context, fingerprint string, remaining []string) error
-	MarkFallbackNotified(ctx context.Context, fingerprint string) error
+	RecordAlertID(ctx context.Context, existing model.Incident, alertID string) (int64, error)
+	RecordCSMIncident(ctx context.Context, existing model.Incident, incidentID, incidentNumber string) (int64, error)
+	RecordCSMAttemptStarted(ctx context.Context, existing model.Incident, attempts int) (int64, error)
+	RecordCSMAttemptFailure(ctx context.Context, existing model.Incident, attempts, maxAttempts int, permanent bool) (int64, error)
+	SyncStatus(ctx context.Context, existing model.Incident, status string, checkedAt time.Time) (int64, error)
+	RecordStateChecked(ctx context.Context, existing model.Incident, checkedAt time.Time) (int64, error)
+	AppendWorkNote(ctx context.Context, existing model.Incident, note string) (int64, error)
+	ClearPendingNotes(ctx context.Context, existing model.Incident, remaining []string) (int64, error)
+	MarkFallbackNotified(ctx context.Context, existing model.Incident) (int64, error)
 	ListPending(ctx context.Context) ([]model.Incident, error)
 }
 
@@ -53,6 +53,7 @@ type incidentStore interface {
 type notifier interface {
 	NotifyCSM(ctx context.Context, inc model.Incident) (incidentID, incidentNumber string, ok bool, permanent bool)
 	NotifyChat(ctx context.Context, inc model.Incident) (ok bool)
+	NotifyChatAnnotation(ctx context.Context, inc model.Incident, kind, note string) (ok bool)
 	PushWorkNote(ctx context.Context, incidentID, note string) error
 	IncidentState(ctx context.Context, incidentNumber string) (open bool, found bool, err error)
 }
@@ -72,24 +73,25 @@ type Engine struct {
 	dedupWindow time.Duration
 	// csmRetry bounds how RetrySweep backs off CSM retries during a prolonged outage.
 	csmRetry CSMRetryConfig
+	// chatThreadingEnabled gates forwarding Duplicate/OK annotations to Chat (threaded by fingerprint) while an incident is stuck in chat-fallback; see notify.Notifier.chatThreadingEnabled.
+	chatThreadingEnabled bool
 	// locks is per-fingerprint so distinct incidents never serialize; racing callers re-read the row under lock.
 	locks *fpLocks
 }
 
-// CSMRetryConfig bounds RetrySweep's exponential backoff for CSM retries, so a prolonged outage
-// doesn't get hit on every sweep: waits grow BaseDelay, BaseDelay*Multiplier, ..., capped at MaxDelay.
+// CSMRetryConfig bounds RetrySweep's exponential backoff for CSM retries: waits grow BaseDelay, BaseDelay*Multiplier, ..., capped at MaxDelay.
 type CSMRetryConfig struct {
 	BaseDelay  time.Duration
 	Multiplier float64
 	MaxDelay   time.Duration
 }
 
-// New wires the engine's collaborators, alert defaults, CSM attempt cap, state-check throttle, dedup window, and CSM retry backoff together.
-func New(logger *slog.Logger, alerts alertReader, incidents incidentStore, n notifier, defaults model.Defaults, maxCSMAttempts int, stateCheckInterval time.Duration, dedupWindow time.Duration, csmRetry CSMRetryConfig) *Engine {
+// New wires the engine's collaborators, alert defaults, CSM attempt cap, state-check throttle, dedup window, CSM retry backoff, and chat threading together.
+func New(logger *slog.Logger, alerts alertReader, incidents incidentStore, n notifier, defaults model.Defaults, maxCSMAttempts int, stateCheckInterval time.Duration, dedupWindow time.Duration, csmRetry CSMRetryConfig, chatThreadingEnabled bool) *Engine {
 	return &Engine{
 		logger: logger, alerts: alerts, incidents: incidents, notifier: n, defaults: defaults,
 		maxCSMAttempts: maxCSMAttempts, stateCheckInterval: stateCheckInterval, dedupWindow: dedupWindow,
-		csmRetry: csmRetry, locks: newFPLocks(),
+		csmRetry: csmRetry, chatThreadingEnabled: chatThreadingEnabled, locks: newFPLocks(),
 	}
 }
 
@@ -229,23 +231,33 @@ func (e *Engine) annotate(ctx context.Context, existing model.Incident, alertID,
 	}
 
 	note := model.BuildWorkNote(kind, alertID, alert.MetricName, alert.Source)
-	if err := e.incidents.AppendWorkNote(ctx, current, note); err != nil {
+	newVersion, err := e.incidents.AppendWorkNote(ctx, current, note)
+	if err != nil {
 		unlock()
-		e.logger.Warn("work note append failed, will retry", "alert_id", alertID, "error", err)
+		if errors.Is(err, store.ErrStaleWrite) {
+			e.logger.Warn("incident changed concurrently, will retry", "alert_id", alertID, "fingerprint", fp)
+		} else {
+			e.logger.Warn("work note append failed, will retry", "alert_id", alertID, "error", err)
+		}
 		return Retry
 	}
-	if err := e.incidents.RecordAlertID(ctx, current, alertID); err != nil {
+	current.Version = newVersion
+	if _, err := e.incidents.RecordAlertID(ctx, current, alertID); err != nil {
 		// Best-effort: failure just risks a redundant note on a future replay, not a lost alert.
 		e.logger.Warn("failed to record alert id for idempotency, continuing", "alert_id", alertID, "error", err)
 	}
 	incidentID, incidentNumber := current.IncidentID, current.IncidentNumber
 	unlock()
 
-	// Push now if CSM already has this incident; if not (CSM unconfirmed), the note stays in
-	// PendingNotes and RetrySweep's ListPending will flush it once CSM confirms. deliverAndPersist
-	// re-acquires the lock itself, so it must run after this one is released.
+	// Push now if CSM already has this incident, else it stays in PendingNotes for RetrySweep; deliverAndPersist re-locks itself, so it must run after unlock.
 	if incidentID != "" {
 		e.deliverAndPersist(ctx, fp)
+	} else if e.chatThreadingEnabled && current.Fallback {
+		// CSM never confirmed, but this incident already reached Chat once; thread this Duplicate/OK in as a reply instead of leaving it silent until CSM recovers. Best-effort: the work note above already persisted either way.
+		chatText := model.BuildChatAnnotationText(kind, alert.MetricName, alert.Source)
+		if !e.notifier.NotifyChatAnnotation(ctx, current, kind, chatText) {
+			e.logger.Warn("chat thread reply failed for annotated incident", "incident_number", incidentNumber, "alert_id", alertID, "kind", kind)
+		}
 	}
 	e.logger.Info("alert recorded on existing incident", "incident_number", incidentNumber, "alert_id", alertID, "kind", kind)
 	return Processed
@@ -274,17 +286,25 @@ func (e *Engine) syncIncidentState(ctx context.Context, inc model.Incident) mode
 		}
 	}
 	if status == inc.Status {
-		if err := e.incidents.RecordStateChecked(ctx, inc.Fingerprint, now); err != nil {
-			e.logger.Warn("failed to persist state check timestamp", "incident_number", inc.IncidentNumber, "error", err)
+		newVersion, err := e.incidents.RecordStateChecked(ctx, inc, now)
+		if err != nil {
+			if !errors.Is(err, store.ErrStaleWrite) {
+				e.logger.Warn("failed to persist state check timestamp", "incident_number", inc.IncidentNumber, "error", err)
+			}
 			return inc
 		}
+		inc.Version = newVersion
 		inc.StateCheckedAt = now
 		return inc
 	}
-	if err := e.incidents.SyncStatus(ctx, inc.Fingerprint, status, now); err != nil {
-		e.logger.Warn("failed to persist synced incident status", "incident_number", inc.IncidentNumber, "error", err)
+	newVersion, err := e.incidents.SyncStatus(ctx, inc, status, now)
+	if err != nil {
+		if !errors.Is(err, store.ErrStaleWrite) {
+			e.logger.Warn("failed to persist synced incident status", "incident_number", inc.IncidentNumber, "error", err)
+		}
 		return inc
 	}
+	inc.Version = newVersion
 	inc.Status = status
 	inc.StateCheckedAt = now
 	return inc
@@ -323,34 +343,50 @@ func (e *Engine) deliverAndPersist(ctx context.Context, fingerprint string) {
 		// Persist attempt count before NotifyCSM so CSMAttempts is a lower bound on attempts that may have reached CSM.
 		attempts := inc.CSMAttempts + 1
 		pctx, cancel := persistCtx(ctx)
-		startErr := e.incidents.RecordCSMAttemptStarted(pctx, inc.Fingerprint, attempts)
+		newVersion, startErr := e.incidents.RecordCSMAttemptStarted(pctx, inc, attempts)
 		cancel()
 		if startErr != nil {
+			if errors.Is(startErr, store.ErrStaleWrite) {
+				// Another replica already wrote this row (e.g. took over leadership); back off instead of notifying CSM without exclusive delivery.
+				e.logger.Warn("incident changed concurrently, deferring delivery", "incident_number", inc.IncidentNumber)
+				return
+			}
 			e.logger.Error("failed to record csm attempt start, will retry", "incident_number", inc.IncidentNumber, "error", startErr)
 		} else {
+			inc.Version = newVersion
 			inc.CSMAttempts = attempts
 			id, number, ok, permanent := e.notifier.NotifyCSM(ctx, inc)
 			if ok {
 				csmSucceeded = true
 				pctx, cancel := persistCtx(ctx)
-				err := e.incidents.RecordCSMIncident(pctx, inc.Fingerprint, id, number)
+				newVersion, err := e.incidents.RecordCSMIncident(pctx, inc, id, number)
 				cancel()
 				if err != nil {
 					// Don't mark confirmed locally; the next attempt's dedup-by-tag search will find this incident instead of duplicating it.
-					e.logger.Error("failed to persist csm incident, will retry", "incident_number", inc.IncidentNumber, "csm_incident_id", id, "csm_incident_number", number, "error", err)
+					if errors.Is(err, store.ErrStaleWrite) {
+						e.logger.Warn("incident changed concurrently while recording csm confirmation; relying on dedup-by-tag search to avoid duplicating it", "incident_number", inc.IncidentNumber, "csm_incident_id", id, "csm_incident_number", number)
+					} else {
+						e.logger.Error("failed to persist csm incident, will retry", "incident_number", inc.IncidentNumber, "csm_incident_id", id, "csm_incident_number", number, "error", err)
+					}
 				} else {
+					inc.Version = newVersion
 					csmConfirmed = true
 					inc.IncidentNumber = number
 					inc.IncidentID = id
 				}
 			} else {
 				pctx, cancel := persistCtx(ctx)
-				err := e.incidents.RecordCSMAttemptFailure(pctx, inc.Fingerprint, attempts, e.maxCSMAttempts, permanent)
+				newVersion, err := e.incidents.RecordCSMAttemptFailure(pctx, inc, attempts, e.maxCSMAttempts, permanent)
 				cancel()
 				if err != nil {
-					e.logger.Error("failed to record csm attempt failure", "incident_number", inc.IncidentNumber, "error", err)
-				} else if permanent || attempts >= e.maxCSMAttempts {
-					e.logger.Error("csm permanently failed for incident, giving up", "incident_number", inc.IncidentNumber, "attempts", attempts, "permanent", permanent)
+					if !errors.Is(err, store.ErrStaleWrite) {
+						e.logger.Error("failed to record csm attempt failure", "incident_number", inc.IncidentNumber, "error", err)
+					}
+				} else {
+					inc.Version = newVersion
+					if permanent || attempts >= e.maxCSMAttempts {
+						e.logger.Error("csm permanently failed for incident, giving up", "incident_number", inc.IncidentNumber, "attempts", attempts, "permanent", permanent)
+					}
 				}
 			}
 		}
@@ -367,9 +403,9 @@ func (e *Engine) deliverAndPersist(ctx context.Context, fingerprint string) {
 	}
 	if chatNotified && !inc.Fallback {
 		pctx, cancel := persistCtx(ctx)
-		err := e.incidents.MarkFallbackNotified(pctx, inc.Fingerprint)
+		_, err := e.incidents.MarkFallbackNotified(pctx, inc)
 		cancel()
-		if err != nil {
+		if err != nil && !errors.Is(err, store.ErrStaleWrite) {
 			e.logger.Error("failed to persist fallback-notified flag", "incident_number", inc.IncidentNumber, "error", err)
 		}
 	}
@@ -390,12 +426,15 @@ func (e *Engine) flushPendingNotes(ctx context.Context, inc model.Incident) mode
 		return inc // no progress made; nothing to persist.
 	}
 	pctx, cancel := persistCtx(ctx)
-	err := e.incidents.ClearPendingNotes(pctx, inc.Fingerprint, remaining)
+	newVersion, err := e.incidents.ClearPendingNotes(pctx, inc, remaining)
 	cancel()
 	if err != nil {
-		e.logger.Error("failed to persist pending notes progress", "incident_number", inc.IncidentNumber, "error", err)
+		if !errors.Is(err, store.ErrStaleWrite) {
+			e.logger.Error("failed to persist pending notes progress", "incident_number", inc.IncidentNumber, "error", err)
+		}
 		return inc
 	}
+	inc.Version = newVersion
 	inc.PendingNotes = remaining
 	return inc
 }

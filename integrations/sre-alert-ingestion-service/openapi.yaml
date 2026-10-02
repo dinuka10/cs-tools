@@ -31,9 +31,21 @@ paths:
       tags: [alerts]
       operationId: postAwsAlert
       summary: Receive an AWS alert webhook
+      description: >-
+        An SNS SubscriptionConfirmation is confirmed and emailed to the team named by ?team=
+        (answers 200, stores nothing); notifications are stored as alerts.
+      parameters:
+        - name: team
+          in: query
+          required: false
+          description: Team to email about SNS subscription confirmations (default "Default").
+          schema:
+            type: string
       requestBody:
         $ref: '#/components/requestBodies/VendorPayload'
       responses:
+        '200':
+          description: SNS subscription confirmation handled; nothing stored.
         '201':
           $ref: '#/components/responses/Stored'
         '400':
@@ -197,6 +209,28 @@ paths:
         '503':
           $ref: '#/components/responses/Unavailable'
 
+  /servicenow:
+    post:
+      tags: [alerts]
+      operationId: postServicenowAlert
+      summary: Receive an alert ServiceNow has already transformed (temporary)
+      description: >-
+        Temporary route for the parallel run. The body is one canonical alert object, or an
+        array of them, with the eight fields ServiceNow's AlertCoreUtils.init receives.
+      requestBody:
+        $ref: '#/components/requestBodies/CanonicalAlertPayload'
+      responses:
+        '201':
+          $ref: '#/components/responses/Stored'
+        '400':
+          $ref: '#/components/responses/Rejected'
+        '401':
+          $ref: '#/components/responses/Rejected'
+        '413':
+          $ref: '#/components/responses/Rejected'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
   /site24x7:
     post:
       tags: [alerts]
@@ -226,6 +260,18 @@ components:
           schema:
             type: object
             additionalProperties: true
+    CanonicalAlertPayload:
+      required: true
+      description: One canonical alert, or a non-empty array of them (up to 1 MiB).
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/CanonicalAlert'
+              - type: array
+                minItems: 1
+                items:
+                  $ref: '#/components/schemas/CanonicalAlert'
   responses:
     Stored:
       description: Every alert in the request was stored.
@@ -246,6 +292,31 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
   schemas:
+    CanonicalAlert:
+      type: object
+      description: >-
+        Stored as sent, with no defaults. Needs at least one of these fields; other keys are ignored.
+      minProperties: 1
+      additionalProperties: true
+      properties:
+        service:
+          type: string
+        metric_name:
+          type: string
+        severity:
+          type: string
+          example: Critical
+        category:
+          type: string
+        environment:
+          type: string
+        source:
+          type: string
+          example: AWS
+        unique_identifier:
+          type: string
+        description:
+          type: string
     Stored:
       type: object
       properties:

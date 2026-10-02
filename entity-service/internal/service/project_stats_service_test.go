@@ -254,6 +254,7 @@ func TestGetProjectChangeRequestStats_StateGroupings(t *testing.T) {
 			{State: "CUSTOMER_REVIEW", Count: 5},
 			{State: "CLOSED", Count: 6},
 			{State: "CANCELED", Count: 7},
+			{State: "ROLLBACK", Count: 8},
 		},
 		crCurrentMonth: 2, crPastThirtyDays: 4,
 	}
@@ -263,16 +264,16 @@ func TestGetProjectChangeRequestStats_StateGroupings(t *testing.T) {
 		t.Fatalf("GetProjectChangeRequestStats: %v", err)
 	}
 
-	if resp.TotalCount != 28 {
-		t.Errorf("totalCount = %d, want 28", resp.TotalCount)
+	if resp.TotalCount != 36 {
+		t.Errorf("totalCount = %d, want 36", resp.TotalCount)
 	}
-	// NEW+ASSESS+CUSTOMER_APPROVAL+IMPLEMENT+CUSTOMER_REVIEW
-	if resp.ActiveCount != 15 {
-		t.Errorf("activeCount = %d, want 15", resp.ActiveCount)
+	// NEW+ASSESS+CUSTOMER_APPROVAL+IMPLEMENT+CUSTOMER_REVIEW+ROLLBACK
+	if resp.ActiveCount != 23 {
+		t.Errorf("activeCount = %d, want 23", resp.ActiveCount)
 	}
-	// CUSTOMER_APPROVAL+IMPLEMENT+CUSTOMER_REVIEW -- NEW/ASSESS excluded
-	if resp.OutstandingCount != 12 {
-		t.Errorf("outstandingCount = %d, want 12", resp.OutstandingCount)
+	// CUSTOMER_APPROVAL+IMPLEMENT+CUSTOMER_REVIEW+ROLLBACK -- NEW/ASSESS excluded
+	if resp.OutstandingCount != 20 {
+		t.Errorf("outstandingCount = %d, want 20", resp.OutstandingCount)
 	}
 	// CUSTOMER_APPROVAL+CUSTOMER_REVIEW
 	if resp.ActionRequiredCount != 8 {

@@ -65,18 +65,23 @@ export default function UsageAndMetricsTabContent(): JSX.Element {
     projectId ?? "",
   );
 
+  // Every active deployment gets a tab, regardless of productCount -- a
+  // deployment with zero deployed products still legitimately shows a
+  // "no products in this environment" empty state inside
+  // UsageEnvironmentProductsPanel, and staging's own tab bar confirms this:
+  // it lists deployments with productCount 0 (e.g. a QA/test deployment)
+  // right alongside ones with real products. Filtering here just hid tabs a
+  // customer should still be able to click into.
   const deploymentTabs = useMemo(
     () =>
-      (deploymentsData ?? [])
-        .filter((dep) => (dep.productCount ?? 0) > 0)
-        .map((dep) => ({
-          id: `${USAGE_METRICS_DEPLOYMENT_TAB_PREFIX}${dep.id}`,
-          label: dep.name,
-          icon: Server,
-          iconColor: getUsageOverviewAccentForTypeId(dep.type.id).iconColor,
-          instanceCount: dep.instanceCount ?? 0,
-          productCount: dep.productCount ?? 0,
-        })),
+      (deploymentsData ?? []).map((dep) => ({
+        id: `${USAGE_METRICS_DEPLOYMENT_TAB_PREFIX}${dep.id}`,
+        label: dep.name,
+        icon: Server,
+        iconColor: getUsageOverviewAccentForTypeId(dep.type.id).iconColor,
+        instanceCount: dep.instanceCount ?? 0,
+        productCount: dep.productCount ?? 0,
+      })),
     [deploymentsData],
   );
 

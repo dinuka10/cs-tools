@@ -30,7 +30,7 @@ import {
   CodeIcon,
   SheetIcon,
 } from "@wso2/oxygen-ui-icons-react";
-import { useGetDriveFiles, type DriveFile } from "../api/useSplAccountsApi";
+import { useGetDriveFiles, type DriveFile } from "../api/useAccountsApi";
 
 const FILE_VIEW_BASE_URL = "https://drive.google.com/file/d/";
 const FOLDER_VIEW_BASE_URL = "https://drive.google.com/drive/folders/";

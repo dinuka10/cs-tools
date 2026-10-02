@@ -18,7 +18,7 @@
 // (that's CSM Portal's own, unrelated case-management feature).
 import { useEffect, useState } from "react";
 import { Box, type SelectChangeEvent } from "@wso2/oxygen-ui";
-import { useGetProjectCases } from "../api/useSplProjectsApi";
+import { useGetProjectCases } from "../api/useProjectsApi";
 import DefaultTable from "./DefaultTable";
 import { SelectDropdown } from "./SelectDropdown";
 import type { CaseDetails } from "../projectTypes";

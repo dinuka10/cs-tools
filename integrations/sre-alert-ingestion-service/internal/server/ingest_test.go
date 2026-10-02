@@ -126,6 +126,21 @@ func TestIngest_PrometheusBatchSubmittedTogether(t *testing.T) {
 	}
 }
 
+func TestIngest_ServiceNowForwardStoresCanonicalAlerts(t *testing.T) {
+	sub := &fakeSubmitter{}
+	body := `[{"source":"AWS","severity":"Critical","unique_identifier":"a1"},{"source":"Azure","severity":"OK","unique_identifier":"z1"}]`
+	rec := do(t, newIngestServer(t, sub, nil), "POST", VendorRoutePrefix+"servicenow", body)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body %s", rec.Code, rec.Body)
+	}
+	if m := decode(t, rec); m["count"] != float64(2) {
+		t.Errorf("body = %v", m)
+	}
+	if sub.vendor != "servicenow" || len(sub.calls) != 1 || sub.calls[0][0].Source != "AWS" || sub.calls[0][1].UniqueIdentifier != "z1" {
+		t.Errorf("submitted %+v for %s", sub.calls, sub.vendor)
+	}
+}
+
 func TestIngest_PrometheusBatch503WhenAnyFails(t *testing.T) {
 	sub := &fakeSubmitter{err: errors.New("alert could not be stored")}
 	rec := do(t, newIngestServer(t, sub, nil), "POST", VendorRoutePrefix+"prometheus", prometheusBatch)
@@ -228,5 +243,45 @@ func TestIngest_RejectionCountIsPerVendor(t *testing.T) {
 	got := []int64{rejects.list[0].VendorTotal, rejects.list[1].VendorTotal, rejects.list[2].VendorTotal}
 	if got[0] != 1 || got[1] != 2 || got[2] != 1 {
 		t.Errorf("per-vendor totals = %v, want [1 2 1]", got)
+	}
+}
+
+type fakeConfirmer struct{ teams []string }
+
+func (f *fakeConfirmer) HandleIfConfirmation(raw []byte, team string) bool {
+	if !strings.Contains(string(raw), `"SubscriptionConfirmation"`) {
+		return false
+	}
+	f.teams = append(f.teams, team)
+	return true
+}
+
+func TestIngest_SNSConfirmationAnswers200WithoutStoring(t *testing.T) {
+	sub := &fakeSubmitter{}
+	confirmer := &fakeConfirmer{}
+	for _, v := range []string{"AWS", "AZURE", "DATADOG", "ELASTICSEARCH", "GCP", "ICINGA", "OPENOBSERVE", "OPENSEARCH", "PROMETHEUS", "SITE24X7"} {
+		t.Setenv(v+"_ALERT_CONFIG", "")
+	}
+	reg, err := vendors.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(Options{
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Auth: auth.None{},
+		Pipeline: NewIngestor(reg, sub, time.Second).WithSNSConfirmer(confirmer),
+		Vendors:  reg.Names(), MaxBodyBytes: 4096,
+	})
+
+	rec := do(t, s, "POST", VendorRoutePrefix+"aws?team=ManagedCloud", `{"Type":"SubscriptionConfirmation","SubscribeURL":"https://sns.us-east-1.amazonaws.com/x"}`)
+	if rec.Code != http.StatusOK || len(sub.calls) != 0 {
+		t.Fatalf("status = %d, submits = %d; want 200 and nothing stored", rec.Code, len(sub.calls))
+	}
+	if len(confirmer.teams) != 1 || confirmer.teams[0] != "ManagedCloud" {
+		t.Errorf("teams = %v, want [ManagedCloud] from ?team=", confirmer.teams)
+	}
+
+	rec = do(t, s, "POST", VendorRoutePrefix+"aws", `{"Type":"Notification","Message":"{\"AlarmName\":\"a\",\"AlarmArn\":\"arn\",\"NewStateValue\":\"ALARM\"}"}`)
+	if rec.Code != http.StatusCreated || len(sub.calls) != 1 {
+		t.Errorf("notification: status = %d, submits = %d; want 201 and stored", rec.Code, len(sub.calls))
 	}
 }

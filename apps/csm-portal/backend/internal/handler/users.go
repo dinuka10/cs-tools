@@ -20,11 +20,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/directory"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/scim"
@@ -36,6 +38,7 @@ type scimClient interface {
 	SearchUser(ctx context.Context, email string) (*scim.UserInfo, error)
 	SearchExternalUser(ctx context.Context, email string) (*scim.ExternalUserInfo, error)
 	UpdateUserPhone(ctx context.Context, userID, mobile string) (*string, error)
+	GetRole(ctx context.Context, roleID string) ([]scim.RoleMember, error)
 }
 
 // entityUserClient abstracts the entity service user operations used by UsersHandler.
@@ -66,6 +69,12 @@ type UsersHandler struct {
 	// tell whether AttachmentStorageHandler's routes are reachable without
 	// probing them.
 	sftpgoAttachmentStorageEnabled bool
+	// timecardApproverRoleID is the Asgardeo role ID (TIMECARD_APPROVER_ASGARDEO_ROLE_ID)
+	// GET /users/time-card-approvers fetches via SCIM. Configured once, out of
+	// band -- see that handler's own doc comment for why this is the real,
+	// authoritative list of approvers, not entity-service's own Postgres role
+	// table.
+	timecardApproverRoleID string
 	// access resolves the caller's token roles into the portal roles GET
 	// /users/me reports. nil (every existing call site and test) reports none;
 	// cmd/server/main.go sets it with WithAccessGuard.
@@ -86,12 +95,16 @@ func (h *UsersHandler) WithAccessGuard(g *AccessGuard) *UsersHandler {
 // mirrors the same runtime flag value main.go uses to decide whether to
 // register AttachmentStorageHandler's routes (SFTPGO_ATTACHMENT_STORAGE_ENABLED),
 // so GET /users/me can tell the frontend whether those routes are reachable.
-func NewUsersHandler(scim scimClient, entity entityUserClient, dir *directory.Directory, sftpgoAttachmentStorageEnabled bool) *UsersHandler {
+// timecardApproverRoleID is GetTimeCardApprovers' own config -- see that
+// handler's doc comment; pass "" when GET /users/time-card-approvers is not
+// registered (main.go only registers it once this is set).
+func NewUsersHandler(scim scimClient, entity entityUserClient, dir *directory.Directory, sftpgoAttachmentStorageEnabled bool, timecardApproverRoleID string) *UsersHandler {
 	return &UsersHandler{
 		scim:                           scim,
 		entity:                         entity,
 		dir:                            dir,
 		sftpgoAttachmentStorageEnabled: sftpgoAttachmentStorageEnabled,
+		timecardApproverRoleID:         timecardApproverRoleID,
 	}
 }
 
@@ -407,6 +420,14 @@ func (h *UsersHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if requestsInternalUserType(req.Roles) && !isWso2Email(req.Email) {
+		writeError(w, http.StatusBadRequest, "an internal-type user must have a "+wso2EmailDomain+" email address")
+		return
+	}
+	if requestsExternalUserType(req.Roles) {
+		writeError(w, http.StatusBadRequest, "creating an external-type user is not available at this time")
+		return
+	}
 
 	result, err := h.entity.CreateUser(r.Context(), body)
 	if err != nil {
@@ -416,6 +437,67 @@ func (h *UsersHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, result)
+}
+
+// timeCardApproversResponse is the GET /users/time-card-approvers response shape.
+type timeCardApproversResponse struct {
+	Approvers []timeCardApproverRef `json:"approvers"`
+}
+
+type timeCardApproverRef struct {
+	ID    string `json:"id"`
+	Email string `json:"email"`
+}
+
+// GetTimeCardApprovers handles GET /users/time-card-approvers. Lists the real
+// Asgardeo membership of the configured time-card-approver role via the SCIM
+// operations service, rather than entity-service's own Postgres `role`/
+// `user_role` tables (what POST /users/search's roleIds filter reads) --
+// approval is actually granted by Asgardeo role membership (see
+// AUTH_TIMECARD_APPROVER_ROLES in "Access control"), and the Postgres table
+// is a separate, syncable mirror that can drift from it. Only registered
+// (see cmd/server/main.go) once TIMECARD_APPROVER_ASGARDEO_ROLE_ID is set.
+func (h *UsersHandler) GetTimeCardApprovers(w http.ResponseWriter, r *http.Request) {
+	user := middleware.UserInfoFromContext(r.Context())
+	if user == nil {
+		writeError(w, http.StatusUnauthorized, ErrMsgUnauthorized)
+		return
+	}
+
+	// Registered unconditionally (see cmd/server/main.go) so a disabled
+	// deployment 404s cleanly here rather than falling through to the
+	// wildcard GET /users/{id} route, which would reject the literal segment
+	// "time-card-approvers" as an invalid UUID with 400 instead.
+	if h.timecardApproverRoleID == "" {
+		writeError(w, http.StatusNotFound, ErrMsgNotFound)
+		return
+	}
+
+	members, err := h.scim.GetRole(r.Context(), h.timecardApproverRoleID)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "scim GetRole (time card approvers) failed", "userID", user.UserID, "err", err)
+		// A 401/403 here means this backend's own SCIM client credentials lack
+		// the scope to read Asgardeo roles (see ASGARDEO_ROLE_IDS's own doc
+		// comment) -- a deployment/configuration problem, not anything about
+		// the calling portal user's own permissions. mapUpstreamErrorGeneric's
+		// usual 401/403 pass-through would tell an ordinary viewer "you don't
+		// have permission" for what is actually a backend misconfiguration an
+		// admin needs to fix, so those two codes are reported as a sanitized
+		// 502 instead; every other status still goes through the usual mapping.
+		var apiErr *apierror.Error
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden) {
+			writeError(w, http.StatusBadGateway, "Failed to list time card approvers.")
+			return
+		}
+		mapUpstreamErrorGeneric(w, err, "Failed to list time card approvers.")
+		return
+	}
+
+	approvers := make([]timeCardApproverRef, 0, len(members))
+	for _, m := range members {
+		approvers = append(approvers, timeCardApproverRef{ID: m.ID, Email: m.Email})
+	}
+	writeJSONValue(w, http.StatusOK, timeCardApproversResponse{Approvers: approvers})
 }
 
 // ListSavedFilterViews handles GET /users/me/saved-filter-views.

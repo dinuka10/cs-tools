@@ -44,6 +44,11 @@ let patchError: Error | null = null;
 // module load, which isn't present under vitest. The page imports
 // `BackendApiError` from it directly, so stub the module with a real class
 // (so `instanceof` still works) — same approach as CsmIncidentDetailPage.test.tsx.
+// `useBackendApi` also has to be stubbed here (not just `BackendApiError`):
+// this page's comment-edit/delete wiring goes through the real, unmocked
+// `usePatchComment`/`useDeleteComment` (@features/csm-cases/api/useCsmCaseComments),
+// which calls `useBackendApi()` unconditionally on every render — leaving it
+// undefined throws "No useBackendApi export" the moment the page mounts.
 vi.mock("@api/backend/client", () => ({
   BackendApiError: class BackendApiError extends Error {
     status: number;
@@ -52,6 +57,7 @@ vi.mock("@api/backend/client", () => ({
       this.status = status;
     }
   },
+  useBackendApi: () => ({ get: vi.fn(), post: vi.fn(), patch: vi.fn(), delete: vi.fn() }),
 }));
 
 vi.mock("@hooks/useNavTransition", () => ({
@@ -59,6 +65,20 @@ vi.mock("@hooks/useNavTransition", () => ({
 }));
 vi.mock("@context/error-banner/ErrorBannerContext", () => ({
   useErrorBanner: () => ({ showError: showErrorMock }),
+}));
+// `usePortalAccess()` (for `canDownloadAttachment`) pulls in `useCurrentUser`
+// -> `CurrentUserContext` -> `useGetUsersMe`, which reads `@config/apiConfig`
+// at module load — unavailable under vitest (see this repo's own testing
+// conventions). Mocking `CurrentUserContext` directly short-circuits that
+// chain before it ever reaches `apiConfig`, same approach as
+// CsmIncidentDetailPage.test.tsx.
+vi.mock("@context/current-user/CurrentUserContext", () => ({
+  useCurrentUser: () => ({
+    user: { id: "00000000-0000-0000-0000-00000000000c", email: "jane.doe@example.com" },
+    isLoading: false,
+    isError: false,
+    error: null,
+  }),
 }));
 vi.mock("@features/csm-operations/api/useGetChangeRequest", () => ({
   useGetChangeRequest: () => useGetChangeRequestMock(),
@@ -415,12 +435,12 @@ describe("CsmChangeRequestDetailPage — Clone", () => {
   });
 });
 
-describe("CsmChangeRequestDetailPage — Request approval (New -> Assess)", () => {
-  it("shows the Request approval button when the backend flags 'assess' as a legal next state", () => {
+describe("CsmChangeRequestDetailPage — Move to Assess (New -> Assess)", () => {
+  it("shows the Move to Assess button when the backend flags 'assess' as a legal next state", () => {
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: ["assess"] } });
     renderPage();
     expect(
-      screen.getByRole("button", { name: /request approval/i }),
+      screen.getByRole("button", { name: /move to assess/i }),
     ).toBeInTheDocument();
   });
 
@@ -428,7 +448,7 @@ describe("CsmChangeRequestDetailPage — Request approval (New -> Assess)", () =
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: [] } });
     renderPage();
     expect(
-      screen.queryByRole("button", { name: /request approval/i }),
+      screen.queryByRole("button", { name: /move to assess/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -436,16 +456,25 @@ describe("CsmChangeRequestDetailPage — Request approval (New -> Assess)", () =
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: undefined } });
     renderPage();
     expect(
-      screen.queryByRole("button", { name: /request approval/i }),
+      screen.queryByRole("button", { name: /move to assess/i }),
     ).not.toBeInTheDocument();
   });
 
-  it("shows a disabled Request approval button when the state allows it but there is no assigned team", () => {
+  /**
+   * New -> Assess is compulsorily gated on an assigned team, by explicit
+   * product decision: the team's own members become the Assess-stage
+   * approvers the moment the transition lands, so there is no valid way to
+   * enter Assess with no team to assign that stage to. The backend itself
+   * rejects this PATCH with no team regardless of what the button does --
+   * this is the UI-side half that keeps the click from round-tripping into
+   * that rejection.
+   */
+  it("shows a disabled Move to Assess button when the state allows it but there is no assigned team", () => {
     mockQueryResult({
       data: { ...BASE_CR, legalNextStates: ["assess"], assignedTeam: null },
     });
     renderPage();
-    const button = screen.getByRole("button", { name: /request approval/i });
+    const button = screen.getByRole("button", { name: /move to assess/i });
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(patchMutateMock).not.toHaveBeenCalled();
@@ -456,31 +485,31 @@ describe("CsmChangeRequestDetailPage — Request approval (New -> Assess)", () =
       data: { ...BASE_CR, legalNextStates: ["assess"], assignedTeam: null },
     });
     renderPage();
-    const button = screen.getByRole("button", { name: /request approval/i });
+    const button = screen.getByRole("button", { name: /move to assess/i });
     const focusTarget = button.closest('[tabindex="0"]');
     expect(focusTarget).not.toBeNull();
     expect(focusTarget).toHaveAttribute(
       "aria-label",
-      "Request approval: Set an assigned team before requesting approval",
+      "Move to Assess: Set an assigned team before moving to Assess",
     );
   });
 
-  it("leaves Request approval enabled when both the state and the assigned team allow it", () => {
+  it("leaves Move to Assess enabled when both the state and the assigned team allow it", () => {
     mockQueryResult({
       data: { ...BASE_CR, legalNextStates: ["assess"], assignedTeam: { id: "team-1", name: "Platform" } },
     });
     renderPage();
     expect(
-      screen.getByRole("button", { name: /request approval/i }),
+      screen.getByRole("button", { name: /move to assess/i }),
     ).toBeEnabled();
   });
 
-  it("PATCHes { requestApproval: true } for this CR when clicked", () => {
+  it("PATCHes { state: \"assess\" } for this CR when clicked", () => {
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: ["assess"] } });
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /request approval/i }));
+    fireEvent.click(screen.getByRole("button", { name: /move to assess/i }));
     expect(patchMutateMock).toHaveBeenCalledWith(
-      { id: "chg-1", patch: { requestApproval: true } },
+      { id: "chg-1", patch: { state: "assess" } },
       expect.objectContaining({ onError: expect.any(Function) }),
     );
   });
@@ -488,12 +517,12 @@ describe("CsmChangeRequestDetailPage — Request approval (New -> Assess)", () =
   it("surfaces a mutation error via the shared error banner", () => {
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: ["assess"] } });
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /request approval/i }));
+    fireEvent.click(screen.getByRole("button", { name: /move to assess/i }));
     const [, options] = patchMutateMock.mock.calls[0];
     const err = new Error("boom");
     options.onError(err);
     expect(showErrorMock).toHaveBeenCalledWith(
-      "Could not request approval for this change request.",
+      "Could not move this change request to Assess.",
       err,
     );
   });
@@ -501,7 +530,7 @@ describe("CsmChangeRequestDetailPage — Request approval (New -> Assess)", () =
   it("surfaces the backend's real rejection reason for a 4xx state-transition error", () => {
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: ["assess"] } });
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /request approval/i }));
+    fireEvent.click(screen.getByRole("button", { name: /move to assess/i }));
     const [, options] = patchMutateMock.mock.calls[0];
     const err = new BackendApiError(409, "State transition rejected: approver required");
     options.onError(err);
@@ -514,12 +543,12 @@ describe("CsmChangeRequestDetailPage — Request approval (New -> Assess)", () =
   it("falls back to the generic message for a 5xx error even with a body message", () => {
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: ["assess"] } });
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /request approval/i }));
+    fireEvent.click(screen.getByRole("button", { name: /move to assess/i }));
     const [, options] = patchMutateMock.mock.calls[0];
     const err = new BackendApiError(500, "internal error detail");
     options.onError(err);
     expect(showErrorMock).toHaveBeenCalledWith(
-      "Could not request approval for this change request.",
+      "Could not move this change request to Assess.",
       err,
     );
   });
@@ -592,12 +621,12 @@ describe("CsmChangeRequestDetailPage — direct (non-destructive) transitions", 
     );
   });
 
-  it("keeps the requestApproval flag for New -> Assess rather than sending state", () => {
+  it("sends a plain state PATCH for New -> Assess, same as every other transition", () => {
     mockQueryResult({ data: { ...BASE_CR, legalNextStates: ["assess"] } });
     renderPage();
-    fireEvent.click(screen.getByRole("button", { name: /request approval/i }));
+    fireEvent.click(screen.getByRole("button", { name: /move to assess/i }));
     const [{ patch }] = patchMutateMock.mock.calls[0];
-    expect(patch).toEqual({ requestApproval: true });
+    expect(patch).toEqual({ state: "assess" });
   });
 
   it("sends a state the backend added verbatim, with no frontend change", () => {

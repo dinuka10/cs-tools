@@ -15,8 +15,7 @@
 # under the License.
 
 [server]
-# Total SIGTERM budget; must cover drain_delay + request_wait + allocator_drain.
-# Choreo's termination grace period must be longer (30s or more).
+# Total SIGTERM budget covering the three drains below; Choreo's grace period must be 30s or more.
 shutdown_grace = "25s"
 # After SIGTERM, /healthz answers 503 for this long before the listener closes.
 drain_delay = "5s"
@@ -31,15 +30,10 @@ idle_timeout = "60s"
 # Bodies over this are answered 413 and never claim an id.
 max_body_bytes = 1048576
 
-[auth]
-# Vendor-route auth hook. Only "none" exists today: the routes are public.
-mode = "none"
-
 [allocator]
 # Alerts waiting to be claimed; when full, new webhooks get 503 immediately.
 queue_size = 5000
-# Memory cap on everything accepted but not finished; new webhooks get 503 when full.
-# Keep it about half the container memory limit.
+# Memory cap on accepted, unfinished alerts before 503; about half the container memory limit.
 queue_max_bytes = 268435456
 # Max alerts claimed with a single compare-and-set on alert_seq.
 max_batch = 200
@@ -55,11 +49,9 @@ insert_attempts = 5
 insert_base_delay = "250ms"
 # Per-query timeout for row inserts and read-backs.
 query_timeout = "1.5s"
-# Timeout for the alert_seq read and compare-and-set; longer, so a slow claim isn't mistaken
-# for a failure that may leave claimed ids without rows.
+# Timeout for the alert_seq read and compare-and-set, longer so a slow claim isn't a failure.
 claim_timeout = "5s"
-# How long, from the claim, a throttled write keeps retrying before the filler row.
-# Must stay under alerts-core's gap_timeout (10m).
+# How long a throttled write retries before the filler row; must stay under alerts-core's gap_timeout (10m).
 write_deadline = "5m"
 
 [cassandra]
@@ -69,12 +61,11 @@ connect_base_delay = "2s"
 connect_timeout = "10s"
 
 [wake]
-# Timeout for the fire-and-forget POST /alert to alerts-core.
+# Timeout for the fire-and-forget POST /alertz to alerts-core.
 timeout = "2s"
 
 [reject]
-# One rejected-webhook Chat card per vendor + error class per window, at most 10 per replica;
-# the rest are counted and reported on the next card.
+# Window for one reject card per vendor + error class (max 10 per replica); the rest are counted.
 window = "15m"
 # How much of a rejected body the card shows.
 body_preview_chars = 500

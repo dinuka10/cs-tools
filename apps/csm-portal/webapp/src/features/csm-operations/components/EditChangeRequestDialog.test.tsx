@@ -15,8 +15,9 @@
 // under the License.
 
 import { fireEvent, render, screen, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
+import { clearUserPreferredTimeZone, setUserPreferredTimeZone } from "@utils/dateTime";
 import type { BeChangeRequestDetail, BePatchChangeRequestPayload } from "@api/backend/types";
 
 
@@ -380,5 +381,75 @@ describe("EditChangeRequestDialog — planned end must be after planned start", 
       screen.queryByText(/planned end must be after planned start/i),
     ).not.toBeInTheDocument();
     expect(saveButton()).toBeEnabled();
+  });
+});
+
+describe("EditChangeRequestDialog — planned dates round-trip through the user's time zone", () => {
+  afterEach(() => {
+    clearUserPreferredTimeZone();
+  });
+
+  it("does not re-send an untouched planned date: the UTC value read in converts back to itself", () => {
+    // Asia/Colombo is UTC+05:30. Without the time zone conversion, the stored
+    // UTC digits were treated as wall-clock and a save would have shifted them.
+    setUserPreferredTimeZone("Asia/Colombo");
+    const { onSave } = renderDialog({
+      plannedStartOn: "2026-03-01 10:00:00",
+      plannedEndOn: "2026-03-01 12:00:00",
+    });
+    fireEvent.change(planEditor(/rollback plan/i), { target: { value: "<p>dirty</p>" } });
+    fireEvent.click(saveButton());
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    const patch = onSave.mock.calls[0][0];
+    expect(patch).not.toHaveProperty("plannedStartOn");
+    expect(patch).not.toHaveProperty("plannedEndOn");
+  });
+
+  it("shows the stored UTC start in the user's time zone", () => {
+    setUserPreferredTimeZone("Asia/Colombo");
+    renderDialog({ plannedStartOn: "2026-03-01 10:00:00", plannedEndOn: "2026-03-01 12:00:00" });
+    // 10:00 UTC is 15:30 (03:30 PM) in Colombo.
+    const start = screen.getByRole("group", { name: /planned start/i });
+    expect(start).toHaveTextContent("03/01/2026 03:30 PM");
+  });
+});
+
+describe("EditChangeRequestDialog — the 'in the past' hint follows the profile time zone", () => {
+  const PAST_HINT = /this date is in the past/i;
+
+  beforeAll(() => {
+    // Pin the browser zone so it differs from the profile zone under test.
+    vi.stubEnv("TZ", "UTC");
+  });
+
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2030-03-01T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearUserPreferredTimeZone();
+  });
+
+  it("warns when the start is past in the profile zone but would look future in the browser zone", () => {
+    setUserPreferredTimeZone("Asia/Colombo");
+    // 10:00Z is before now (12:00Z); the picker shows 15:30, which read as
+    // browser (UTC) digits would be 15:30Z, i.e. later than now.
+    renderDialog({ plannedStartOn: "2030-03-01 10:00:00", plannedEndOn: "2030-03-01 20:00:00" });
+    expect(screen.getByText(PAST_HINT)).toBeInTheDocument();
+  });
+
+  it("does not warn when the start is future in the profile zone but would look past in the browser zone", () => {
+    setUserPreferredTimeZone("America/Los_Angeles");
+    // 16:00Z is after now; the picker shows 08:00, which read as browser (UTC)
+    // digits would be 08:00Z, i.e. earlier than now.
+    renderDialog({ plannedStartOn: "2030-03-01 16:00:00", plannedEndOn: "2030-03-01 20:00:00" });
+    expect(screen.queryByText(PAST_HINT)).not.toBeInTheDocument();
   });
 });

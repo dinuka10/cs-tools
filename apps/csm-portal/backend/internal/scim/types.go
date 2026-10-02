@@ -142,6 +142,22 @@ type scimUpdateRequest struct {
 	PhoneNumber *scimPhonePayload `json:"phoneNumber,omitempty"`
 }
 
+// scimRole mirrors the SCIM Role record returned by GET
+// /organizations/internal/roles/{id} (Asgardeo Roles Management API v2).
+type scimRole struct {
+	ID          string         `json:"id"`
+	DisplayName string         `json:"displayName"`
+	Users       []scimRoleUser `json:"users"`
+}
+
+// scimRoleUser is one element of a role's "users" array. Display is observed
+// as "<domain>/<email>" (e.g. "DEFAULT/jane@wso2.com") for a provisioned
+// user -- see RoleMember.Email's own doc comment.
+type scimRoleUser struct {
+	Display string `json:"display"`
+	Value   string `json:"value"`
+}
+
 type scimPhonePayload struct {
 	Mobile string `json:"mobile"`
 }
@@ -166,6 +182,17 @@ type UserInfo struct {
 // through AccessGuard.RolesFor for a user other than the caller, where no
 // JWT "roles" claim is available) filters by this prefix first.
 const CSMAppRolePrefix = "app-csm-"
+
+// RoleMember is one user holding a role, as returned by GetRole.
+type RoleMember struct {
+	// ID is the user's Asgardeo UUID.
+	ID string
+	// Email is extracted from the SCIM "display" field (observed as
+	// "<domain>/<email>", e.g. "DEFAULT/jane@wso2.com") with the domain
+	// prefix stripped. Falls back to the raw display value if it carries no
+	// "/" (defensive -- not observed in practice).
+	Email string
+}
 
 // ExternalUserInfo holds the SCIM "external" org existence/lock status for a
 // user, mirroring the asgardeo-user-check service's {exists, locked} contract.

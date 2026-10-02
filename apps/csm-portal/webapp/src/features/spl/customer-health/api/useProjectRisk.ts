@@ -16,21 +16,21 @@
 
 import { useMutation, useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { useBackendApi, BackendApiError } from "@api/backend/client";
-import type { ProjectRisk } from "./splCustomerHealthTypes";
+import type { ProjectRisk } from "./customerHealthTypes";
 
-// POST /spl/customer-health/projects/{projectSysId}/risk
+// POST /customer-health/projects/{projectSysId}/risk
 export function useOpenProjectRisk() {
   const backendApi = useBackendApi();
   return useMutation<ProjectRisk, Error, { projectSysId: string; accountSysId: string; comment: string }>({
     mutationFn: ({ projectSysId, accountSysId, comment }) =>
       backendApi.post<{ accountSysId: string; comment: string }, ProjectRisk>(
-        `/spl/customer-health/projects/${projectSysId}/risk`,
+        `/customer-health/projects/${encodeURIComponent(projectSysId)}/risk`,
         { accountSysId, comment },
       ),
   });
 }
 
-// POST /spl/customer-health/projects/{projectSysId}/mark-healthy
+// POST /customer-health/projects/{projectSysId}/mark-healthy
 export function useMarkProjectHealthy() {
   const backendApi = useBackendApi();
   return useMutation<
@@ -40,13 +40,13 @@ export function useMarkProjectHealthy() {
   >({
     mutationFn: ({ projectSysId, accountSysId, comment }) =>
       backendApi.post<{ accountSysId: string; comment: string }, unknown>(
-        `/spl/customer-health/projects/${projectSysId}/mark-healthy`,
+        `/customer-health/projects/${encodeURIComponent(projectSysId)}/mark-healthy`,
         { accountSysId, comment },
       ),
   });
 }
 
-// PUT /spl/customer-health/risks/{riskId}/close — riskId is an INTEGER.
+// PUT /customer-health/risks/{riskId}/close — riskId is an INTEGER.
 // The source app read a bespoke error message off the failure
 // (`err.response.data.message`) for this one call — BackendApiError's own
 // `.payload?.message` is the equivalent field here.
@@ -54,7 +54,7 @@ export function useCloseProjectRisk() {
   const backendApi = useBackendApi();
   return useMutation<unknown, BackendApiError, { riskId: number; comment: string }>({
     mutationFn: ({ riskId, comment }) =>
-      backendApi.put<{ comment: string }, unknown>(`/spl/customer-health/risks/${riskId}/close`, { comment }),
+      backendApi.put<{ comment: string }, unknown>(`/customer-health/risks/${riskId}/close`, { comment }),
   });
 }
 
@@ -63,7 +63,7 @@ export function closeProjectRiskErrorMessage(error: unknown, fallback: string): 
   return fallback;
 }
 
-// GET /spl/customer-health/projects/{projectSysId}/risk-history — fetched
+// GET /customer-health/projects/{projectSysId}/risk-history — fetched
 // lazily (only when the history dialog opens), so `enabled` is controlled
 // by the caller rather than firing on mount.
 export function useProjectRiskHistory(
@@ -75,6 +75,8 @@ export function useProjectRiskHistory(
     queryKey: ["spl-customer-health-risk-history", projectSysId],
     enabled,
     queryFn: async () =>
-      (await backendApi.get<ProjectRisk[]>(`/spl/customer-health/projects/${projectSysId}/risk-history`)) ?? [],
+      (await backendApi.get<ProjectRisk[]>(
+        `/customer-health/projects/${encodeURIComponent(projectSysId)}/risk-history`,
+      )) ?? [],
   });
 }

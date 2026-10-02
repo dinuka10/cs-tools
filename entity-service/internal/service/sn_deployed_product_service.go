@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -168,21 +169,8 @@ type snCreateDeployedProductResponse struct {
 	Message         string `json:"message"`
 	DeployedProduct struct {
 		ID string `json:"id"`
-		// Number is not exposed on the public CreateDeployedProduct response
-		// (domain.CreatedDeployedProduct has no Number field, matching
-		// backend-v2's own mirror struct and deployment's identical
-		// omission -- see snCreateDeploymentResponse's own doc comment) --
-		// it exists on this wire struct only for
-		// createDeployedProductSNFirstDetails' dual-write use: deployed_product.number
-		// is NOT NULL UNIQUE (migration 0019) and Postgres has no generator
-		// for it, the same unresolved problem deployment.number had before
-		// createDeploymentSNFirstDetails. This mirrors deployment's shape
-		// (id/number/createdOn/createdBy) exactly, on the assumption the
-		// Choreo/Ballerina integration service assigns deployed_product a
-		// number the same way it does deployment -- unconfirmed against a
-		// live response since nothing previously needed this field; if wrong,
-		// createDeployedProductSNFirstDetails' own empty-number guard below
-		// fails the request loudly rather than writing a bad row.
+		// Number is the record's own number (e.g. IBITM...), carried in the
+		// upstream create reply. It is not exposed on the public response.
 		Number    string `json:"number"`
 		CreatedOn string `json:"createdOn"`
 		CreatedBy string `json:"createdBy"`
@@ -290,22 +278,26 @@ func (s *snDeployedProductService) createDeployedProductSNFirstDetails(ctx conte
 	if err != nil {
 		return "", "", "", time.Time{}, err
 	}
-	createdOn, err = time.Parse(snCreatedOnLayout, snResp.DeployedProduct.CreatedOn)
-	if err != nil {
-		return "", "", "", time.Time{}, fmt.Errorf("sn create deployed product: parse createdOn %q: %w", snResp.DeployedProduct.CreatedOn, err)
-	}
+	// The reply's createdOn is deliberately ignored: it is a wall-clock time in
+	// a non-UTC zone, and parsing it as UTC would store created_on hours in the
+	// future. The current time is used instead.
 	// deployed_product.number is NOT NULL UNIQUE on the Postgres side (see
-	// createDeployedProductSNFirst's own doc comment) -- an empty id/number
-	// here would either fail the Postgres insert with an opaque constraint
-	// violation or, worse, succeed with a blank number that later collides
-	// with a real one. Caught here, before it ever reaches the repository.
+	// createDeployedProductSNFirst's own doc comment), so a reply without an
+	// id/number cannot be stored. The create has already happened upstream by
+	// now, so this is a partial creation needing reconciliation, not a
+	// rejected client request: reported as a downstream error and logged,
+	// never as a validation error. Nothing reaches the repository.
 	if snResp.DeployedProduct.ID == "" {
-		return "", "", "", time.Time{}, &apierror.ValidationError{Msg: "sn create deployed product: response id is required"}
+		slog.ErrorContext(ctx, "sn create deployed product: create reply carried no id; nothing written to Postgres",
+			"deploymentId", req.DeploymentID)
+		return "", "", "", time.Time{}, &apierror.DownstreamError{Msg: "The upstream service returned an invalid response to the deployed product create request."}
 	}
 	if snResp.DeployedProduct.Number == "" {
-		return "", "", "", time.Time{}, &apierror.ValidationError{Msg: "sn create deployed product: response number is required"}
+		slog.ErrorContext(ctx, "sn create deployed product: ServiceNow deployed product created but the create reply carried no number; nothing written to Postgres, needs reconciliation",
+			"deployedProductId", snResp.DeployedProduct.ID, "deploymentId", req.DeploymentID)
+		return "", "", "", time.Time{}, &apierror.DownstreamError{Msg: "The deployed product was created but its number was not returned by the upstream service, so it could not be stored. It needs to be reconciled."}
 	}
-	return sysidToUUID(snResp.DeployedProduct.ID), snResp.DeployedProduct.Number, snResp.DeployedProduct.CreatedBy, createdOn, nil
+	return sysidToUUID(snResp.DeployedProduct.ID), snResp.DeployedProduct.Number, snResp.DeployedProduct.CreatedBy, time.Now().UTC(), nil
 }
 
 // UpdateDeployedProduct implements DeployedProductService for the ServiceNow data source.

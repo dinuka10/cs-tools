@@ -16,7 +16,43 @@
 
 package store
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/scylladb/gocqlx/v2/qb"
+)
+
+// TestCasUpdate_QueryShape locks down casUpdate's CQL shape: version bound under distinct SET/IF names with an equality-only IF clause, since Cosmos's Cassandra API supports no other comparator.
+func TestCasUpdate_QueryShape(t *testing.T) {
+	stmt, names := qb.Update("incidents_processed").
+		Set("alert_count").
+		SetNamed("version", "new_version").
+		Where(qb.Eq("fingerprint")).
+		If(qb.EqNamed("version", "expected_version")).
+		ToCql()
+
+	if !strings.Contains(stmt, "IF version=?") {
+		t.Fatalf("expected an equality-only IF clause on version (Cosmos LWT supports no other comparator), got: %s", stmt)
+	}
+	if strings.Contains(stmt, "IF version<") || strings.Contains(stmt, "IF version>") {
+		t.Fatalf("IF clause must be equality-only, got: %s", stmt)
+	}
+
+	wantNames := []string{"alert_count", "new_version", "fingerprint", "expected_version"}
+	if len(names) != len(wantNames) {
+		t.Fatalf("bound names = %v, want %v", names, wantNames)
+	}
+	for i, n := range wantNames {
+		if names[i] != n {
+			t.Fatalf("bound names = %v, want %v", names, wantNames)
+		}
+	}
+	// SET and IF sides of "version" must bind under distinct names, or the new/old values would collide.
+	if names[1] == names[3] {
+		t.Fatalf("SET and IF sides of version must bind under distinct names, both got %q", names[1])
+	}
+}
 
 func TestIsPending(t *testing.T) {
 	tests := []struct {

@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-// OnboardingStep names the two onboarding_step rows this service writes
+// OnboardingStep names the three onboarding_step rows this service writes
 // for a membership — entity-service's OnboardingStepName enum also has
 // DATABASE (written in-process by its own Salesforce ingest) and
 // REGISTRATION (written by the customer portal backend), neither of which
@@ -38,6 +38,8 @@ const (
 	OnboardingStepIdentity OnboardingStep = "IDENTITY"
 	// OnboardingStepEmail is the invitation-email step.
 	OnboardingStepEmail OnboardingStep = "EMAIL"
+	// OnboardingStepWelcomeEmail is the Welcome email sent after registration.
+	OnboardingStepWelcomeEmail OnboardingStep = "WELCOME_EMAIL"
 )
 
 // OnboardingStepStatus mirrors entity-service's OnboardingStepStatus enum.
@@ -63,7 +65,7 @@ type OnboardingStepRequest struct {
 	// characters; omitted from the body when empty.
 	LastError string `json:"lastError,omitempty"`
 	// EventType is the event this write is a reaction to —
-	// events.TypeProjectContactInvited for every write this service makes.
+	// events.TypeProjectContactInvited, or TypeProjectContactRegistered for WELCOME_EMAIL.
 	EventType string `json:"eventType"`
 	// EventModifiedOn is the version this write is based on, and it is the
 	// wire contract with entity-service's upsert rule: a write only moves a
@@ -122,6 +124,11 @@ type getOnboardingStepsResponse struct {
 // An unknown membership yields nil with no error: entity-service answers
 // an empty list rather than a 404.
 func (c *CustomerEntityClient) SucceededEmailStep(ctx context.Context, membershipSfID string) (*RecordedOnboardingStep, error) {
+	return c.SucceededStep(ctx, membershipSfID, OnboardingStepEmail)
+}
+
+// SucceededStep returns the membership's SUCCEEDED row for step, or nil.
+func (c *CustomerEntityClient) SucceededStep(ctx context.Context, membershipSfID string, step OnboardingStep) (*RecordedOnboardingStep, error) {
 	if membershipSfID == "" {
 		return nil, fmt.Errorf("entity: membershipSfId is required to read onboarding steps")
 	}
@@ -134,9 +141,9 @@ func (c *CustomerEntityClient) SucceededEmailStep(ctx context.Context, membershi
 		return nil, fmt.Errorf("entity: decode onboarding steps response: %w", err)
 	}
 	for _, s := range out.Steps {
-		if s.Step == OnboardingStepEmail && s.Status == OnboardingStepSucceeded {
-			step := s
-			return &step, nil
+		if s.Step == step && s.Status == OnboardingStepSucceeded {
+			found := s
+			return &found, nil
 		}
 	}
 	return nil, nil

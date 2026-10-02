@@ -16,6 +16,7 @@
 import { Route } from "react-router";
 
 import DashboardPage from "./pages/dashboard/DashboardPage";
+import LeadershipDashboardPage from "./pages/dashboard/LeadershipDashboardPage";
 import OrganizationDetailPage from "./pages/organizations/OrganizationDetailPage";
 import OrganizationsPage from "./pages/organizations/OrganizationsPage";
 import PlaybooksPage from "./pages/playbooks/PlaybooksPage";
@@ -47,11 +48,12 @@ export function plgRoutes() {
       <Route path="organizations/:organizationId/:productCode" element={<OrganizationDetailPage />} />
       <Route path="new-registrations" element={<NewRegistrationsPage />} />
       <Route path="playbooks" element={<PlaybooksPage />} />
-      {/* The leadership view — the SAME component as /plg/dashboard above, with
-          fewer tiles. It reads the last path segment to decide which, so this
-          route is the switch: "overview" drops the two queue counts, because
-          those are a to-do list and a leadership dashboard is not one. */}
-      <Route path="overview" element={<DashboardPage />} />
+      {/* The leadership view: its own page, not a variant of the one above.
+          Both draw the same cohort charts and differ in their tiles — the
+          leadership view carries no queue counts, because those are a to-do
+          list. They were one component reading its own URL to decide which it
+          was, which broke silently when the merge moved the path. */}
+      <Route path="overview" element={<LeadershipDashboardPage />} />
     </Route>
   );
 }

@@ -180,6 +180,40 @@ func (c *Client) UpdateUserPhone(ctx context.Context, userID, mobile string) (*s
 	return extractMobilePhone(updatedUser), nil
 }
 
+// GetRole fetches the role with the given Asgardeo role ID and returns its
+// member users. roleID is deployment configuration set once, out of band
+// (e.g. TIMECARD_APPROVER_ASGARDEO_ROLE_ID) -- not looked up by name on every
+// call, since the SCIM operations service's role endpoint is a plain
+// get-by-id, not a search.
+func (c *Client) GetRole(ctx context.Context, roleID string) ([]RoleMember, error) {
+	path := "/organizations/" + org + "/roles/" + url.PathEscape(roleID)
+	raw, err := c.do(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var role scimRole
+	if err := json.Unmarshal(raw, &role); err != nil {
+		return nil, fmt.Errorf("scim: decode role response: %w", err)
+	}
+
+	members := make([]RoleMember, 0, len(role.Users))
+	for _, u := range role.Users {
+		members = append(members, RoleMember{ID: u.Value, Email: emailFromDisplay(u.Display)})
+	}
+	return members, nil
+}
+
+// emailFromDisplay strips a SCIM role member's "<domain>/" prefix (e.g.
+// "DEFAULT/jane@wso2.com" -> "jane@wso2.com"). Falls back to the raw value
+// when it carries no "/", rather than returning an empty string.
+func emailFromDisplay(display string) string {
+	if idx := strings.Index(display, "/"); idx >= 0 && idx+1 < len(display) {
+		return display[idx+1:]
+	}
+	return display
+}
+
 // extractMobilePhone returns the first phone number of type "mobile", or nil.
 // Mirrors processPhoneNumber in the Ballerina SCIM utils.
 func extractMobilePhone(u scimUser) *string {

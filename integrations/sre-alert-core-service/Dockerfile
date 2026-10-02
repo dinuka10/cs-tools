@@ -14,7 +14,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM golang:1.25.5-alpine AS builder
+FROM mirror.gcr.io/library/golang:1.26.0-alpine AS builder
 
 # Set the working directory to /app
 WORKDIR /app
@@ -29,7 +29,7 @@ RUN go test ./...
 RUN go build -o alert-core-service ./cmd/server
 
 # Use a small Alpine Linux image as the base image for the final container; pinned for reproducible builds.
-FROM alpine:3.22
+FROM mirror.gcr.io/library/alpine:3.22
 
 # Set the working directory to /app
 WORKDIR /app

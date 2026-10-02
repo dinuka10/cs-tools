@@ -577,6 +577,32 @@ func TestSNChangeRequestService_PatchChangeRequest_RejectsEmptyJournalFields(t *
 	}
 }
 
+// TestSNChangeRequestService_CreateChangeRequest_RejectsNonNewState guards
+// against the regression reported live: the CSM Portal's own create form used
+// to let a caller pick Assess or Authorize directly as a change request's
+// starting state, skipping the workflow's own assess/authorize gates
+// entirely. Every state but New must now be rejected before create even
+// reaches ServiceNow.
+func TestSNChangeRequestService_CreateChangeRequest_RejectsNonNewState(t *testing.T) {
+	svc := NewServiceNowChangeRequestService(nil)
+
+	for _, s := range []domain.ChangeRequestState{
+		domain.ChangeRequestStateAssess,
+		domain.ChangeRequestStateAuthorize,
+		domain.ChangeRequestStateImplement,
+		domain.ChangeRequestStateClosed,
+	} {
+		state := s
+		_, err := svc.CreateChangeRequest(contextWithUserIDToken("token"), domain.CreateChangeRequestRequest{
+			Subject: "subject",
+			State:   &state,
+		})
+		if _, ok := err.(*apierror.ValidationError); !ok {
+			t.Fatalf("state %q: expected *apierror.ValidationError, got %T: %v", state, err, err)
+		}
+	}
+}
+
 // TestSNChangeRequestService_PatchChangeRequest_RejectsInvalidPriorityAndCategory
 // verifies the new priority/category writable keys are validated the same way
 // the pre-existing create-path enums are.
@@ -649,6 +675,36 @@ func TestSNChangeRequestService_CreateChangeRequest_SendsNewCreateFields(t *test
 	}
 	if gotBody["isPlanningVisibleToCustomers"] != true {
 		t.Errorf("isPlanningVisibleToCustomers: got %v", gotBody["isPlanningVisibleToCustomers"])
+	}
+}
+
+// TestSNChangeRequestService_CreateChangeRequest_ExplicitNewStateAccepted
+// verifies a caller explicitly asking for New (the only state create ever
+// permits) still succeeds, and that the outgoing payload never carries a
+// stateKey at all -- ServiceNow's own default is what actually sets it.
+func TestSNChangeRequestService_CreateChangeRequest_ExplicitNewStateAccepted(t *testing.T) {
+	var gotBody map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("/change-requests", func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"message": "Change request created", "changeRequest": {"id": "` + uuidToSysid(testCaseUUID) + `", "number": "CHG0001", "createdOn": "2026-01-01 00:00:00", "createdBy": "engineer@example.com"}}`))
+	})
+
+	client := newTestSNClient(t, mux)
+	svc := NewServiceNowChangeRequestService(client)
+
+	newState := domain.ChangeRequestStateNew
+	req := domain.CreateChangeRequestRequest{Subject: "subject", State: &newState}
+
+	if _, err := svc.CreateChangeRequest(contextWithUserIDToken("token"), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := gotBody["stateKey"]; ok {
+		t.Errorf("stateKey: got %v present in payload, want it absent entirely", gotBody["stateKey"])
 	}
 }
 

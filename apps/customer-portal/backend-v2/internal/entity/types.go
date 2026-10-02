@@ -1060,10 +1060,13 @@ type DeployedProductFilters struct {
 }
 
 // SearchDeployedProductsRequest is the input for POST /deployed-products/search.
-// DeploymentIDs scopes results to the given deployments; it is the only filter besides pagination.
+// DeploymentIDs scopes results to the given deployments. ProductCategories optionally narrows
+// them by product category (e.g. "pdp"); the entity service combines it with DeploymentIDs and
+// normalizes the case itself.
 type SearchDeployedProductsRequest struct {
-	Pagination    Pagination `json:"pagination"`
-	DeploymentIDs []string   `json:"deploymentIds,omitempty"`
+	Pagination        Pagination `json:"pagination"`
+	DeploymentIDs     []string   `json:"deploymentIds,omitempty"`
+	ProductCategories []string   `json:"productCategories,omitempty"`
 }
 
 // DeployedProductVersionRef is the version sub-object in a DeployedProductView.
@@ -2401,16 +2404,23 @@ type CaseFeedback struct {
 
 // AttachmentDetails is entity-service's response for GET /attachments/{id}.
 type AttachmentDetails struct {
-	ID          string    `json:"id"`
-	ReferenceID string    `json:"referenceId"`
-	Name        string    `json:"name"`
-	Type        string    `json:"type"`
-	SizeBytes   int       `json:"sizeBytes"`
-	Description *string   `json:"description"`
-	CreatedBy   string    `json:"createdBy"`
-	CreatedOn   time.Time `json:"createdOn"`
-	DownloadURL *string   `json:"downloadUrl"`
-	PreviewURL  *string   `json:"previewUrl"`
+	ID          string `json:"id"`
+	ReferenceID string `json:"referenceId"`
+	// ReferenceType identifies which entity type ReferenceID points at. Nil
+	// when entity-service's own lookup doesn't report one -- a caller
+	// authorizing access per referenced resource must treat a nil value as
+	// unknown and fail closed (see entity-service's own
+	// domain.AttachmentDetails.ReferenceType doc comment, and
+	// authorizeAttachmentAccess in internal/handler/attachments.go).
+	ReferenceType *ReferenceType `json:"referenceType"`
+	Name          string         `json:"name"`
+	Type          string         `json:"type"`
+	SizeBytes     int            `json:"sizeBytes"`
+	Description   *string        `json:"description"`
+	CreatedBy     string         `json:"createdBy"`
+	CreatedOn     time.Time      `json:"createdOn"`
+	DownloadURL   *string        `json:"downloadUrl"`
+	PreviewURL    *string        `json:"previewUrl"`
 	// Content is nil for a CSM-native (Postgres) data source attachment:
 	// entity-service holds no bytes for it, only its storage key. Always
 	// non-nil for ServiceNow-sourced attachments.

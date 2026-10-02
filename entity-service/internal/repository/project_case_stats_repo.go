@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 )
 
 // ProjectCaseStatsFilter narrows the aggregations below to one project, and
@@ -128,11 +128,16 @@ type ProjectCaseStatsRepository interface {
 }
 
 type projectCaseStatsRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewProjectCaseStatsRepository constructs a ProjectCaseStatsRepository backed by the given connection pool.
-func NewProjectCaseStatsRepository(db *pgxpool.Pool) ProjectCaseStatsRepository {
+// NewProjectCaseStatsRepository constructs a ProjectCaseStatsRepository
+// backed by the given Scoped connection -- announcement's RLS (migration
+// 000085) and work_item's are enforced by Postgres, reading the caller's
+// identity from ctx automatically instead of a filter field the caller had
+// to remember to populate. sla has no RLS (migration 0153); its route
+// access is gated by internalOnly.
+func NewProjectCaseStatsRepository(db *Scoped) ProjectCaseStatsRepository {
 	return &projectCaseStatsRepo{db: db}
 }
 
@@ -177,61 +182,67 @@ func caseStatsWhere(f ProjectCaseStatsFilter, next int, includeTypes, includeCre
 // StateSeverityCounts implements ProjectCaseStatsRepository.
 func (r *projectCaseStatsRepo) StateSeverityCounts(ctx context.Context, f ProjectCaseStatsFilter) ([]StateSeverityCount, error) {
 	where, args := caseStatsWhere(f, 1, true, true)
-	rows, err := r.db.Query(ctx, `
-		SELECT `+caseLikeStateColumn+` AS state,
-		       COALESCE(c.severity::TEXT, '') AS severity,
-		       COUNT(*)`+caseStatsFrom+where+`
-		 GROUP BY 1, 2`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("project case stats: state/severity counts: %w", err)
-	}
-	defer rows.Close()
-
 	var out []StateSeverityCount
-	for rows.Next() {
-		var sc StateSeverityCount
-		// state is NULL when a case-like row has no extension row at all;
-		// such a row still counts toward totalCount, so it is kept with an
-		// empty State rather than dropped.
-		var state *string
-		if err := rows.Scan(&state, &sc.Severity, &sc.Count); err != nil {
-			return nil, fmt.Errorf("project case stats: scan state/severity count: %w", err)
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+caseLikeStateColumn+` AS state,
+			       COALESCE(c.severity::TEXT, '') AS severity,
+			       COUNT(*)`+caseStatsFrom+where+`
+			 GROUP BY 1, 2`, args...)
+		if err != nil {
+			return fmt.Errorf("project case stats: state/severity counts: %w", err)
 		}
-		if state != nil {
-			sc.State = *state
+		defer rows.Close()
+
+		for rows.Next() {
+			var sc StateSeverityCount
+			// state is NULL when a case-like row has no extension row at all;
+			// such a row still counts toward totalCount, so it is kept with an
+			// empty State rather than dropped.
+			var state *string
+			if err := rows.Scan(&state, &sc.Severity, &sc.Count); err != nil {
+				return fmt.Errorf("project case stats: scan state/severity count: %w", err)
+			}
+			if state != nil {
+				sc.State = *state
+			}
+			out = append(out, sc)
 		}
-		out = append(out, sc)
-	}
-	return out, rows.Err()
+		return rows.Err()
+	})
+	return out, err
 }
 
 // StateEngagementTypeCounts implements ProjectCaseStatsRepository.
 func (r *projectCaseStatsRepo) StateEngagementTypeCounts(ctx context.Context, f ProjectCaseStatsFilter) ([]StateEngagementTypeCount, error) {
 	where, args := caseStatsWhere(f, 1, true, false)
-	rows, err := r.db.Query(ctx, `
-		SELECT `+caseLikeStateColumn+` AS state,
-		       eng.type::TEXT,
-		       COUNT(*)`+caseStatsFrom+where+`
-		   AND eng.type IS NOT NULL
-		 GROUP BY 1, 2`, args...)
-	if err != nil {
-		return nil, fmt.Errorf("project case stats: engagement type counts: %w", err)
-	}
-	defer rows.Close()
-
 	var out []StateEngagementTypeCount
-	for rows.Next() {
-		var ec StateEngagementTypeCount
-		var state *string
-		if err := rows.Scan(&state, &ec.EngagementType, &ec.Count); err != nil {
-			return nil, fmt.Errorf("project case stats: scan engagement type count: %w", err)
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+caseLikeStateColumn+` AS state,
+			       eng.type::TEXT,
+			       COUNT(*)`+caseStatsFrom+where+`
+			   AND eng.type IS NOT NULL
+			 GROUP BY 1, 2`, args...)
+		if err != nil {
+			return fmt.Errorf("project case stats: engagement type counts: %w", err)
 		}
-		if state != nil {
-			ec.State = *state
+		defer rows.Close()
+
+		for rows.Next() {
+			var ec StateEngagementTypeCount
+			var state *string
+			if err := rows.Scan(&state, &ec.EngagementType, &ec.Count); err != nil {
+				return fmt.Errorf("project case stats: scan engagement type count: %w", err)
+			}
+			if state != nil {
+				ec.State = *state
+			}
+			out = append(out, ec)
 		}
-		out = append(out, ec)
-	}
-	return out, rows.Err()
+		return rows.Err()
+	})
+	return out, err
 }
 
 // ResolvedBuckets implements ProjectCaseStatsRepository.
@@ -247,15 +258,17 @@ func (r *projectCaseStatsRepo) ResolvedBuckets(ctx context.Context, f ProjectCas
 	// the month boundary is the UTC one the ServiceNow implementation uses
 	// (getYearUTC/getMonthUTC) rather than the database server's timezone.
 	var currentMonth, pastThirtyDays int
-	err := r.db.QueryRow(ctx, `
-		SELECT COUNT(*) FILTER (WHERE closed_on >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),
-		       COUNT(*) FILTER (WHERE closed_on >= now() - INTERVAL '30 days')
-		  FROM (
-		        SELECT `+caseLikeStateColumn+` AS state,
-		               `+caseLikeClosedOnColumn+` AS closed_on`+caseStatsFrom+where+`
-		       ) resolved
-		 WHERE state = ANY(`+statePlaceholder+`) AND closed_on IS NOT NULL`, args...).
-		Scan(&currentMonth, &pastThirtyDays)
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(*) FILTER (WHERE closed_on >= date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),
+			       COUNT(*) FILTER (WHERE closed_on >= now() - INTERVAL '30 days')
+			  FROM (
+			        SELECT `+caseLikeStateColumn+` AS state,
+			               `+caseLikeClosedOnColumn+` AS closed_on`+caseStatsFrom+where+`
+			       ) resolved
+			 WHERE state = ANY(`+statePlaceholder+`) AND closed_on IS NOT NULL`, args...).
+			Scan(&currentMonth, &pastThirtyDays)
+	})
 	if err != nil {
 		return 0, 0, fmt.Errorf("project case stats: resolved buckets: %w", err)
 	}
@@ -269,16 +282,18 @@ func (r *projectCaseStatsRepo) ClosedByCreatedWindow(ctx context.Context, f Proj
 	statePlaceholder := fmt.Sprintf("$%d", len(args))
 
 	var current, previous int
-	err := r.db.QueryRow(ctx, `
-		SELECT COUNT(*) FILTER (WHERE created_on >= now() - INTERVAL '30 days'),
-		       COUNT(*) FILTER (WHERE created_on >= now() - INTERVAL '60 days'
-		                          AND created_on <  now() - INTERVAL '30 days')
-		  FROM (
-		        SELECT `+caseLikeStateColumn+` AS state,
-		               wi.created_on`+caseStatsFrom+where+`
-		       ) windowed
-		 WHERE state = `+statePlaceholder, args...).
-		Scan(&current, &previous)
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT COUNT(*) FILTER (WHERE created_on >= now() - INTERVAL '30 days'),
+			       COUNT(*) FILTER (WHERE created_on >= now() - INTERVAL '60 days'
+			                          AND created_on <  now() - INTERVAL '30 days')
+			  FROM (
+			        SELECT `+caseLikeStateColumn+` AS state,
+			               wi.created_on`+caseStatsFrom+where+`
+			       ) windowed
+			 WHERE state = `+statePlaceholder, args...).
+			Scan(&current, &previous)
+	})
 	if err != nil {
 		return 0, 0, fmt.Errorf("project case stats: change-rate windows: %w", err)
 	}

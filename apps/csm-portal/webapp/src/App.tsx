@@ -108,21 +108,21 @@ import CsmTimeCardsPage from "@features/csm-timecards/pages/CsmTimeCardsPage";
 import CsmAnnouncementsPage from "@features/csm-announcements/pages/CsmAnnouncementsPage";
 import CsmAnnouncementCreatePage from "@features/csm-announcements/pages/CsmAnnouncementCreatePage";
 import HelpPage from "@features/help/pages/HelpPage";
-import SplRouteGuard from "@features/spl/pages/SplRouteGuard";
-import SplAccountsPage from "@features/spl/accounts/pages/SplAccountsPage";
-import SplAccountDetailPage from "@features/spl/accounts/pages/SplAccountDetailPage";
-import SplProjectsPage from "@features/spl/projects/pages/SplProjectsPage";
-import SplProjectDetailPage from "@features/spl/projects/pages/SplProjectDetailPage";
-import SplSlaReportPage from "@features/spl/reports/pages/SplSlaReportPage";
-import SplCsReportPage from "@features/spl/reports/pages/SplCsReportPage";
-import SplTimelogsReportPage from "@features/spl/reports/pages/SplTimelogsReportPage";
-import SplTeamSchedulePage from "@features/spl/schedule/pages/SplTeamSchedulePage";
-import SplUserScanPage from "@features/spl/user-scan/pages/SplUserScanPage";
-import SplUsageMetricsPage from "@features/spl/usage-metrics/pages/SplUsageMetricsPage";
-import SplCustomerHealthDashboardPage from "@features/spl/customer-health/pages/SplCustomerHealthDashboardPage";
-import SplCustomerHealthDetailPage from "@features/spl/customer-health/pages/SplCustomerHealthDetailPage";
-// Cases lands in its own follow-up PR (feat/spl-merge-2-cases) -- see this
-// PR's own description for why this port was split by domain.
+import RouteGuard from "@features/spl/pages/RouteGuard";
+import CasesPage from "@features/spl/cases/pages/CasesPage";
+import CaseDetailPage from "@features/spl/cases/pages/CaseDetailPage";
+import AccountsPage from "@features/spl/accounts/pages/AccountsPage";
+import AccountDetailPage from "@features/spl/accounts/pages/AccountDetailPage";
+import ProjectsPage from "@features/spl/projects/pages/ProjectsPage";
+import ProjectDetailPage from "@features/spl/projects/pages/ProjectDetailPage";
+import SlaReportPage from "@features/spl/reports/pages/SlaReportPage";
+import CsReportPage from "@features/spl/reports/pages/CsReportPage";
+import TimelogsReportPage from "@features/spl/reports/pages/TimelogsReportPage";
+import TeamSchedulePage from "@features/spl/schedule/pages/TeamSchedulePage";
+import UserScanPage from "@features/spl/user-scan/pages/UserScanPage";
+import UsageMetricsPage from "@features/spl/usage-metrics/pages/UsageMetricsPage";
+import CustomerHealthDashboardPage from "@features/spl/customer-health/pages/CustomerHealthDashboardPage";
+import CustomerHealthDetailPage from "@features/spl/customer-health/pages/CustomerHealthDetailPage";
 
 /**
  * Landing for `/`. Defers to AuthGuard's post-login deep-link restore when a
@@ -155,12 +155,10 @@ function RootLanding(): JSX.Element | null {
     Boolean(searchParams.get(key)?.trim()),
   );
   // The Sales/SA view has no dashboard (SPL never had one) — its landing
-  // page is Cases, same as the standalone app's own index redirect (see
-  // usePortalView.ts). Cases itself lands in a follow-up PR
-  // (feat/spl-merge-2-cases); until it merges, Accounts is this view's
-  // landing page instead.
+  // page is Cases, same as the standalone app's own index redirect. See
+  // usePortalView.ts.
   const view = usePortalView();
-  const landing = view === "sales-sa" ? "/spl/accounts" : "/dashboard";
+  const landing = view === "sales-sa" ? "/spl/cases" : "/dashboard";
   return pending || hasDeepLinkSearch ? null : <Navigate to={landing} replace />;
 }
 
@@ -635,59 +633,59 @@ export default function App(): JSX.Element {
                   <Route path="help" element={<HelpPage />} />
 
                   {/* Support Portal Lite — ported from the former standalone
-                      apps/support-portal-lite/webapp. SplRouteGuard is the
+                      apps/support-portal-lite/webapp. RouteGuard is the
                       real enforcement point (an audience-gate 403, not just
                       a hidden nav entry) and also mounts
-                      SplPermissionProvider for every screen below it.
-                      Cases lands in its own follow-up PR -- this port was
-                      split by domain to stay under CodeRabbit's 100-file
-                      review limit. */}
-                  <Route path="spl" element={<SplRouteGuard />}>
-                    {/* SplAccountsPage reads the path leaf itself to decide
+                      PermissionProvider for every screen below it. */}
+                  <Route path="spl" element={<RouteGuard />}>
+                    <Route path="cases" element={<CasesPage />} />
+                    <Route path="cases/:caseId" element={<CaseDetailPage />} />
+
+                    {/* AccountsPage reads the path leaf itself to decide
                         all-accounts vs my-accounts — same component, two
                         routes. Only "accounts" has a csmNavItems.ts entry;
                         "my-accounts" is reachable from within the page
                         itself (a toggle), same as the source app. */}
-                    <Route path="accounts" element={<SplAccountsPage />} />
-                    <Route path="my-accounts" element={<SplAccountsPage />} />
-                    <Route path="accounts/:accountId" element={<SplAccountDetailPage />} />
+                    <Route path="accounts" element={<AccountsPage />} />
+                    <Route path="my-accounts" element={<AccountsPage />} />
+                    <Route path="accounts/:accountId" element={<AccountDetailPage />} />
 
-                    <Route path="projects" element={<SplProjectsPage />} />
-                    {/* SplProjectDetailPage only reads :projectId — reachable
+                    <Route path="projects" element={<ProjectsPage />} />
+                    {/* ProjectDetailPage only reads :projectId — reachable
                         both directly and nested under its account, matching
                         both links the source app's own components use. */}
-                    <Route path="projects/:projectId" element={<SplProjectDetailPage />} />
+                    <Route path="projects/:projectId" element={<ProjectDetailPage />} />
                     <Route
                       path="accounts/:accountId/projects/:projectId"
-                      element={<SplProjectDetailPage />}
+                      element={<ProjectDetailPage />}
                     />
                     <Route
                       path="projects/:projectId/sla-report/:sysId"
-                      element={<SplSlaReportPage />}
+                      element={<SlaReportPage />}
                     />
                     <Route
                       path="projects/:projectId/cs-report/:sysId"
-                      element={<SplCsReportPage />}
+                      element={<CsReportPage />}
                     />
                     <Route
                       path="projects/:projectId/timelogs-report"
-                      element={<SplTimelogsReportPage />}
+                      element={<TimelogsReportPage />}
                     />
 
-                    <Route path="team-schedule" element={<SplTeamSchedulePage />} />
-                    <Route path="team-schedule/:sysId" element={<SplTeamSchedulePage />} />
+                    <Route path="team-schedule" element={<TeamSchedulePage />} />
+                    <Route path="team-schedule/:sysId" element={<TeamSchedulePage />} />
 
-                    <Route path="user-scan" element={<SplUserScanPage />} />
+                    <Route path="user-scan" element={<UserScanPage />} />
 
-                    <Route path="usage-metrics" element={<SplUsageMetricsPage />} />
+                    <Route path="usage-metrics" element={<UsageMetricsPage />} />
 
                     <Route
                       path="customer-health"
-                      element={<SplCustomerHealthDashboardPage />}
+                      element={<CustomerHealthDashboardPage />}
                     />
                     <Route
                       path="customer-health/account/:accountId"
-                      element={<SplCustomerHealthDetailPage />}
+                      element={<CustomerHealthDetailPage />}
                     />
                   </Route>
                 </Route>

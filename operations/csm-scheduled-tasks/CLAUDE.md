@@ -168,6 +168,46 @@ query run) if empty. Shares `internal/entitycases.Client` and the row-rendering 
 (`internal/notify/templates/open_cases_report.html`) per this component's own "Per-task report
 emails" below.
 
+## Outage communication
+
+The SRE-facing pair of outage emails: one when an outage is declared, one
+when it is resolved. Task name **`outage_communication`**, default schedule
+`*/5 * * * *`. The Go port of ServiceNow's `Outage Communication` flow.
+
+*** NOT THE SAME AS `outage_internal_notification`. *** That task is the
+internal-STAKEHOLDER notice, a different ServiceNow flow with a different
+audience and a different idempotency mechanism. They share the outage table
+and nothing else. Two tasks, two sub-cron names, two `SUB_CRON_RECIPIENTS`
+entries.
+
+**Recipients are configuration, and that is an evidenced decision.**
+ServiceNow resolves a group literally named `SRE Team`, which on the dev
+instance is `SRE_Team@gmail.com` with three members — a gmail address
+standing in for an internal list. Of seventeen active groups matching /SRE/,
+only one other has any address at all and it is a personal one. So there is
+no real distribution list to derive from, and the port takes its audience
+from `SUB_CRON_RECIPIENTS["outage_communication"].to` instead.
+
+Unlike the report tasks, `to` here is the REAL audience of the email, not
+just the failure-alert list — the same arrangement `outage_internal_notification`
+uses. See "Alerting" for which tasks work which way.
+
+*** AN UNCONFIGURED DEPLOYMENT IS SAFE, AND THE ORDER MATTERS. *** With no
+`SUB_CRON_RECIPIENTS` entry the `to` list is empty and the handler returns
+BEFORE it sweeps. That is deliberate: the sweep writes a communication-log
+row per decision, and those rows are the port's idempotency guard, so
+sweeping with nowhere to deliver would mark outages as announced to nobody
+and they would never be announced again.
+
+**It is also inert until digiops-cs mirrors `outage.outage_communication`.**
+Without that column the repository degrades to "nothing to send" rather than
+failing the sweep — narrow on purpose, so only `undefined_column` is
+swallowed.
+
+**What it will not send.** ServiceNow's declaration branch requires
+`type=outage`, so a DEGRADATION or PLANNED outage produces no email at all.
+Reproduced deliberately; widening it is a product change, not a port.
+
 ## Alerting
 
 Two layers, combined:
@@ -277,6 +317,33 @@ component's own code (entity-service's `Attempt` response doesn't report whether
 superseded something) — that's a real gap if a "period X was abandoned" notice is wanted later; it
 would need a small addition to the `ClaimScheduledTaskRunResponse` contract, not just to this
 component.
+
+## `cmd/server` is the ONLY package main in this component
+
+> **Do not add a second directory under `cmd/`, and do not add `package main`
+> anywhere else in this module. It breaks the Choreo build.**
+
+Choreo builds this with the Google Go buildpack, which picks the package to
+build by running
+
+```
+go list -f '{{if eq .Name "main"}}{{.Dir}}{{end}}' ./...
+```
+
+With exactly one result it builds that. With two it cannot choose, falls back
+to the module root, finds no `.go` files there and fails the build with
+
+```
+no Go files in /workspace
+```
+
+The failure names neither of the offending directories, so it reads like a
+broken build path rather than an extra main package. It has happened twice:
+`cmd/availdiff`, then `cmd/mockdashboard`.
+
+A development tool that needs its own entry point belongs outside this
+module, or as a test helper, or behind `GOOGLE_BUILDABLE=./cmd/server` set on
+the Choreo build — but the default assumption here is one `cmd/` directory.
 
 ## Running locally
 

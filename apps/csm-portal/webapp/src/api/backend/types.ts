@@ -1708,14 +1708,18 @@ export interface BeUser {
 
 /**
  * `POST /users` request body. At least one of firstName/lastName is
- * required. `roles` is accepted by the backend but not currently sent by the
- * webapp — there is no Asgardeo-backed way to browse/assign roles at
- * account-creation time yet.
+ * required. `roles` is accepted by the backend and, beyond the allow-list
+ * check every role goes through, is also how `AddUserDialog.tsx` sets the
+ * new user's type: entity-service derives `user_type` from role membership
+ * (no plain settable column exists), so sending `["internal"]`/`["external"]`
+ * is what resolves it to INTERNAL/EXTERNAL — see that service's own
+ * `user_service.go` doc comment on `recompute_user_type`.
  */
 export interface BeCreateUserPayload {
   firstName?: string;
   lastName?: string;
   email: string;
+  roles?: string[];
 }
 
 export interface BeUserSearchFilters {
@@ -2399,36 +2403,13 @@ export interface BeCreateCaseGithubIssueResponse {
   };
 }
 
-/**
- * One entry of the config-driven "repository" catalogue offered by the
- * "Open Git issue" dialog's repo `Select` (cloud cases only — see
- * `CreateGithubIssueDialog`'s `showRepoField`). `value` is an opaque dropdown
- * key; `owner`/`repo` are the real GitHub org/repo an issue filed against
- * this option is created in, and are what populates
- * `BeCreateCaseGithubIssuePayload.repoOverride` — never derive owner/repo
- * from `value` itself. `githubLabel` is the real GitHub issue label that
- * should eventually be applied to an issue filed against this option
- * (distinct from `displayLabel`, which is only this dropdown's display
- * text) — not yet consumed anywhere on the frontend; the actual apply
- * step is a separate, larger follow-up outside this webapp.
- */
-export interface BeGithubIssueRepoOption {
-  value: string;
-  displayLabel: string;
+/** `GET /products/github-repo` — the repository an issue for this product is filed in. */
+export interface BeProductRepoMapping {
+  productName: string;
+  abbreviation?: string;
   owner: string;
-  repo: string;
+  repository: string;
   githubLabel: string;
-}
-
-/**
- * `GET /metadata` response: a single growable bag of reference/config data
- * the webapp fetches once, rather than a dedicated endpoint per field.
- * `githubIssueRepoOptions` is the first field — more are expected to be
- * added here over time as new frontend needs come up. Empty array when
- * unconfigured.
- */
-export interface BeMetadataResponse {
-  githubIssueRepoOptions: BeGithubIssueRepoOption[];
 }
 
 /**
@@ -2744,7 +2725,9 @@ export interface BeChangeRequestApprover {
   id: string;
   name?: string | null;
   status: string;
+  createdOn?: string | null;
   respondedOn?: string | null;
+  comments?: string | null;
 }
 
 /** One approval stage on a change request, with its individual approvers. */

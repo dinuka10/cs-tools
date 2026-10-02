@@ -41,7 +41,7 @@ declare global {
        * TEMPORARY / LOCAL DEV ONLY. Forces which of the two independent
        * views ("cs-abt" or "sales-sa") the app renders, bypassing the real
        * Asgardeo-groups detection usePortalView otherwise defers to (the
-       * same signal useSplAccess already uses to gate /spl/* routes) —
+       * same signal useAccess already uses to gate /spl/* routes) —
        * until real role separation lands (see the Asgardeo Role Catalogue
        * memory note). "cs-abt" shows CSM Portal's own left nav (Dashboard,
        * Support, Operations, ...); "sales-sa" shows only the Support

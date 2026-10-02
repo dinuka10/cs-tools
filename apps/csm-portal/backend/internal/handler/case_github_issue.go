@@ -19,14 +19,15 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/entity"
-	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/githubissue"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 )
 
@@ -37,10 +38,9 @@ const (
 	maxGitHubIssueTitleChars = 256
 	maxGitHubIssueBodyChars  = 65536
 
-	errMsgGitHubRepoRequired   = "A target repository is required."
-	errMsgGitHubRepoNotAllowed = "The selected repository is not available."
-	errMsgGitHubTitleInvalid   = "A title of up to 256 characters is required."
-	errMsgGitHubBodyTooLong    = "The issue description is too long."
+	errMsgGitHubRepoNotMapped = "No GitHub repository is mapped for this product."
+	errMsgGitHubTitleInvalid  = "A title of up to 256 characters is required."
+	errMsgGitHubBodyTooLong   = "The issue description is too long."
 
 	regressionLabel          = "regression"
 	originLabel              = "Origin/CS"
@@ -69,8 +69,8 @@ func (h *CaseHandler) WithEngineeringClient(c engineeringGitIssueClient) *CaseHa
 }
 
 // caseGitHubIssueRequest is the subset of the POST /cases/{id}/github-issues
-// body this path reads. The target repository is always repoOverride.
-// reason does not choose the repository; "migration" adds Affected/Migration.
+// body this path reads. The repository comes from the case product, not from
+// repoOverride. reason "migration" adds Affected/Migration.
 type caseGitHubIssueRequest struct {
 	Title        string `json:"title"`
 	Description  string `json:"description"`
@@ -97,19 +97,6 @@ type caseGitHubIssueResult struct {
 	URL    string `json:"url"`
 	Number int    `json:"number"`
 	Repo   string `json:"repo"`
-}
-
-// findGitHubRepoOption returns the configured catalogue entry for owner/repo.
-// GitHub names are case-insensitive, so the match is too. Only catalogue repos
-// may be targeted: without this, any caller with write access could have the
-// service account file issues in an arbitrary repository.
-func findGitHubRepoOption(owner, repo string) (githubissue.RepoOption, bool) {
-	for _, o := range githubissue.Active() {
-		if strings.EqualFold(o.Owner, owner) && strings.EqualFold(o.Repo, repo) {
-			return o, true
-		}
-	}
-	return githubissue.RepoOption{}, false
 }
 
 // buildGitHubIssueBody is the caller's description followed by the optional
@@ -139,7 +126,7 @@ func buildGitHubIssueBody(req caseGitHubIssueRequest) string {
 // label always go on. Patch adds Type/Patch and patch. Discussion adds the
 // priority label. The switches add Require/Hotfix, regression, and
 // Affected/Migration. An in-progress project adds Onboarding/affected.
-func buildGitHubIssueLabels(option githubissue.RepoOption, req caseGitHubIssueRequest) []string {
+func buildGitHubIssueLabels(productLabel string, req caseGitHubIssueRequest) []string {
 	var labels []string
 	seen := make(map[string]bool)
 	add := func(l string) {
@@ -157,7 +144,7 @@ func buildGitHubIssueLabels(option githubissue.RepoOption, req caseGitHubIssueRe
 	if !reservedIssueLabel(req.UpdateLevel) {
 		add(req.UpdateLevel)
 	}
-	add(option.GithubLabel)
+	add(productLabel)
 	issueType := strings.TrimSpace(req.IssueTypeLabel)
 	switch issueType {
 	case patchIssueTypeLabel:
@@ -206,12 +193,37 @@ func reservedIssueLabel(s string) bool {
 	}
 }
 
-// createGitHubIssueViaEngineering files the issue in the requested catalogue
-// repository through the engineering entity service. The case must exist and be
-// visible to the caller (the entity service enforces that on GetCase).
+// productNameFromCase prefers the catalogue product name, then the versioned
+// display name. The entity lookup treats a trailing version as a prefix match.
+func productNameFromCase(raw []byte) string {
+	var view struct {
+		DeployedProduct *struct {
+			DisplayName *string `json:"displayName"`
+			Product     *struct {
+				Name string `json:"name"`
+			} `json:"product"`
+		} `json:"deployedProduct"`
+	}
+	if err := json.Unmarshal(raw, &view); err != nil || view.DeployedProduct == nil {
+		return ""
+	}
+	if view.DeployedProduct.Product != nil {
+		if name := strings.TrimSpace(view.DeployedProduct.Product.Name); name != "" {
+			return name
+		}
+	}
+	if view.DeployedProduct.DisplayName != nil {
+		return strings.TrimSpace(*view.DeployedProduct.DisplayName)
+	}
+	return ""
+}
+
+// createGitHubIssueViaEngineering files the issue through the engineering
+// entity service. The repository and product label come from
+// product_repo_mapping, looked up by the case product. The browser's
+// repoOverride is ignored.
 //
 // When the engineering client is configured, every create uses this path.
-// The catalogue does not split some repositories back to the entity service.
 // After GitHub accepts the issue, a work note with the issue URL is written
 // on the case. That write is best-effort: a failure is logged and the create
 // response is still success, because the issue already exists. Case tags
@@ -229,34 +241,53 @@ func (h *CaseHandler) createGitHubIssueViaEngineering(w http.ResponseWriter, r *
 		writeError(w, http.StatusBadRequest, errMsgGitHubTitleInvalid)
 		return
 	}
-	if req.RepoOverride == nil || strings.TrimSpace(req.RepoOverride.Owner) == "" || strings.TrimSpace(req.RepoOverride.Repo) == "" {
-		writeError(w, http.StatusBadRequest, errMsgGitHubRepoRequired)
-		return
-	}
-	option, ok := findGitHubRepoOption(strings.TrimSpace(req.RepoOverride.Owner), strings.TrimSpace(req.RepoOverride.Repo))
-	if !ok {
-		writeError(w, http.StatusBadRequest, errMsgGitHubRepoNotAllowed)
-		return
-	}
 	issueBody := buildGitHubIssueBody(req)
 	if utf8.RuneCountInString(issueBody) > maxGitHubIssueBodyChars {
 		writeError(w, http.StatusBadRequest, errMsgGitHubBodyTooLong)
 		return
 	}
 
-	if _, err := h.entity.GetCase(r.Context(), caseID); err != nil {
+	caseRaw, err := h.entity.GetCase(r.Context(), caseID)
+	if err != nil {
 		slog.ErrorContext(r.Context(), "entity GetCase failed before creating a GitHub issue", "userID", user.UserID, "caseID", caseID, "err", err)
 		mapUpstreamErrorGeneric(w, err, "Failed to create GitHub issue.")
 		return
 	}
+	productName := productNameFromCase(caseRaw)
+	if productName == "" {
+		writeError(w, http.StatusBadRequest, errMsgGitHubRepoNotMapped)
+		return
+	}
+	mappingRaw, err := h.entity.GetProductRepoMapping(r.Context(), productName)
+	if err != nil {
+		var upstream *apierror.Error
+		if errors.As(err, &upstream) && upstream.StatusCode == http.StatusNotFound {
+			writeError(w, http.StatusBadRequest, errMsgGitHubRepoNotMapped)
+			return
+		}
+		slog.ErrorContext(r.Context(), "entity GetProductRepoMapping failed", "userID", user.UserID, "caseID", caseID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to create GitHub issue.")
+		return
+	}
+	var mapping struct {
+		Owner       string `json:"owner"`
+		Repository  string `json:"repository"`
+		GithubLabel string `json:"githubLabel"`
+	}
+	if err := json.Unmarshal(mappingRaw, &mapping); err != nil || strings.TrimSpace(mapping.Owner) == "" || strings.TrimSpace(mapping.Repository) == "" {
+		writeError(w, http.StatusBadRequest, errMsgGitHubRepoNotMapped)
+		return
+	}
+	owner := strings.TrimSpace(mapping.Owner)
+	repo := strings.TrimSpace(mapping.Repository)
 
-	// The catalogue's owner is the GitHub organisation, so it is passed as both
+	// The mapping's owner is the GitHub organisation, so it is passed as both
 	// the organisation and the owner the engineering service asks for. The
 	// service picks its GitHub access token by that organisation name, so it
 	// must be one it is configured with.
-	issue, err := h.engineering.CreateGitIssue(r.Context(), option.Owner, option.Owner, option.Repo, title, issueBody, buildGitHubIssueLabels(option, req))
+	issue, err := h.engineering.CreateGitIssue(r.Context(), owner, owner, repo, title, issueBody, buildGitHubIssueLabels(mapping.GithubLabel, req))
 	if err != nil {
-		slog.ErrorContext(r.Context(), "engineering CreateGitIssue failed", "userID", user.UserID, "caseID", caseID, "repo", option.Owner+"/"+option.Repo, "err", err)
+		slog.ErrorContext(r.Context(), "engineering CreateGitIssue failed", "userID", user.UserID, "caseID", caseID, "repo", owner+"/"+repo, "err", err)
 		mapUpstreamErrorGeneric(w, err, "Failed to create GitHub issue.")
 		return
 	}
@@ -264,15 +295,15 @@ func (h *CaseHandler) createGitHubIssueViaEngineering(w http.ResponseWriter, r *
 	// The engineering service returns the issue's id, number, state, title, body
 	// and labels but no URL, and files issues on github.com, so the URL is built
 	// from the repo and number.
-	slog.InfoContext(r.Context(), "GitHub issue created from case", "userID", user.UserID, "caseID", caseID, "repo", option.Owner+"/"+option.Repo, "number", issue.Number)
-	issueURL := fmt.Sprintf("https://github.com/%s/%s/issues/%d", option.Owner, option.Repo, issue.Number)
+	slog.InfoContext(r.Context(), "GitHub issue created from case", "userID", user.UserID, "caseID", caseID, "repo", owner+"/"+repo, "number", issue.Number)
+	issueURL := fmt.Sprintf("https://github.com/%s/%s/issues/%d", owner, repo, issue.Number)
 	h.recordGitHubIssueWorkNote(r.Context(), user, caseID, issueURL)
 	writeJSONValue(w, http.StatusCreated, caseGitHubIssueResponse{
 		Message: "GitHub issue created.",
 		Issue: caseGitHubIssueResult{
 			URL:    issueURL,
 			Number: issue.Number,
-			Repo:   option.Owner + "/" + option.Repo,
+			Repo:   owner + "/" + repo,
 		},
 	})
 }

@@ -1858,15 +1858,76 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorPayload'
 
+  /teams/{id}/members:
+    get:
+      summary: Get a team's member roster.
+      description: >
+        Backed by entity-service — the team's CRE/SRE membership, not the internal
+        WSO2-staff team registry POST /teams/search covers. id is a UUID (the team
+        registry's own creGroupId/sreGroupId, e.g. an account's creTeam.id) rather
+        than the registry's stable team key.
+      operationId: getTeamsIdMembers
+      parameters:
+        - name: id
+          in: path
+          description: UUID of the team (backing CRE/SRE group).
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The team's members.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TeamMember'
+        "400":
+          description: Bad request (e.g. malformed UUID).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Team not found, or has no members.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
   /users:
     post:
       summary: Create a new user.
       description: >
         Inserts a new platform user. Admin-only — every other portal role gets
-        403. Postgres data source only. roles is optional and currently unused
-        by the CSM portal frontend (no UI to pick a role yet); each name, if
+        403. Postgres data source only. roles is optional; each name, if
         supplied, is checked against the same configured role allow-list
-        POST /roles/search serves.
+        POST /roles/search serves. The CSM portal's Add User form sends exactly
+        one of "internal"/"external" here to set the new user's type — entity-
+        service derives user_type from role membership, so this is the only way
+        to set it. Granting "internal" or "admin" for an email that is not
+        @wso2.com is rejected with 400: an internal-type user must have a
+        wso2.com address.
       operationId: postUsers
       requestBody:
         required: true
@@ -1882,7 +1943,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/User'
         "400":
-          description: Bad request — missing/invalid email, neither firstName nor lastName supplied, or an unrecognized role.
+          description: >-
+            Bad request — missing/invalid email, neither firstName nor lastName
+            supplied, an unrecognized role, roles requests an
+            internal-resolving role (admin/internal) for a non-@wso2.com email,
+            or roles requests an external-resolving role
+            (external/partner/customer/partner_admin/customer_admin) — creating
+            an external-type user is temporarily disabled regardless of email.
           content:
             application/json:
               schema:
@@ -1913,6 +1980,61 @@ paths:
                 $ref: '#/components/schemas/ErrorPayload'
         "500":
           description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /users/time-card-approvers:
+    get:
+      summary: List the real Asgardeo membership of the time-card-approver role.
+      description: >
+        Returns 404 unless ASGARDEO_ROLE_IDS contains a timecard_approver|<role-id>
+        mapping. Fetches the configured Asgardeo role (via the SCIM operations
+        service's GET /organizations/internal/roles/{id}, which proxies Asgardeo's
+        Roles Management API v2) and returns its member users. This is the
+        authoritative list of who may approve a time card — entity-service's own
+        Postgres role/user_role tables (what POST /users/search's roleIds filter
+        reads) are a separate, syncable mirror that can drift from the real Asgardeo
+        role assignment.
+      operationId: getUsersTimeCardApprovers
+      responses:
+        "200":
+          description: The role's current member users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeCardApproversResponse'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not Found — no timecard_approver entry is configured in ASGARDEO_ROLE_IDS.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "502":
+          description: >-
+            Bad Gateway — the SCIM operations service rejected this backend's own
+            request (e.g. its OAuth2 app lacks a roles-read scope). Reported as 502
+            rather than 401/403 so it is never mistaken for the caller's own
+            permissions being denied.
           content:
             application/json:
               schema:
@@ -4428,6 +4550,59 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorPayload'
 
+  /products/github-repo:
+    get:
+      summary: Look up the GitHub repository for a product.
+      description: |
+        Resolves a case product name to the repository an internal GitHub issue
+        is filed in. An exact product name wins, then an abbreviation, then the
+        longest product name that is a prefix of `name` followed by a space.
+      operationId: getProductGithubRepo
+      parameters:
+        - name: name
+          in: query
+          required: true
+          description: Catalogue product name, abbreviation, or versioned display name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The repository mapped to the product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductRepoMapping'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: No GitHub repository is mapped for this product.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
   /products/{id}/versions/search:
     post:
       summary: Search versions for a specific product.
@@ -4739,9 +4914,10 @@ paths:
       description: |
         By default the request is forwarded to the entity service (ServiceNow data source only).
         When the backend is configured with an engineering entity service, the issue is filed
-        through it instead: `repoOverride` is then required and must be one of the configured
-        repository options (otherwise `400`), `reason` is ignored, and the case's work notes are
-        not updated.
+        through it. The repository and product label are resolved from the case product via
+        product_repo_mapping (`GET /products/github-repo`). A product with no mapping returns
+        `400`. `repoOverride` is ignored. `reason` "migration" adds the Affected/Migration label,
+        and a work note with the issue URL is written on the case.
       operationId: createCaseGithubIssue
       security:
         - bearerAuth: []
@@ -4798,60 +4974,6 @@ paths:
                 $ref: '#/components/schemas/ErrorPayload'
         "500":
           description: Internal server error.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-
-  /metadata:
-    get:
-      summary: Get the portal's config-driven metadata bag.
-      description: >
-        Returns a single growable bag of reference/config data the webapp
-        fetches once, rather than a dedicated endpoint per field.
-        `githubIssueRepoOptions` is the first field: for each option, its
-        dropdown value/display label plus the actual GitHub owner/repo an issue filed
-        against it is created in, resolved once at process startup from
-        GITHUB_ISSUE_REPO_OPTIONS and held in memory; not user-configurable at
-        runtime. A deployment with that unset returns an empty array, not an
-        error. Independent of the `reason`-based repo selection on
-        POST /cases/{id}/github-issues above — this backs a different,
-        user-facing repo picker. More fields are expected to be added here
-        over time.
-      operationId: getMetadata
-      responses:
-        "200":
-          description: Ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/MetadataResponse'
-        "400":
-          description: BadRequest
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "401":
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "403":
-          description: Forbidden
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "404":
-          description: NotFound
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorPayload'
-        "500":
-          description: InternalServerError
           content:
             application/json:
               schema:
@@ -7954,7 +8076,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -7990,7 +8112,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8044,7 +8166,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8080,7 +8202,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8122,7 +8244,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8166,7 +8288,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8221,7 +8343,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8277,7 +8399,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8338,7 +8460,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8406,7 +8528,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8468,7 +8590,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8518,7 +8640,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8574,7 +8696,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8630,7 +8752,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8678,7 +8800,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8728,7 +8850,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8783,7 +8905,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8797,7 +8919,7 @@ paths:
   /plg/products/{product}/playbooks:
     post:
       summary: Author a playbook template.
-      description: "`playbookType` and `lifecycleStage` are both required and neither is defaulted: the most common answer is exactly what makes a default dangerous, since forgetting to choose would publish a plausible playbook at the wrong stage. The two reserved bookend tasks are added automatically."
+      description: "`playbookType` and `lifecycleStage` are both required and neither is defaulted: the most common answer is exactly what makes a default dangerous, since forgetting to choose would publish a plausible playbook at the wrong stage. The two reserved bookend tasks are added automatically. Admin only: authoring a playbook template is `PermManagePlaybooks`, held by the admin role alone. A CS engineer may read templates and assign them to a pairing, but not create, change or delete one."
       operationId: plgCreatePlaybook
       parameters:
         - name: product
@@ -8832,7 +8954,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — authoring a playbook template is admin only; a CS engineer may read and assign templates but not change one. Also returned when the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8882,7 +9004,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8901,7 +9023,7 @@ paths:
                 $ref: "#/components/schemas/ErrorPayload"
     patch:
       summary: Rename, restage, retype or deactivate a template.
-      description: Deactivating withdraws the template from every pairing that has not already attached it; runs already under way are unaffected.
+      description: "Deactivating withdraws the template from every pairing that has not already attached it; runs already under way are unaffected. Admin only: authoring a playbook template is `PermManagePlaybooks`, held by the admin role alone. A CS engineer may read templates and assign them to a pairing, but not create, change or delete one."
       operationId: plgPatchPlaybook
       parameters:
         - name: playbookId
@@ -8937,7 +9059,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — authoring a playbook template is admin only; a CS engineer may read and assign templates but not change one. Also returned when the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -8956,7 +9078,7 @@ paths:
                 $ref: "#/components/schemas/ErrorPayload"
     delete:
       summary: Delete a playbook template.
-      description: Refused while any pairing has a run attached to it — deactivate it instead.
+      description: "Refused while any pairing has a run attached to it — deactivate it instead. Admin only: authoring a playbook template is `PermManagePlaybooks`, held by the admin role alone. A CS engineer may read templates and assign them to a pairing, but not create, change or delete one."
       operationId: plgDeletePlaybook
       parameters:
         - name: playbookId
@@ -8982,7 +9104,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — authoring a playbook template is admin only; a CS engineer may read and assign templates but not change one. Also returned when the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -9008,7 +9130,7 @@ paths:
   /plg/playbooks/{playbookId}/tasks:
     put:
       summary: "Replace a template's task list."
-      description: "A whole-list replace rather than per-task edits, so the order the author sees is the order stored. The two reserved bookend tasks cannot be removed or retyped. `CHECKLIST` and `SINGLE_SELECT` tasks must carry `options`; no other type may."
+      description: "A whole-list replace rather than per-task edits, so the order the author sees is the order stored. The two reserved bookend tasks cannot be removed or retyped. `CHECKLIST` and `SINGLE_SELECT` tasks must carry `options`; no other type may. Admin only: authoring a playbook template is `PermManagePlaybooks`, held by the admin role alone. A CS engineer may read templates and assign them to a pairing, but not create, change or delete one."
       operationId: plgReplacePlaybookTasks
       parameters:
         - name: playbookId
@@ -9044,7 +9166,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — authoring a playbook template is admin only; a CS engineer may read and assign templates but not change one. Also returned when the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -9101,7 +9223,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -9175,7 +9297,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
         "403":
-          description: Forbidden — the caller is authenticated but is not PLG CS staff.
+          description: "Forbidden — the caller's token carries no role granting PLG access, or the caller is not an active internal PLG CS user."
           content:
             application/json:
               schema:
@@ -9186,6 +9308,3147 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorPayload"
+
+  # ---------------------------------------------------------------------
+  # SupportPortalLite — ported from digiops-cs's apps/support-portal-lite
+  # Ballerina backend (being retired), serving the Sales/Solutions-Architecture
+  # audience. None of the routes below carry a /spl/ prefix: SPL and this
+  # API are the same backend now, and none of these routes collide with
+  # anything this API's own, differently-shaped case-management domain owns.
+  # Account/project/case list-search-detail (which used to collide, and so
+  # used to live here under /spl/accounts, /spl/projects, /spl/cases) are
+  # gone entirely -- consolidated onto the shared /accounts, /projects, and
+  # /cases search/detail routes above. Off by default (SPL_ENABLED); see
+  # cmd/server/main.go. Path parameters here are ServiceNow sys_ids or
+  # case/account/project numbers, not UUIDs.
+  # ---------------------------------------------------------------------
+
+  /accounts/{accountId}/escalations:
+    get:
+      summary: List an account's escalations.
+      operationId: getAccountEscalations
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EscalationDetail'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /accounts/{accountId}/cases/{caseId}/escalate:
+    post:
+      summary: Escalate a case on this account.
+      operationId: escalateCase
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: caseId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EscalationRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EscalationResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_ADD_ESCALATION_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "409":
+          description: Conflict — the case has already been escalated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /cases/{caseId}/attachments-info:
+    get:
+      summary: List metadata for a case's attachments.
+      operationId: getAttachmentsInfo
+      parameters:
+        - name: caseId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: offset
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 0
+        - name: limit
+          in: query
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AttachmentInfo'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /products:
+    get:
+      summary: List the distinct product names known to ServiceNow deployments.
+      operationId: getProducts
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /abt-teams:
+    get:
+      summary: List the distinct ABT team names.
+      operationId: getABTTeams
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /generate-sla-report:
+    get:
+      summary: Generate a project's SLA report for a date range.
+      operationId: generateSLAReport
+      parameters:
+        - name: projectSysId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLAReportDetails'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /report-details:
+    get:
+      summary: Generate a project's detailed CS report for a date range.
+      operationId: getReportDetails
+      parameters:
+        - name: projectSysId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CSReportDetails'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /generate-timelogs-breakdown-report:
+    get:
+      summary: Generate a project's time-log breakdown report.
+      operationId: generateTimelogsBreakdownReport
+      parameters:
+        - name: projectId
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TimeLogBreakdownDetails'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /attachments/{attachmentId}/download:
+    get:
+      summary: Download the binary content of a case attachment (ServiceNow-backed).
+      operationId: downloadAttachment
+      parameters:
+        - name: attachmentId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: >-
+            Raw file content. Content-Type is restricted to a safe allowlist
+            (anything outside it is served as application/octet-stream);
+            Content-Disposition is always attachment. X-Content-Type-Options:
+            nosniff is set on every response by this API's SecurityHeaders
+            middleware.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_DOWNLOAD_ATTACHMENT_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /abt-team-schedule:
+    get:
+      summary: Get an ABT team's schedule.
+      operationId: getABTTeamSchedule
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: duration
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: teamId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: eventType
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ABTTeamScheduleData'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  # SupportPortalLite usage-metrics (/usage-metrics/*) — every endpoint
+  # here forwards the request/response body close to verbatim to ServiceNow's
+  # custom scoped-app API (raw passthrough, not reshaped by this backend), so
+  # request/response schemas are intentionally left open (additionalProperties:
+  # true) rather than fully typed against an upstream contract this backend
+  # does not own or reshape. Every endpoint additionally requires
+  # PermUsageMetricsViewer on top of the blanket PermSPLAccess gate.
+
+  /usage-metrics/projects:
+    get:
+      summary: List projects for the usage-metrics dashboard, optionally filtered by name.
+      operationId: usageMetricsGetProjects
+      parameters:
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/instances/metrics/search:
+    post:
+      summary: Search instance-level product metrics (raw passthrough to ServiceNow's custom API).
+      operationId: searchInstanceMetrics
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/instances/metrics/stats:
+    post:
+      summary: Get aggregated instance metrics stats (raw passthrough to ServiceNow's custom API).
+      operationId: getInstanceMetricsStats
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/instances/usages/search:
+    post:
+      summary: Search instance-level usage records (raw passthrough to ServiceNow's custom API).
+      operationId: searchInstanceUsages
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/instances/usages/stats:
+    post:
+      summary: Get aggregated instance usage stats (raw passthrough to ServiceNow's custom API).
+      operationId: getInstanceUsagesStats
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/deployments/search:
+    post:
+      summary: Search deployments (raw passthrough to ServiceNow's custom API).
+      operationId: searchUsageMetricsDeployments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/projects/search:
+    post:
+      summary: Search projects for the usage-metrics dashboard (raw passthrough to ServiceNow's custom API).
+      operationId: searchUsageMetricsProjects
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/deployed-products/search:
+    post:
+      summary: Search deployed products (raw passthrough to ServiceNow's custom API).
+      operationId: searchUsageMetricsDeployedProducts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/instances/search:
+    post:
+      summary: Search instances (raw passthrough to ServiceNow's custom API).
+      operationId: searchUsageMetricsInstances
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/deployed-products/{id}/metrics/search:
+    post:
+      summary: Get metrics for a deployed product over a date range (raw passthrough to ServiceNow's custom API).
+      operationId: getDeployedProductMetrics
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        description: Must include startDate and endDate (validated before forwarding).
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [startDate, endDate]
+              properties:
+                startDate:
+                  type: string
+                endDate:
+                  type: string
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest — missing/invalid body, or an invalid date range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /usage-metrics/deployed-products/{id}/metrics/usage-counts/search:
+    post:
+      summary: Get usage counts for a deployed product over a date range (raw passthrough to ServiceNow's custom API).
+      operationId: getDeployedProductUsageCounts
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        description: Must include startDate and endDate (validated before forwarding).
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [startDate, endDate]
+              properties:
+                startDate:
+                  type: string
+                endDate:
+                  type: string
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: BadRequest — missing/invalid body, or an invalid date range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden — caller lacks SPL_USAGE_METRICS_GROUPS membership.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /files:
+    get:
+      summary: List files in a Google Drive folder.
+      operationId: listFiles
+      parameters:
+        - name: folderId
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DriveFile'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /files/search:
+    get:
+      summary: Find a Google Drive folder by name.
+      operationId: searchFolder
+      parameters:
+        - name: folderName
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DriveFolder'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/summary:
+    post:
+      summary: Search account health summaries (ServiceNow account data enriched with MySQL-tracked review status).
+      operationId: getCustomerHealthSummary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerHealthSummaryRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountSummaryResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/accounts/{accountSysId}/init-health-tracking:
+    post:
+      summary: Initialize MySQL health-tracking rows for an account's projects.
+      operationId: initHealthTracking
+      parameters:
+        - name: accountSysId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InitHealthTrackingRequest'
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/accounts/{accountId}:
+    get:
+      summary: Get an account's detailed health breakdown (ServiceNow-backed; no MySQL involved).
+      operationId: getCustomerHealthAccountDetail
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ViewerAccountDetail'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/projects/{projectSysId}/risk:
+    post:
+      summary: Open a new risk on a project.
+      operationId: openRisk
+      parameters:
+        - name: projectSysId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OpenRiskRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectRisk'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/risks/{riskId}/close:
+    put:
+      summary: Close an open risk.
+      operationId: closeRisk
+      parameters:
+        - name: riskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CloseRiskRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectRisk'
+        "400":
+          description: BadRequest — e.g. no matching open risk for this riskId.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/projects/{projectSysId}/mark-healthy:
+    post:
+      summary: Mark a project healthy.
+      operationId: markHealthy
+      parameters:
+        - name: projectSysId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MarkHealthyRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatusRecord'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/projects/{projectSysId}/revert-review:
+    post:
+      summary: Revert a project's health review.
+      operationId: revertReview
+      parameters:
+        - name: projectSysId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevertHealthRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatusRecord'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/accounts/{accountSysId}/health-status:
+    get:
+      summary: List health status per project for an account.
+      operationId: getAccountHealthStatus
+      parameters:
+        - name: accountSysId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProjectHealthStatus'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/accounts/{accountSysId}/health-summary:
+    get:
+      summary: Get an account's overall health summary.
+      operationId: getAccountHealthSummary
+      parameters:
+        - name: accountSysId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthSummary'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/projects/{projectSysId}/risk-history:
+    get:
+      summary: List a project's risk history.
+      operationId: getProjectRiskHistory
+      parameters:
+        - name: projectSysId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProjectRisk'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/risks/{riskId}/action-items:
+    post:
+      summary: Create an action item on a risk.
+      operationId: createActionItem
+      parameters:
+        - name: riskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateActionItemRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskActionItem'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+    get:
+      summary: List action items on a risk, optionally filtered by status.
+      operationId: getActionItemsByRisk
+      parameters:
+        - name: riskId
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RiskActionItem'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/action-items/{actionItemId}/status:
+    put:
+      summary: Update an action item's status.
+      operationId: updateActionItemStatus
+      parameters:
+        - name: actionItemId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateActionItemStatusRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskActionItem'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/action-items/{actionItemId}:
+    put:
+      summary: Update an action item's fields.
+      operationId: updateActionItem
+      parameters:
+        - name: actionItemId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateActionItemRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiskActionItem'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/accounts/{accountSysId}/action-items:
+    get:
+      summary: List action items for an account, optionally filtered by project and/or status.
+      operationId: getActionItemsByAccount
+      parameters:
+        - name: accountSysId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: projectSysId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RiskActionItem'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /customer-health/action-items/{actionItemId}/comments:
+    post:
+      summary: Post a comment on an action item.
+      operationId: createActionItemComment
+      parameters:
+        - name: actionItemId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommentRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionItemComment'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+    get:
+      summary: List comments on an action item.
+      operationId: getActionItemComments
+      parameters:
+        - name: actionItemId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ActionItemComment'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /user-info:
+    get:
+      summary: Get the caller's own employee info, resolved from their JWT email.
+      operationId: getUserInfo
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserInfoView'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: InternalServerError
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /scan-user:
+    post:
+      summary: >-
+        Diagnostic tool cross-referencing the sales-side (Salesforce) and
+        CS-side (ServiceNow) entity services for a given email/subscription
+        key, surfacing why a user might not have portal access.
+      operationId: scanUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserScanRequest'
+      responses:
+        "200":
+          description: Ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ScanResponse'
+        "400":
+          description: BadRequest
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: NotFound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "413":
+          description: RequestEntityTooLarge
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: >-
+            InternalServerError — also returned (with a lookup-specific
+            message in the same {"message": "..."} shape as ErrorPayload)
+            when the sales-side or CS-side entity service lookup itself
+            fails, distinct from an ordinary internal error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /projects/{id}/metadata:
+    get:
+      summary: Get a project's reference/feature metadata.
+      operationId: getProjectsIdMetadata
+      description: >
+        Reference data (choice lists, feature flags such as service-request eligibility) for building the project's UI. The entity service's response is returned verbatim.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: ID of the project
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /tasks/search:
+    post:
+      summary: Search tasks across all cases.
+      operationId: searchTasks
+      description: >
+        Standalone task search. The body is forwarded to the integration service as-is; an empty body is allowed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /cases/{id}/attachments/upload-token:
+    post:
+      summary: Start a direct-to-storage attachment upload.
+      operationId: mintAttachmentUploadToken
+      description: >
+        Only available when object-storage attachments are enabled for the deployment; when disabled the path is not registered and returns 404. Creates the attachment row in pending status and returns the upload credential.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Case UUID
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /attachments/{id}/share:
+    post:
+      summary: Create a short-lived download link for an attachment.
+      operationId: createAttachmentShare
+      description: >
+        Only available when object-storage attachments are enabled; otherwise 404. Returns a public, short-lived download URL for the stored file.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Attachment UUID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /cases/{caseId}/attachments/{attachmentId}/confirm:
+    post:
+      summary: Confirm a completed direct-to-storage upload.
+      operationId: confirmAttachmentUpload
+      description: >
+        Only available when object-storage attachments are enabled; otherwise 404. Moves the attachment from pending to complete once the browser upload has finished.
+      parameters:
+        - name: caseId
+          in: path
+          required: true
+          description: Case UUID
+          schema:
+            type: string
+            format: uuid
+        - name: attachmentId
+          in: path
+          required: true
+          description: Attachment UUID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/catalogue:
+    get:
+      summary: List schedule teams, roles and slots.
+      operationId: getTeamScheduleCatalogue
+      description: >
+        Response is the entity service's payload, forwarded unchanged.
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/my-lead-teams:
+    get:
+      summary: Teams the caller leads (may edit the rota of).
+      operationId: getTeamScheduleMyLeadTeams
+      description: >
+        Response is the entity service's payload, forwarded unchanged. Whether the caller may edit a team's rota is decided by the entity service.
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/assignments/search:
+    post:
+      summary: Search rota assignments.
+      operationId: searchTeamScheduleAssignments
+      description: >
+        Body forwarded unchanged to the entity service.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/absences/search:
+    post:
+      summary: Search absences.
+      operationId: searchTeamScheduleAbsences
+      description: >
+        Body forwarded unchanged to the entity service.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/on-duty:
+    get:
+      summary: Who is on duty at an instant.
+      operationId: getTeamScheduleOnDuty
+      description: >
+        Defaults to now when `at` is omitted.
+      parameters:
+        - name: at
+          in: query
+          required: false
+          description: RFC 3339 instant. Validated by the entity service.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/activity:
+    get:
+      summary: Rota change history for a team and range.
+      operationId: getTeamScheduleActivity
+      parameters:
+        - name: teamKey
+          in: query
+          required: false
+          description: Team key
+          schema:
+            type: string
+        - name: from
+          in: query
+          required: false
+          description: Range start
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Range end
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/edit-markers:
+    get:
+      summary: Who changed the rota within a range.
+      operationId: getTeamScheduleEditMarkers
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: Range start
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: false
+          description: Range end
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/assignments:
+    post:
+      summary: Create a rota assignment.
+      operationId: createTeamScheduleAssignment
+      description: >
+        Caller must lead the team the slot belongs to (enforced by the entity service).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/assignments/apply:
+    post:
+      summary: Apply a rota range change.
+      operationId: applyTeamScheduleAssignments
+      description: >
+        Body forwarded unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/assignments/{id}:
+    patch:
+      summary: Change a rota assignment.
+      operationId: updateTeamScheduleAssignment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Assignment ID
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+    delete:
+      summary: Remove a rota assignment.
+      operationId: deleteTeamScheduleAssignment
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Assignment ID
+          schema:
+            type: string
+        - name: note
+          in: query
+          required: false
+          description: Optional reason recorded with the removal.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Removed.
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/absences/apply:
+    post:
+      summary: Apply an absence change.
+      operationId: applyTeamScheduleAbsences
+      description: >
+        Body forwarded unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: Ok.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/absences/{id}:
+    delete:
+      summary: Remove a whole span of leave or allocation.
+      operationId: deleteTeamScheduleAbsence
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Absence ID
+          schema:
+            type: string
+        - name: note
+          in: query
+          required: false
+          description: Optional reason recorded with the removal.
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Removed.
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/absence-kinds:
+    post:
+      summary: Add a leave or allocation tag to the catalogue.
+      operationId: createTeamScheduleAbsenceKind
+      description: >
+        Body forwarded unchanged.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+
+  /team-schedule/absence-kinds/{code}:
+    delete:
+      summary: Delete a leave or allocation tag once nothing uses it.
+      operationId: deleteTeamScheduleAbsenceKind
+      parameters:
+        - name: code
+          in: path
+          required: true
+          description: Absence kind code
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Deleted.
+        "400":
+          description: Bad request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "401":
+          description: Unauthorized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "403":
+          description: Forbidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "404":
+          description: Not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorPayload'
 
 components:
   securitySchemes:
@@ -10678,51 +13941,6 @@ components:
             no-op — this backend only forwards it, exactly like
             inlineDrilldown.
 
-    MetadataResponse:
-      type: object
-      required:
-        - githubIssueRepoOptions
-      properties:
-        githubIssueRepoOptions:
-          type: array
-          description: >
-            The "Open Git issue" dialog's repository dropdown options, from
-            GITHUB_ISSUE_REPO_OPTIONS. Empty when that variable is unset — not
-            an error.
-          items:
-            $ref: '#/components/schemas/GithubIssueRepoOption'
-
-    GithubIssueRepoOption:
-      type: object
-      required:
-        - value
-        - displayLabel
-        - owner
-        - repo
-        - githubLabel
-      properties:
-        value:
-          type: string
-          description: >
-            Opaque dropdown selection key. Not itself a repo name — owner/repo
-            below carry the actual destination.
-        displayLabel:
-          type: string
-          description: Human-readable option text shown in the dropdown.
-        owner:
-          type: string
-          description: GitHub organization/owner an issue filed against this option is created in.
-        repo:
-          type: string
-          description: GitHub repository name an issue filed against this option is created in.
-        githubLabel:
-          type: string
-          description: >
-            The real GitHub issue label that should eventually be applied to
-            an issue filed against this option — distinct from displayLabel,
-            which is dropdown text only. Stored and served here only; not yet
-            applied anywhere.
-
     DashboardListItem:
       type: object
       properties:
@@ -11681,6 +14899,17 @@ components:
         limit:
           type: integer
 
+    TeamMember:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        role:
+          type: string
+
     UserGroupRef:
       type: object
       required: [id, name]
@@ -11959,6 +15188,25 @@ components:
           type: string
           format: date-time
 
+    TimeCardApproversResponse:
+      type: object
+      required: [approvers]
+      properties:
+        approvers:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeCardApproverRef'
+
+    TimeCardApproverRef:
+      type: object
+      required: [id, email]
+      properties:
+        id:
+          type: string
+          description: The user's Asgardeo UUID.
+        email:
+          type: string
+
     CreateUserPayload:
       type: object
       required: [email]
@@ -11976,7 +15224,13 @@ components:
             type: string
           description: >-
             Role names to grant. Optional; omit or leave empty to create the
-            user with no roles. Not currently exposed in the CSM portal UI.
+            user with no roles. The Add User form's "User type" selector sends
+            "internal" here (see entity-service's own recompute_user_type
+            trigger) — "internal"/"admin" is rejected for a non-@wso2.com
+            email. "external" (and the other EXTERNAL-resolving roles:
+            partner/customer/partner_admin/customer_admin) is rejected
+            unconditionally — creating an external-type user is temporarily
+            disabled, and the form's "External" option is disabled to match.
       description: At least one of firstName/lastName is required.
 
     AccountSearchPayload:
@@ -12929,6 +16183,20 @@ components:
           type: integer
         hasMore:
           type: boolean
+
+    ProductRepoMapping:
+      type: object
+      properties:
+        productName:
+          type: string
+        abbreviation:
+          type: string
+        owner:
+          type: string
+        repository:
+          type: string
+        githubLabel:
+          type: string
 
     Product:
       description: >
@@ -14250,6 +17518,8 @@ components:
 
     ChangeRequestApprover:
       type: object
+      required:
+        - createdOn
       properties:
         id:
           type: string
@@ -14262,9 +17532,21 @@ components:
             Approver-level status as reported by the backing data source
             (e.g. "APPROVED", "NOT_REQUIRED", "REQUESTED"); open string set,
             not a fixed enum.
+        createdOn:
+          type: string
+          nullable: true
+          description: >-
+            When this approval was requested. Null on the ServiceNow-backed data
+            source, which has no equivalent field.
         respondedOn:
           type: string
           nullable: true
+        comments:
+          type: string
+          nullable: true
+          description: >-
+            The approver's own comment on their decision, if any. Null on the
+            ServiceNow-backed data source, same reason as createdOn above.
 
     ChangeRequestApproval:
       type: object
@@ -18158,3 +21440,1082 @@ components:
               label:
                 type: string
           description: Required by the two list types and refused by the rest.
+    AccountDetails:
+      type: object
+      properties:
+        number:
+          type: string
+        name:
+          type: string
+        region:
+          type: string
+        country:
+          type: string
+        city:
+          type: string
+        arr:
+          type: string
+        accountManager:
+          type: string
+        technicalOwner:
+          type: string
+        customerSuccessManager:
+          type: string
+        rating:
+          type: string
+        integrationCSTeamName:
+          type: string
+        integrationCSTeamEmail:
+          type: string
+        integrationCSTeamManagerName:
+          type: string
+        integrationCSTeamManagerEmail:
+          type: string
+        integrationCSTeamSysId:
+          type: string
+        integrationCSTeamScheduleUrl:
+          type: string
+        driveLocation:
+          type: string
+
+    ViewerProjectDetails:
+      type: object
+      properties:
+        number:
+          type: string
+        sysId:
+          type: string
+        name:
+          type: string
+        key:
+          type: string
+        startDate:
+          type: string
+        endDate:
+          type: string
+        remainingQueryHours:
+          type: string
+        closureState:
+          type: string
+        projectType:
+          type: string
+        accountNumber:
+          type: string
+        accountName:
+          type: string
+        totalQueryHours:
+          type: string
+
+    Contact:
+      type: object
+      properties:
+        contactName:
+          type: string
+        email:
+          type: string
+        state:
+          type: string
+
+    EscalationDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        severity:
+          type: string
+        state:
+          type: string
+        escalatedOn:
+          type: string
+
+    EscalationRequest:
+      type: object
+      required: [justification, requestSource, reason, severity]
+      properties:
+        justification:
+          type: string
+        requestSource:
+          type: string
+          enum: [Customer, Internal]
+        reason:
+          type: string
+          enum: ["Inactivity", "Lack Of Progress", "Customer Imposed Deadline"]
+        severity:
+          type: string
+          enum: ["High Severity", "Medium Severity"]
+
+    EscalationResponse:
+      type: object
+      properties:
+        linkedCaseNumber:
+          type: string
+        sysId:
+          type: string
+
+    CaseDetails:
+      type: object
+      properties:
+        number:
+          type: string
+        sysId:
+          type: string
+        caseId:
+          type: string
+        description:
+          type: string
+        shortDescription:
+          type: string
+        assignedTo:
+          type: string
+        caseType:
+          type: string
+        priority:
+          type: string
+        state:
+          type: string
+        openedBy:
+          type: string
+        openedAt:
+          type: string
+        accountNumber:
+          type: string
+        accountName:
+          type: string
+        isGenAiUsageAllowed:
+          type: boolean
+        projectNumber:
+          type: string
+        projectKey:
+          type: string
+        productName:
+          type: string
+        lastWSO2CommentTime:
+          type: string
+        lastCustomerCommentTime:
+          type: string
+        projectDeploymentName:
+          type: string
+        projectDeploymentType:
+          type: string
+
+    CaseDetailsWithCount:
+      type: object
+      properties:
+        count:
+          type: integer
+        cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseDetails'
+
+    Comment:
+      type: object
+      properties:
+        createdOn:
+          type: string
+        value:
+          type: string
+        createdBy:
+          type: string
+        type:
+          type: string
+
+    CommentsResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        comments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Comment'
+
+    AttachmentInfo:
+      type: object
+      properties:
+        sysId:
+          type: string
+        fileName:
+          type: string
+        createdOn:
+          type: string
+        createdBy:
+          type: string
+        updatedOn:
+          type: string
+        updatedBy:
+          type: string
+        contentType:
+          type: string
+        state:
+          type: string
+
+    SLAReportDetails:
+      type: object
+      properties:
+        projectName:
+          type: string
+        projectKey:
+          type: string
+        percentileDataList:
+          type: array
+          items:
+            $ref: '#/components/schemas/PercentileDataList'
+        caseDataList:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseDataList'
+
+    PercentileDataList:
+      type: object
+      properties:
+        key:
+          type: string
+        caseType:
+          type: string
+        priority:
+          type: string
+        responseTime:
+          type: string
+        workaroundTime:
+          type: string
+        resolutionTime:
+          type: string
+
+    CaseDataList:
+      type: object
+      properties:
+        caseSysId:
+          type: string
+        caseId:
+          type: string
+        caseNumber:
+          type: string
+        caseType:
+          type: string
+        casePriority:
+          type: string
+        caseState:
+          type: string
+        opened:
+          type: string
+        response:
+          type: string
+        responseSysId:
+          type: string
+        workaround:
+          type: string
+        workaroundSysId:
+          type: string
+        resolution:
+          type: string
+        resolutionSysId:
+          type: string
+
+    CSReportDetails:
+      type: object
+      properties:
+        subscriptionDetails:
+          $ref: '#/components/schemas/SubscriptionDetail'
+        casesRecords:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseRecordDetail'
+        slaDetails:
+          $ref: '#/components/schemas/SlaStats'
+        projectDeployments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectDeployment'
+        monthlyCounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/MonthlyCount'
+
+    SubscriptionDetail:
+      type: object
+      properties:
+        projectName:
+          type: string
+        projectKey:
+          type: string
+        projectType:
+          type: string
+        accountName:
+          type: string
+        startDate:
+          type: string
+        endDate:
+          type: string
+        supportTier:
+          type: string
+        subscription:
+          type: string
+        totalQueryHours:
+          type: string
+        consumedQueryHours:
+          type: string
+
+    CaseRecordDetail:
+      type: object
+      properties:
+        caseSysId:
+          type: string
+        caseNumber:
+          type: string
+        engagementType:
+          type: string
+        caseType:
+          type: string
+        casePriority:
+          type: string
+        caseState:
+          type: string
+        opened:
+          type: string
+        description:
+          type: string
+        updated:
+          type: string
+        deployment:
+          type: string
+        productName:
+          type: string
+
+    SlaStats:
+      type: object
+      properties:
+        slaRecords:
+          type: array
+          items:
+            $ref: '#/components/schemas/SlaRecordDetail'
+        slaPerformanceStats:
+          $ref: '#/components/schemas/SlaPerformanceStats'
+
+    SlaRecordDetail:
+      type: object
+      properties:
+        task:
+          type: string
+        slaDefinition:
+          type: string
+        businessElapsedPercentage:
+          type: string
+
+    SlaStatsDetail:
+      type: object
+      properties:
+        fraction:
+          description: Upstream (ServiceNow) sends this as either a string or an integer; both are preserved as-is rather than coerced.
+          oneOf:
+            - type: string
+            - type: integer
+        percentage:
+          type: string
+
+    SlaPerformanceStats:
+      type: object
+      description: >-
+        Field names are capitalized (Workaround/Resolution/Response), not
+        camelCase — deliberately preserved as-is to match this exact wire
+        contract from the original backend, which the SPL frontend already
+        codes against.
+      properties:
+        Workaround:
+          $ref: '#/components/schemas/SlaStatsDetail'
+        Resolution:
+          $ref: '#/components/schemas/SlaStatsDetail'
+        Response:
+          $ref: '#/components/schemas/SlaStatsDetail'
+
+    ProjectDeployment:
+      type: object
+      properties:
+        name:
+          type: string
+        products:
+          type: array
+          items:
+            $ref: '#/components/schemas/ViewerProduct'
+
+    ViewerProduct:
+      type: object
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        supportStatus:
+          type: string
+        eolDate:
+          type: string
+        cores:
+          description: Upstream sends this as either a string or an integer; both are preserved as-is.
+          oneOf:
+            - type: string
+            - type: integer
+        tps:
+          description: Upstream sends this as either a string or an integer; both are preserved as-is.
+          oneOf:
+            - type: string
+            - type: integer
+        updateLevelInfo:
+          type: integer
+        earliestPossibleSupportEOLDate:
+          type: string
+
+    MonthlyCount:
+      type: object
+      properties:
+        yearAndMonth:
+          type: string
+        counts:
+          $ref: '#/components/schemas/Count'
+
+    Count:
+      type: object
+      properties:
+        incidentCount:
+          type: integer
+        queryCount:
+          type: integer
+
+    TimeLogBreakdownDetails:
+      type: object
+      properties:
+        projectName:
+          type: string
+        projectKey:
+          type: string
+        projectType:
+          type: string
+        remainingQueryHours:
+          type: string
+        totalQueryHours:
+          type: string
+        cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeLogBreakdownCase'
+
+    TimeLogBreakdownCase:
+      type: object
+      properties:
+        caseNumber:
+          type: string
+        caseId:
+          type: string
+        caseType:
+          type: string
+        shortDescription:
+          type: string
+        priority:
+          type: string
+        state:
+          type: string
+        totalHours:
+          type: string
+        consumedQueryHours:
+          type: string
+        timeCards:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeCardDetails'
+
+    TimeCardDetails:
+      type: object
+      properties:
+        total:
+          type: string
+        createdOn:
+          type: string
+        createdBy:
+          type: string
+        updatedOn:
+          type: string
+        updatedBy:
+          type: string
+        isBillable:
+          type: string
+        state:
+          type: string
+
+    WorkNoteResponse:
+      type: object
+      properties:
+        number:
+          type: string
+        updatedOn:
+          type: string
+
+    ABTTeamScheduleData:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/ABTTeamScheduleList'
+        metadata:
+          type: array
+          items:
+            $ref: '#/components/schemas/ABTTeamScheduleMetadata'
+        snURL:
+          type: string
+
+    ABTTeamScheduleMetadata:
+      type: object
+      description: >-
+        Populates the SPL frontend's team/event-type filter dropdowns.
+        FIXED: an earlier version of this backend never decoded this field
+        from ServiceNow's response, silently leaving it empty — caught
+        during frontend reconciliation; see internal/servicenow/schedule.go.
+      properties:
+        teams:
+          type: array
+          items:
+            $ref: '#/components/schemas/ABTTeamScheduleMetadataTeam'
+        eventTypes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ABTTeamScheduleMetadataEventType'
+
+    ABTTeamScheduleMetadataTeam:
+      type: object
+      properties:
+        label:
+          type: string
+        id:
+          type: string
+        link:
+          type: string
+
+    ABTTeamScheduleMetadataEventType:
+      type: object
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+
+    ABTTeamScheduleList:
+      type: object
+      properties:
+        label:
+          type: string
+        members:
+          type: array
+          items:
+            $ref: '#/components/schemas/ABTTeamScheduleMember'
+
+    ABTTeamScheduleMember:
+      type: object
+      properties:
+        name:
+          type: string
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/ABTTeamScheduleMemberRole'
+        schedule:
+          type: object
+          description: Keyed by date; each value is the list of schedule entries for that date.
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/ABTTeamScheduleMemberSchedule'
+
+    ABTTeamScheduleMemberRole:
+      type: object
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+
+    ABTTeamScheduleMemberSchedule:
+      type: object
+      properties:
+        name:
+          type: string
+        label:
+          type: string
+
+    DriveFile:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        mimeType:
+          type: string
+
+    DriveFolder:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+
+    CustomerHealthSummaryRequest:
+      type: object
+      properties:
+        email:
+          type: string
+          nullable: true
+        phrase:
+          type: string
+          nullable: true
+        risks:
+          type: string
+          nullable: true
+        region:
+          type: array
+          items:
+            type: string
+        product:
+          type: string
+          nullable: true
+        abtTeam:
+          type: string
+          nullable: true
+        healthStatus:
+          type: string
+          nullable: true
+        offset:
+          type: integer
+        limit:
+          type: integer
+          default: 10
+
+    AccountSummaryResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AccountSummary'
+        totalCount:
+          type: integer
+
+    AccountSummary:
+      type: object
+      properties:
+        accountSysId:
+          type: string
+        accountName:
+          type: string
+          nullable: true
+        hasNoGoLive:
+          $ref: '#/components/schemas/GoLiveStatus'
+        hasRecentCases:
+          type: boolean
+        hasEolProduct:
+          type: boolean
+        hasAbandonedMigrations:
+          type: boolean
+        hasMigrationDelays:
+          type: boolean
+        hasRecentEscalations:
+          type: boolean
+        noSupportCases6mo:
+          type: boolean
+        healthStatus:
+          type: string
+          nullable: true
+          description: Populated from MySQL risk-tracking data; null when no health review has been recorded for this account.
+
+    GoLiveStatus:
+      type: object
+      properties:
+        status:
+          type: string
+        isRisk:
+          type: boolean
+        state:
+          type: string
+
+    InitHealthTrackingRequest:
+      type: object
+      properties:
+        projectSysIds:
+          type: array
+          items:
+            type: string
+
+    ViewerAccountDetail:
+      type: object
+      properties:
+        accountName:
+          type: string
+        customerProjects:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProjectDetail'
+
+    ProjectDetail:
+      type: object
+      properties:
+        sysId:
+          type: string
+        name:
+          type: string
+        hasRecentCases:
+          type: boolean
+        detailedRecentCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseGroup'
+        totalRecentCases:
+          type: integer
+        hasAbandonedCases:
+          type: boolean
+        detailedAbandonedCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseLink'
+        isUsingEolProduct:
+          type: boolean
+        softwareModel:
+          type: array
+          items:
+            $ref: '#/components/schemas/EolProduct'
+        deployments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ViewerDeployment'
+        hasMigrationDelays:
+          type: boolean
+        detailedMigrationDelays:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseLink'
+        hasEscalatedCases:
+          type: boolean
+        detailedEscalatedCases:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseLink'
+        goLiveStatus:
+          $ref: '#/components/schemas/GoLiveStatus'
+
+    CaseGroup:
+      type: object
+      properties:
+        priority:
+          type: string
+        count:
+          type: integer
+        cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseInfo'
+
+    CaseInfo:
+      type: object
+      properties:
+        sysId:
+          type: string
+        number:
+          type: string
+
+    CaseLink:
+      type: object
+      properties:
+        sysId:
+          type: string
+        number:
+          type: string
+        escalationSysId:
+          type: string
+        escalationNumber:
+          type: string
+
+    EolProduct:
+      type: object
+      properties:
+        name:
+          type: string
+        eolDate:
+          type: string
+        deployments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ViewerDeployment'
+
+    ViewerDeployment:
+      type: object
+      properties:
+        sysId:
+          type: string
+        name:
+          type: string
+
+    OpenRiskRequest:
+      type: object
+      required: [accountSysId, comment]
+      properties:
+        accountSysId:
+          type: string
+        comment:
+          type: string
+
+    CloseRiskRequest:
+      type: object
+      required: [comment]
+      properties:
+        comment:
+          type: string
+
+    MarkHealthyRequest:
+      type: object
+      required: [accountSysId]
+      properties:
+        accountSysId:
+          type: string
+        comment:
+          type: string
+          nullable: true
+
+    RevertHealthRequest:
+      type: object
+      required: [accountSysId]
+      properties:
+        accountSysId:
+          type: string
+
+    ProjectRisk:
+      type: object
+      properties:
+        id:
+          type: integer
+        projectSysId:
+          type: string
+        accountSysId:
+          type: string
+        status:
+          type: string
+        openedComment:
+          type: string
+        openedByEmail:
+          type: string
+        openedOn:
+          type: string
+        closedComment:
+          type: string
+          nullable: true
+        closedByEmail:
+          type: string
+          nullable: true
+        closedOn:
+          type: string
+          nullable: true
+        actionItems:
+          type: array
+          items:
+            $ref: '#/components/schemas/RiskActionItem'
+
+    HealthStatusRecord:
+      type: object
+      properties:
+        id:
+          type: integer
+        projectSysId:
+          type: string
+        accountSysId:
+          type: string
+        status:
+          type: string
+        reviewedByEmail:
+          type: string
+          nullable: true
+        reviewedOn:
+          type: string
+          nullable: true
+
+    ProjectHealthStatus:
+      type: object
+      properties:
+        projectSysId:
+          type: string
+        healthStatus:
+          $ref: '#/components/schemas/HealthStatusRecord'
+        openRisk:
+          $ref: '#/components/schemas/ProjectRisk'
+          nullable: true
+
+    HealthSummary:
+      type: object
+      properties:
+        accountSysId:
+          type: string
+        overallStatus:
+          type: string
+
+    CreateActionItemRequest:
+      type: object
+      required: [title, priority, dueDate, projectSysId, accountSysId]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+        priority:
+          type: string
+        assignedToEmail:
+          type: string
+          nullable: true
+        dueDate:
+          type: string
+        projectSysId:
+          type: string
+        accountSysId:
+          type: string
+
+    UpdateActionItemStatusRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+        resolutionComment:
+          type: string
+          nullable: true
+
+    UpdateActionItemRequest:
+      type: object
+      required: [title, priority]
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+        priority:
+          type: string
+        assignedToEmail:
+          type: string
+          nullable: true
+        dueDate:
+          type: string
+          nullable: true
+
+    CreateCommentRequest:
+      type: object
+      required: [comment]
+      properties:
+        comment:
+          type: string
+
+    RiskActionItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        riskId:
+          type: integer
+        projectSysId:
+          type: string
+        accountSysId:
+          type: string
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+        priority:
+          type: string
+        status:
+          type: string
+        assignedToEmail:
+          type: string
+          nullable: true
+        dueDate:
+          type: string
+          nullable: true
+        resolutionComment:
+          type: string
+          nullable: true
+        resolvedByEmail:
+          type: string
+          nullable: true
+        resolvedOn:
+          type: string
+          nullable: true
+        createdByEmail:
+          type: string
+        createdOn:
+          type: string
+        updatedOn:
+          type: string
+        commentCount:
+          type: integer
+
+    ActionItemComment:
+      type: object
+      properties:
+        id:
+          type: integer
+        actionItemId:
+          type: integer
+        comment:
+          type: string
+        createdByEmail:
+          type: string
+        createdOn:
+          type: string
+
+    UserInfoView:
+      type: object
+      properties:
+        firstName:
+          type: string
+        lastName:
+          type: string
+
+    UserScanRequest:
+      type: object
+      required: [email, subscriptionKey, isPartner]
+      properties:
+        email:
+          type: string
+        subscriptionKey:
+          type: string
+        isPartner:
+          type: boolean
+
+    SplScanInformation:
+      type: object
+      properties:
+        issue:
+          type: string
+        solution:
+          type: string
+        documentation:
+          type: string
+
+    ScanResult:
+      type: object
+      properties:
+        order:
+          type: integer
+        label:
+          type: string
+        state:
+          type: boolean
+        information:
+          $ref: '#/components/schemas/SplScanInformation'
+
+    ScanResponse:
+      type: object
+      properties:
+        system:
+          type: string
+          enum: [Salesforce, Servicenow]
+        systemResult:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScanResult'
+

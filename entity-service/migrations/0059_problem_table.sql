@@ -15,9 +15,10 @@
 -- under the License.
 
 -- work_item type extension for PROBLEM, same shared-primary-key pattern as
--- incident (000058_incident_table.up.sql): id IS work_item.id, ON DELETE
--- CASCADE, no audit columns - those live on work_item and are reachable via
--- join.
+-- incident (migrations/0058_incident_table.sql): id IS work_item.id, ON
+-- DELETE CASCADE, no audit columns - those live on work_item and are
+-- reachable via join.
+
 DO $$ BEGIN
     CREATE TYPE problem_state_enum AS ENUM (
         'NEW', 'ASSESS', 'ROOT_CAUSE_ANALYSIS', 'FIX_IN_PROGRESS', 'RESOLVED', 'CLOSED'
@@ -49,10 +50,10 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- subcategory is a ServiceNow dependent choice list, same shape as
--- incident_subcategory (000058) - a lookup table with its own surrogate id,
--- not a flat enum, since valid values depend on category. value is the raw
--- ServiceNow choice value (lookup-by-name match target); label is the
--- display text.
+-- incident_subcategory (migrations/0058) - a lookup table with its own
+-- surrogate id, not a flat enum, since valid values depend on category.
+-- value is the raw ServiceNow choice value (lookup_by_name match target);
+-- label is the display text.
 CREATE TABLE IF NOT EXISTS problem_subcategory (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     category problem_category_enum NOT NULL,

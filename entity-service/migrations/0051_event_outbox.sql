@@ -14,41 +14,63 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Transactional outbox for row changes that drive notifications.
+-- Transactional outbox for row changes, so csm-flow-service can react to data
+-- changing without polling every table or being told about them out of band.
 --
--- WHY A TRIGGER AND NOT APPLICATION CODE. The notices this feeds are
--- record-triggered: "change request updated WHERE state changes to ...". That
--- needs a before/after diff, and no writer here can produce one -- csm-sync
--- upserts blindly from ServiceNow, so it knows the new row but never the old.
--- An AFTER UPDATE trigger is the only place both versions exist at once.
+-- WHY A TRIGGER AND NOT APPLICATION CODE: rows reach these tables by several
+-- paths -- the loader's bulk CopyFrom merge, its row-by-row fallback, its
+-- update_only mode, and whatever writes them after ServiceNow is gone. A
+-- trigger sees all of them. Diffing in one writer would miss the others, and
+-- the loader in particular does a blind upsert that never reads the old row,
+-- so it could not produce a before/after even if asked.
 --
--- The table is deliberately generic (entity_type / entity_id) even though only
--- change_request writes to it today: the drainer filters by type, so adding a
--- second producer is a trigger and nothing else.
+-- WHY AN OUTBOX AND NOT LISTEN/NOTIFY: NOTIFY is fire-and-forget. A listener
+-- that is disconnected -- a redeploy, a network blip -- misses every event sent
+-- meanwhile, with no way to discover what it missed. An approval notice is not
+-- something to lose to a rolling restart. Rows here persist until a consumer
+-- claims and marks them, so a restart resumes rather than skips.
+
+-- Wrapped in a transaction deliberately. `make migrate` runs each file with
+-- `psql -f`, not `--single-transaction`, so every statement would otherwise
+-- commit on its own. For a file that drops and recreates a trigger that means
+-- a window where the table has no trigger at all, and a write landing in it
+-- produces no outbox row and no notice -- silently, with nothing to retry.
 --
--- This DDL was applied by hand to staging while the notification chain was
--- being built and never committed. It is reproduced here from the live
--- definition so a rebuilt environment gets the same thing.
+-- Postgres makes DDL transactional, so the swap becomes one step: a concurrent
+-- write waits for the lock instead of slipping through the gap. It also makes
+-- the whole migration all-or-nothing, rather than half-applied and unrecorded
+-- in csm_migration_applied_migration if a later statement fails.
+BEGIN;
+
 CREATE TABLE IF NOT EXISTS event_outbox (
-    id           BIGSERIAL PRIMARY KEY,
-    entity_type  TEXT NOT NULL,
-    entity_id    UUID NOT NULL,
-    -- {"column": {"from": ..., "to": ...}} for the columns that differ.
-    changes      JSONB NOT NULL,
-    -- to_jsonb(NEW): the row as it now stands, so a consumer can read a field
-    -- that did not change without going back to the table.
-    snapshot     JSONB NOT NULL,
+    id           BIGINT      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    entity_type  TEXT        NOT NULL,
+    entity_id    UUID        NOT NULL,
+    -- changes is {"<column>": {"from": …, "to": …}} for the columns that
+    -- actually differ; snapshot is the row as it now stands. Together they are
+    -- the entity.changed payload csm-flow-service already consumes, so the
+    -- publisher is a shape-preserving relay rather than a translator.
+    changes      JSONB       NOT NULL,
+    snapshot     JSONB       NOT NULL,
     occurred_on  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Null until a consumer has published it. No status column: published_on
+    -- being set IS the status, the same derivation scheduled_task_run and
+    -- sla_clocks use.
     published_on TIMESTAMPTZ
 );
 
--- The drainer only ever asks for unpublished rows, and this stays small even
--- when the table does not.
+-- The drain query: oldest unpublished first. Partial, because a drained outbox
+-- is almost entirely published rows and the index should not carry them.
 CREATE INDEX IF NOT EXISTS idx_event_outbox_unpublished
-    ON event_outbox (id) WHERE published_on IS NULL;
+    ON event_outbox (id)
+    WHERE published_on IS NULL;
 
-CREATE OR REPLACE FUNCTION trg_event_outbox()
-RETURNS TRIGGER AS $$
+-- Emits one outbox row per UPDATE that actually changed something, with only
+-- the differing columns in `changes`. An UPDATE that rewrites a row to its own
+-- values -- which the loader's upsert does constantly, since it re-merges every
+-- synced record whether or not it moved -- produces nothing. Without that
+-- guard, every sync tick would look like a change to every consumer.
+CREATE OR REPLACE FUNCTION trg_event_outbox() RETURNS trigger AS $$
 DECLARE
     diff JSONB := '{}'::jsonb;
     col  TEXT;
@@ -63,7 +85,6 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- A sync pass that rewrote the row with identical values is not an event.
     IF diff = '{}'::jsonb THEN
         RETURN NULL;
     END IF;
@@ -75,11 +96,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- THE TRIGGER IS OWNED BY THE TABLE. If change_request is ever dropped and
--- recreated, this goes with it and the notices stop firing with no error
--- anywhere -- re-run this migration's CREATE TRIGGER after any migration that
--- replaces the table.
+-- Attached to change_request only for now. Adding a table is one more CREATE
+-- TRIGGER and nothing else -- the function is table-agnostic via TG_TABLE_NAME.
 DROP TRIGGER IF EXISTS change_request_outbox ON change_request;
 CREATE TRIGGER change_request_outbox
     AFTER UPDATE ON change_request
     FOR EACH ROW EXECUTE FUNCTION trg_event_outbox();
+
+COMMIT;

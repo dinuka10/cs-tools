@@ -106,6 +106,16 @@ type genSummary struct {
 	slas                                                          int
 }
 
+// projectTypeIDs are ids from the project_type fixture (fixtures/0031_project_type_table.sql):
+// mostly "Subscription", with some managed-cloud, cloud-support and development-support
+// projects. A project with no type is not a realistic row: the customer portal treats it as
+// "type unknown" and offers no deployments when creating a case.
+var projectTypeIDs = []string{
+	"00000000-0000-0000-0000-0000000000a3", "00000000-0000-0000-0000-0000000000a3",
+	"00000000-0000-0000-0000-0000000000a3", "00000000-0000-0000-0000-0000000000a1",
+	"00000000-0000-0000-0000-0000000000a4", "00000000-0000-0000-0000-0000000000a6",
+}
+
 func (s genSummary) String() string {
 	return fmt.Sprintf(
 		"users=%d accounts=%d account_contacts=%d projects=%d project_contacts=%d "+
@@ -384,10 +394,11 @@ func genProjects(ctx context.Context, tx pgx.Tx, accounts []genAccount, summary 
 			createdOn := randRecentTime(60, 400)
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO project (id, created_on, updated_on, created_by, updated_by,
-					key, sf_id, name, account_id, is_active, start_date)
-				VALUES ($1,$2,$2,'seed-generator','seed-generator',$3,$4,$5,$6,true,$7)
+					key, sf_id, name, account_id, is_active, start_date, project_type_id)
+				VALUES ($1,$2,$2,'seed-generator','seed-generator',$3,$4,$5,$6,true,$7,$8)
 				ON CONFLICT (id) DO NOTHING`,
-				id, createdOn, key, sfID, name, acc.id, createdOn.Format("2006-01-02")); err != nil {
+				id, createdOn, key, sfID, name, acc.id, createdOn.Format("2006-01-02"),
+				pick(projectTypeIDs)); err != nil {
 				return nil, err
 			}
 			summary.projects++

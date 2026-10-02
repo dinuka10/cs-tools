@@ -21,11 +21,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"slices"
+	"sort"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -70,9 +72,11 @@ type ProjectRepository interface {
 	GetProjectByID(ctx context.Context, id string, scope SearchScope) (domain.ProjectDetailsView, error)
 	// UpdateProject applies the subset of domain.ProjectUpdateRequest that has
 	// a real Postgres column -- see service.pgProjectUpdateService's own doc
-	// comment for exactly which fields and why. updatedBy is the caller's
-	// resolved email, always written to project.updated_by (and, when
-	// HasAgent/HasKbReferences is set, account.updated_by too). Returns a
+	// comment for exactly which fields and why. Closure sub-states may be Title
+	// Case; changing one recomputes wso2_closure_state in the same transaction.
+	// updatedBy is the caller's email or internal client id, always written to
+	// project.updated_by (and, when HasAgent/HasKbReferences is set,
+	// account.updated_by too). Returns a
 	// NotFoundError if no such project exists, a ConflictError if
 	// HasAgent/HasKbReferences is requested on a project with no linked
 	// account (project.account_id IS NULL), or a ValidationError if a closure
@@ -81,16 +85,45 @@ type ProjectRepository interface {
 }
 
 type projectRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewProjectRepository constructs a ProjectRepository backed by the given connection pool.
-func NewProjectRepository(db *pgxpool.Pool) ProjectRepository {
+// NewProjectRepository constructs a ProjectRepository backed by the given scoped connection pool.
+func NewProjectRepository(db *Scoped) ProjectRepository {
 	return &projectRepo{db: db}
 }
 
-// SearchProjects implements ProjectRepository.
-func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProjectsRequest, scope SearchScope) ([]domain.Project, int, error) {
+// projectClosureColumns selects the overall and sub closure states in ServiceNow's
+// Title Case ("Pending Notified"), then the compliance violation date as yyyy-MM-dd.
+const projectClosureColumns = `INITCAP(REPLACE(p.wso2_closure_state::TEXT, '_', ' ')),
+	INITCAP(REPLACE(p.end_date_closure_state::TEXT, '_', ' ')),
+	INITCAP(REPLACE(p.invoice_due_date_closure_state::TEXT, '_', ' ')),
+	INITCAP(REPLACE(p.compliance_violation_closure_state::TEXT, '_', ' ')),
+	TO_CHAR(p.compliance_violation_date, 'YYYY-MM-DD')`
+
+// accountIsPartnerColumn is NULL without a linked account (alias a), else the
+// same classification rule the Salesforce membership mapping uses.
+const accountIsPartnerColumn = `CASE WHEN a.id IS NULL THEN NULL
+	ELSE COALESCE(LOWER(TRIM(a.classification)) = 'partner', FALSE) END`
+
+// projectSearchOrderBy builds ORDER BY from a whitelist; the service has already
+// rejected any other sortBy/sortOrder, so raw input never reaches the SQL.
+func projectSearchOrderBy(sortBy, sortOrder string) string {
+	if sortBy == "endDate" {
+		if sortOrder == "desc" {
+			return "p.end_date DESC NULLS LAST, p.id"
+		}
+		return "p.end_date ASC NULLS LAST, p.id"
+	}
+	if sortOrder == "asc" {
+		return "p.created_on ASC, p.id"
+	}
+	return "p.created_on DESC, p.id"
+}
+
+// buildProjectSearchWhere renders SearchProjects' WHERE clause and its bound
+// arguments. It expects aliases p (project), pt (project_type) and a (account).
+func buildProjectSearchWhere(req domain.SearchProjectsRequest, scope SearchScope) (string, []any, int, error) {
 	filterArgs := []any{}
 	argIdx := 1
 
@@ -178,18 +211,81 @@ func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProje
 		argIdx++
 	}
 
-	countQuery := "SELECT COUNT(*) FROM project p LEFT JOIN project_type pt ON pt.id = p.project_type_id " + where
+	// The service validates ClosureStatus as Open/Suspended/Restricted, matching ServiceNow.
+	if req.ClosureStatus != "" {
+		where += fmt.Sprintf(" AND p.wso2_closure_state::text = $%d", argIdx)
+		filterArgs = append(filterArgs, strings.ToUpper(req.ClosureStatus))
+		argIdx++
+	}
+
+	// endDateFrom/endDateTo: inclusive yyyy-MM-dd bounds (validated by the
+	// service); a project with no end date never matches a bound.
+	if req.EndDateFrom != "" {
+		where += fmt.Sprintf(" AND p.end_date >= $%d::date", argIdx)
+		filterArgs = append(filterArgs, req.EndDateFrom)
+		argIdx++
+	}
+	if req.EndDateTo != "" {
+		where += fmt.Sprintf(" AND p.end_date <= $%d::date", argIdx)
+		filterArgs = append(filterArgs, req.EndDateTo)
+		argIdx++
+	}
+
+	// onboardingStatus: any of the given ServiceNow labels, compared ignoring
+	// case and separators, as the case search's projectOnboardingStatus does.
+	if len(req.OnboardingStatus) > 0 {
+		labels, err := onboardingStatusEnumLabels("onboardingStatus", req.OnboardingStatus)
+		if err != nil {
+			return "", nil, argIdx, err
+		}
+		where += fmt.Sprintf(" AND p.onboarding_status = ANY($%d::text[]::onboarding_status_enum[])", argIdx)
+		filterArgs = append(filterArgs, labels)
+		argIdx++
+	}
+
+	// subRegion: the linked account's sub-region, exact but case-insensitive.
+	if sub := strings.TrimSpace(req.SubRegion); sub != "" {
+		where += fmt.Sprintf(" AND LOWER(TRIM(a.sub_region)) = LOWER($%d)", argIdx)
+		filterArgs = append(filterArgs, sub)
+		argIdx++
+	}
+
+	return where, filterArgs, argIdx, nil
+}
+
+// SearchProjects implements ProjectRepository.
+func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProjectsRequest, scope SearchScope) ([]domain.Project, int, error) {
+	// WithCallerIdentity from the explicit scope parameter -- see
+	// CaseRepository.GetCaseByID's identical stamp. The per-project case count
+	// below reads work_item (RLS-protected), so it is counted through the same
+	// identity that scopes the project list: all of it for an internal caller,
+	// only what a customer's own project membership lets them see otherwise.
+	ctx = WithCallerIdentity(ctx, scope)
+	where, filterArgs, argIdx, err := buildProjectSearchWhere(req, scope)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	countQuery := "SELECT COUNT(*) FROM project p LEFT JOIN project_type pt ON pt.id = p.project_type_id LEFT JOIN account a ON a.id = p.account_id " + where
 
 	dataQuery := fmt.Sprintf(
 		`SELECT p.id, p.account_id, p.sf_id, p.name, p.key, pt.name,
 		        p.start_date, p.end_date, p.created_on, p.updated_on,
-		        INITCAP(REPLACE(p.wso2_closure_state::TEXT, '_', ' '))
+		        `+projectClosureColumns+`,
+		        INITCAP(REPLACE(p.onboarding_status::TEXT, '_', '-')),
+		        a.id, a.name, a.region, a.sub_region, `+accountIsPartnerColumn+`,
+		        (SELECT COUNT(*) FROM work_item wi
+		           LEFT JOIN "case" c ON c.id = wi.id`+caseLikeJoins+`
+		          WHERE wi.project_id = p.id
+		            AND wi.type = ANY(`+caseLikeWorkItemTypes+`)
+		            AND `+caseLikeStateColumn+` IS DISTINCT FROM 'CLOSED')
 		 FROM project p
 		 LEFT JOIN project_type pt ON pt.id = p.project_type_id
+		 LEFT JOIN account a ON a.id = p.account_id
 		 %s
-		 ORDER BY p.created_on DESC, p.id
+		 ORDER BY %s
 		 LIMIT $%d OFFSET $%d`,
-		where, argIdx, argIdx+1,
+		where, projectSearchOrderBy(req.SortBy, req.SortOrder), argIdx, argIdx+1,
 	)
 	dataArgs := append(append([]any{}, filterArgs...), req.Pagination.Limit, req.Pagination.Offset)
 
@@ -238,15 +334,25 @@ func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProje
 			// narrow fix at the one place real data violates the schema's
 			// own declared constraint, not a wider contract change every
 			// other reader of Project.SfID would also have to handle.
-			var sfID *string
+			var sfID, aID, aName *string
+			var acct domain.ProjectSearchAccountRef
 			if err := rows.Scan(
 				&p.ID, &p.AccountID, &sfID, &p.Name, &p.Key, &projectTypeName,
-				&p.StartDate, &p.EndDate, &p.CreatedOn, &p.UpdatedOn, &p.ClosureState,
+				&p.StartDate, &p.EndDate, &p.CreatedOn, &p.UpdatedOn,
+				&p.ClosureState, &p.EndDateClosureState, &p.InvoiceDueDateClosureState,
+				&p.ComplianceViolationClosureState, &p.ComplianceViolationDate,
+				&p.OnboardingStatus,
+				&aID, &aName, &acct.Region, &acct.SubRegion, &acct.IsPartner,
+				&p.ActiveCasesCount,
 			); err != nil {
 				return fmt.Errorf("scan project: %w", err)
 			}
 			if sfID != nil {
 				p.SfID = *sfID
+			}
+			if aID != nil {
+				acct.ID, acct.Name = *aID, stringOrEmpty(aName)
+				p.Account = &acct
 			}
 			if projectTypeName != nil {
 				p.SubscriptionType = projectTypeNameToSubscriptionType(*projectTypeName)
@@ -271,6 +377,8 @@ func (r *projectRepo) SearchProjects(ctx context.Context, req domain.SearchProje
 
 // GetProjectByID implements ProjectRepository.
 func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope SearchScope) (domain.ProjectDetailsView, error) {
+	// WithCallerIdentity from the explicit scope parameter, as in SearchProjects.
+	ctx = WithCallerIdentity(ctx, scope)
 	var v domain.ProjectDetailsView
 	// account.ai_gen_response_enabled/smart_knowledge_base_suggestions_enabled
 	// are nullable BOOLEAN columns, but ProjectAccountRef.AgentEnabled/
@@ -308,6 +416,8 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	// still resolve, just with SubscriptionType/HasSr left at their zero
 	// value below.
 	var projectTypeName *string
+	// sf_id is nullable in production data (migration 0095 dropped NOT NULL).
+	var sfID *string
 	// has_service_request_write_access (migration 0130) is a direct port of
 	// ServiceNow's ProjectTypeFeatureManager.FEATURE_MATRIX (see
 	// reference_data_repo.go's own doc comment) -- reusing it here is what
@@ -344,8 +454,9 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 		        -- confirmed against a real ServiceNow payload and Postgres's own INITCAP
 		        -- behavior for both before picking these. A bare ::TEXT cast leaves both
 		        -- uppercase, matching neither.
-		        INITCAP(REPLACE(p.wso2_closure_state::TEXT, '_', ' ')),
+		        `+projectClosureColumns+`,
 		        INITCAP(REPLACE(p.onboarding_status::TEXT, '_', '-')),
+		        `+accountIsPartnerColumn+`,
 		        p.onboarding_go_live_plan_date, p.onboarding_go_live_date, p.onboarding_expiry_date,
 		        EXTRACT(EPOCH FROM p.total_query_duration) / 3600,
 		        EXTRACT(EPOCH FROM p.remaining_query_duration) / 3600,
@@ -380,13 +491,15 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 		 LEFT JOIN "user" amu ON amu.id = a.account_manager_id
 		 WHERE p.id = $1`+scopeClause, scopeArgs...,
 	).Scan(
-		&v.ID, &v.SfID, &v.Name, &v.Key,
+		&v.ID, &sfID, &v.Name, &v.Key,
 		&v.StartDate, &v.EndDate, &v.CreatedOn, &v.UpdatedOn,
 		&aID, &aName, &aNumber, &v.Account.ActivationDate, &v.Account.Region,
 		&agentEnabled, &kbReferencesEnabled,
 		&supportTier,
 		&projectTypeName, &hasSr,
-		&v.ClosureState, &v.OnboardingStatus,
+		&v.ClosureState, &v.EndDateClosureState, &v.InvoiceDueDateClosureState,
+		&v.ComplianceViolationClosureState, &v.ComplianceViolationDate,
+		&v.OnboardingStatus, &v.Account.IsPartner,
 		&v.GoLivePlanDate, &v.GoLiveDate, &v.OnboardingExpiryDate,
 		&v.TotalQueryHours, &v.RemainingQueryHours,
 		&v.ConsumedQueryHours,
@@ -416,6 +529,7 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 	if aNumber != nil {
 		v.Account.Number = *aNumber
 	}
+	v.SfID = stringOrEmpty(sfID)
 	v.Account.AgentEnabled = agentEnabled != nil && *agentEnabled
 	v.Account.KbReferencesEnabled = kbReferencesEnabled != nil && *kbReferencesEnabled
 	v.Account.Tier = stringOrEmpty(supportTier)
@@ -428,19 +542,29 @@ func (r *projectRepo) GetProjectByID(ctx context.Context, id string, scope Searc
 
 // UpdateProject implements ProjectRepository.
 func (r *projectRepo) UpdateProject(ctx context.Context, id string, req domain.ProjectUpdateRequest, updatedBy string) (domain.ProjectUpdateResult, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.ProjectUpdateResult{}, fmt.Errorf("update project: begin tx: %w", err)
+	if err := validateClosureFields(req); err != nil {
+		return domain.ProjectUpdateResult{}, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
+	// WithSystemIdentity: this writes only project and account, neither
+	// RLS-protected, and carries no caller-visible rows. The service already
+	// authorized the caller (resolveUpdatedBy); this only gives Scoped the
+	// identity it requires, including for an allow-listed client the identity
+	// middleware could not resolve to a scope.
+	ctx = WithSystemIdentity(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (domain.ProjectUpdateResult, error) {
+		return updateProjectTx(ctx, tx, id, req, updatedBy)
+	})
+}
 
+// updateProjectTx is UpdateProject's body, run inside tx.
+func updateProjectTx(ctx context.Context, tx pgx.Tx, id string, req domain.ProjectUpdateRequest, updatedBy string) (domain.ProjectUpdateResult, error) {
 	// Lock the row first (mirrors CaseRepository.UpdateCase's own
 	// lock-before-read reasoning) so the account_id this reads is accurate
 	// even under a concurrent update to the same project, and so a
 	// nonexistent id is caught as NotFoundError before either UPDATE below
 	// runs.
 	var accountID *string
-	err = tx.QueryRow(ctx, `SELECT account_id FROM project WHERE id = $1 FOR UPDATE`, id).Scan(&accountID)
+	err := tx.QueryRow(ctx, `SELECT account_id FROM project WHERE id = $1 FOR UPDATE`, id).Scan(&accountID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ProjectUpdateResult{}, &apierror.NotFoundError{Msg: "project not found"}
 	}
@@ -461,16 +585,9 @@ func (r *projectRepo) UpdateProject(ctx context.Context, id string, req domain.P
 		return domain.ProjectUpdateResult{}, &apierror.ConflictError{Msg: "project has no linked account; hasAgent/hasKbReferences cannot be set"}
 	}
 
-	// project.updated_on/updated_by is bumped unconditionally on every
-	// successful call (even one that only touches the linked account below)
-	// so the response's UpdatedOn/UpdatedBy always reflects when this PATCH
-	// happened, matching the ServiceNow-mode contract's own always-present
-	// UpdatedOn/UpdatedBy. ClosureState is deliberately never selected or
-	// returned here -- see pgProjectUpdateService.UpdateProject's own doc
-	// comment for why this mode leaves wso2_closure_state alone rather than
-	// reimplementing the ServiceNow business rule that derives it.
+	// project.updated_on/updated_by is bumped on every successful call, even one
+	// that only touches the linked account below.
 	var res domain.ProjectUpdateResult
-	var endDateState, invoiceState, complianceState *string
 	err = tx.QueryRow(ctx, `
 		UPDATE project
 		SET end_date_closure_state = COALESCE($2::end_date_closure_state_enum, end_date_closure_state),
@@ -479,26 +596,34 @@ func (r *projectRepo) UpdateProject(ctx context.Context, id string, req domain.P
 		    updated_on = NOW(),
 		    updated_by = $5
 		WHERE id = $1
-		RETURNING id, updated_on, updated_by,
-		          end_date_closure_state::TEXT, invoice_due_date_closure_state::TEXT, compliance_violation_closure_state::TEXT`,
-		id, req.EndDateClosureState, req.InvoiceDueDateClosureState, req.ComplianceViolationClosureState, updatedBy,
-	).Scan(&res.ID, &res.UpdatedOn, &res.UpdatedBy, &endDateState, &invoiceState, &complianceState)
+		RETURNING id, updated_on, updated_by`,
+		id, closureEnumLabel(req.EndDateClosureState), closureEnumLabel(req.InvoiceDueDateClosureState),
+		closureEnumLabel(req.ComplianceViolationClosureState), updatedBy,
+	).Scan(&res.ID, &res.UpdatedOn, &res.UpdatedBy)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "22P02" {
-			// pgErr.Message (e.g. `invalid input value for enum
-			// end_date_closure_state_enum: "Pending Notified"`) is logged in
-			// full for debugging but never returned to the caller verbatim --
-			// it embeds the internal enum type name, a schema implementation
-			// detail this API's response shouldn't leak. The caller only
-			// needs to know which of the three fields it sent was bad.
+			// The enum type name in pgErr.Message is logged, never returned.
 			slog.WarnContext(ctx, "update project: invalid enum value", "projectId", id, "error", pgErr.Message)
 			return domain.ProjectUpdateResult{}, &apierror.ValidationError{Msg: "endDateClosureState, invoiceDueDateClosureState, or complianceViolationClosureState contains an unrecognized value"}
 		}
 		return domain.ProjectUpdateResult{}, fmt.Errorf("update project: %w", err)
 	}
-	res.EndDateClosureState = endDateState
-	res.InvoiceDueDateClosureState = invoiceState
-	res.ComplianceViolationClosureState = complianceState
+
+	// Recompute the overall state in this tx, standing in for ServiceNow's
+	// "Update WSO2 Closure State" business rule.
+	if req.EndDateClosureState != nil || req.InvoiceDueDateClosureState != nil || req.ComplianceViolationClosureState != nil {
+		if _, err := tx.Exec(ctx, `UPDATE project SET wso2_closure_state = `+wso2ClosureStateRule+` WHERE id = $1`, id); err != nil {
+			return domain.ProjectUpdateResult{}, fmt.Errorf("update project: recompute closure state: %w", err)
+		}
+	}
+	var complianceDate *string
+	err = tx.QueryRow(ctx, `SELECT `+projectClosureColumns+` FROM project p WHERE p.id = $1`, id).Scan(
+		&res.ClosureState, &res.EndDateClosureState, &res.InvoiceDueDateClosureState,
+		&res.ComplianceViolationClosureState, &complianceDate,
+	)
+	if err != nil {
+		return domain.ProjectUpdateResult{}, fmt.Errorf("update project: read closure states: %w", err)
+	}
 
 	if req.HasAgent != nil || req.HasKbReferences != nil {
 		// RowsAffected is checked, not just the error, because the account
@@ -525,14 +650,80 @@ func (r *projectRepo) UpdateProject(ctx context.Context, id string, req domain.P
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.ProjectUpdateResult{}, fmt.Errorf("update project: commit tx: %w", err)
-	}
-
-	// ClosureState/SuspensionProcessState stay nil -- see this method's own
-	// doc comment (ClosureState) and pgProjectUpdateService.UpdateProject's
-	// (SuspensionProcessState is rejected before this method is ever called).
+	// SuspensionProcessState has no column, so it stays nil.
 	return res, nil
+}
+
+// wso2ClosureStateRule derives project.wso2_closure_state from the three sub-states.
+// It matches 1,939 of 1,940 dev rows that carry a closure state.
+const wso2ClosureStateRule = `(CASE
+	WHEN end_date_closure_state::TEXT IN ('CLOSED', 'SUSPENDED')
+	  OR invoice_due_date_closure_state::TEXT LIKE 'SUSPENDED%'
+	  OR compliance_violation_closure_state::TEXT = 'SUSPENDED' THEN 'SUSPENDED'
+	WHEN end_date_closure_state::TEXT = 'RESTRICTED'
+	  OR invoice_due_date_closure_state::TEXT LIKE 'RESTRICTED%' THEN 'RESTRICTED'
+	ELSE 'OPEN' END)::wso2_closure_state_enum`
+
+// closureEnumLabel maps a ServiceNow closure value ("Pending Notified") to its enum
+// label (PENDING_NOTIFIED), the same snake_upper rule csm-sync applies.
+func closureEnumLabel(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	s := strings.ReplaceAll(strings.ToLower(*v), "&", " and ")
+	s = strings.Trim(nonAlnumRun.ReplaceAllString(s, "_"), "_")
+	s = strings.ToUpper(s)
+	return &s
+}
+
+var nonAlnumRun = regexp.MustCompile(`[^a-z0-9]+`)
+
+// Enum labels of the three closure sub-state columns (migrations 0014, 0175).
+var (
+	endDateClosureLabels = []string{"OPEN", "NOTIFIED", "CLOSURE_NOTICES", "RESTRICTED", "CLOSED", "SUSPENDED",
+		"PENDING_NOTIFIED", "PENDING_CLOSURE_NOTICES", "PENDING_CLOSED", "PENDING_RESTRICTED"}
+	invoiceDueDateClosureLabels = []string{"OPEN", "NOTIFIED", "NOTICED", "RESTRICTED", "SUSPENDED",
+		"PENDING_NOTIFIED", "PENDING_SUSPENDED", "PENDING_NOTICED", "PENDING_RESTRICTED",
+		"NOTIFIED_AND_PREVIOUSLY_PAID", "NOTICED_AND_PREVIOUSLY_PAID", "RESTRICTED_AND_PREVIOUSLY_PAID",
+		"SUSPENDED_AND_PREVIOUSLY_PAID", "PENDING_NOTIFIED_AND_PREVIOUSLY_PAID", "PENDING_NOTICED_AND_PREVIOUSLY_PAID",
+		"PENDING_RESTRICTED_AND_PREVIOUSLY_PAID", "PENDING_SUSPENDED_AND_PREVIOUSLY_PAID"}
+	complianceViolationClosureLabels = []string{"OPEN", "SUSPENDED"}
+)
+
+// validateClosureFields rejects a PATCH closure value with no enum label,
+// naming the value and the accepted values in the Title Case reads return.
+func validateClosureFields(req domain.ProjectUpdateRequest) error {
+	fields := []struct {
+		name   string
+		value  *string
+		labels []string
+	}{
+		{"endDateClosureState", req.EndDateClosureState, endDateClosureLabels},
+		{"invoiceDueDateClosureState", req.InvoiceDueDateClosureState, invoiceDueDateClosureLabels},
+		{"complianceViolationClosureState", req.ComplianceViolationClosureState, complianceViolationClosureLabels},
+	}
+	for _, f := range fields {
+		if f.value == nil || slices.Contains(f.labels, *closureEnumLabel(f.value)) {
+			continue
+		}
+		names := make([]string, len(f.labels))
+		for i, l := range f.labels {
+			names[i] = closureDisplayName(l)
+		}
+		sort.Strings(names)
+		return apierror.InvalidValue(f.name, *f.value, "closure state", names)
+	}
+	return nil
+}
+
+// closureDisplayName renders an enum label the way reads return it:
+// PENDING_NOTIFIED -> "Pending Notified".
+func closureDisplayName(label string) string {
+	words := strings.Split(strings.ToLower(label), "_")
+	for i, w := range words {
+		words[i] = strings.ToUpper(w[:1]) + w[1:]
+	}
+	return strings.Join(words, " ")
 }
 
 // projectTypeNameToSubscriptionType converts a project_type.name label (e.g.

@@ -60,7 +60,7 @@ func (s *salesforceEventService) handleProjectContactEvent(ctx context.Context, 
 	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
 		return s.ingestMembership(ctx, req.ReferenceID, req.EventType, nil)
 	case domain.SalesforceEventDeleted:
-		found, err := s.membership.Memberships.DeactivateBySfID(ctx, req.ReferenceID)
+		found, err := s.membership.Memberships.DeactivateBySfID(ctx, req.ReferenceID, s.adminRoleBasis)
 		if err != nil {
 			return err
 		}
@@ -75,12 +75,14 @@ func (s *salesforceEventService) handleProjectContactEvent(ctx context.Context, 
 	}
 }
 
-// handleContactEvent is the Contact branch of HandleEvent: an UPDATED contact
-// (name, email, isCsAdmin, isCsIntegrationUser changed) re-runs the
-// membership upsert for each of its memberships so the user row and its
-// roles follow. CREATED is a no-op (a bare contact has no membership yet,
-// the Project_Contact__c event will follow) and so is DELETED (Salesforce
-// deletes the memberships too, each with its own event).
+// handleContactEvent is the Contact branch of HandleEvent. CREATED, UPDATED
+// and RESTORED run the Contact writer (salesforce_contact_ingest.go), which
+// writes the contact's "user" and account_contact rows whether or not it has
+// a membership, and then re-run the membership upsert for each of its
+// memberships so project_contact and the groups follow. DELETED deactivates
+// the contact's rows without fetching it (Salesforce hides deleted records
+// from reads); its memberships are deleted in Salesforce too, each with its
+// own event.
 func (s *salesforceEventService) handleContactEvent(ctx context.Context, req domain.SalesforceEventRequest) error {
 	if !s.membership.enabled() {
 		slog.InfoContext(ctx, "salesforce: membership ingest disabled, ignoring contact event",
@@ -88,38 +90,30 @@ func (s *salesforceEventService) handleContactEvent(ctx context.Context, req dom
 		return nil
 	}
 	slog.InfoContext(ctx, "salesforce: contact event", "eventType", req.EventType, "entity", req.Entity, "referenceId", req.ReferenceID)
-	if req.EventType != domain.SalesforceEventUpdated {
-		return nil
-	}
 
-	contact, err := s.membership.SalesEntity.GetContact(ctx, req.ReferenceID)
-	if err != nil {
-		return err
+	switch req.EventType {
+	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
+		return s.ingestContact(ctx, req.ReferenceID, req.EventType)
+	case domain.SalesforceEventDeleted:
+		return s.deactivateContact(ctx, req.ReferenceID)
+	case domain.SalesforceEventUndefined:
+		return &apierror.ValidationError{Msg: "eventType UNDEFINED is not supported"}
+	default:
+		return &apierror.ValidationError{Msg: "eventType must be CREATED, UPDATED, DELETED, RESTORED, or UNDEFINED"}
 	}
-	var firstErr error
-	for _, m := range contact.Memberships {
-		id := strings.TrimSpace(derefString(m.ID))
-		if id == "" {
-			continue
-		}
-		if err := s.ingestMembership(ctx, id, req.EventType, contact.LastModifiedDate); err != nil {
-			slog.ErrorContext(ctx, "salesforce: contact update: membership upsert failed", "contactSfId", req.ReferenceID, "membershipSfId", id, "err", err)
-			if firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-	return firstErr
 }
 
 // ingestMembership fetches one Project_Contact__c (and its Contact) from
 // sales-entity-service and writes it to Postgres. It is idempotent: the
 // repository resolves every row by natural key, and a replay whose
 // LastModifiedDate is not newer than the recorded DATABASE step is skipped.
-// contactModified is the Contact's LastModifiedDate when a Contact event
-// drives the upsert (nil otherwise): a contact edit does not touch the
-// membership's LastModifiedDate, so the guard compares the later of the two.
-func (s *salesforceEventService) ingestMembership(ctx context.Context, membershipSfID, eventType string, contactModified *string) error {
+//
+// known is the Contact when a Contact event drives the upsert (nil
+// otherwise). It is used instead of a second fetch when it is the
+// membership's own contact, and its LastModifiedDate joins the guard: a
+// contact edit does not touch the membership's LastModifiedDate, so the
+// guard compares the later of the two.
+func (s *salesforceEventService) ingestMembership(ctx context.Context, membershipSfID, eventType string, known *salesentity.Contact) error {
 	pc, err := s.membership.SalesEntity.GetProjectContact(ctx, membershipSfID)
 	if err != nil {
 		return err
@@ -131,6 +125,19 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		return &apierror.ServiceUnavailableError{Msg: "sales/sales-entity-service project contact " + membershipSfID + " has no linked project"}
 	}
 	contactSfID := strings.TrimSpace(derefString(pc.Contact.ID))
+	// A partner contact's membership refreshes the project account's partner
+	// links on every exit, duplicate or not (salesforce_partner_ingest.go).
+	defer s.refreshPartnersForMembership(ctx, membershipSfID, pc)
+	if known != nil && !strings.EqualFold(strings.TrimSpace(derefString(known.ID)), contactSfID) {
+		// Not this membership's contact as spelled here (a 15/18-character
+		// Id pair, or Salesforce moved it between the two reads): read the
+		// one the membership names rather than guess.
+		known = nil
+	}
+	var contactModified *string
+	if known != nil {
+		contactModified = known.LastModifiedDate
+	}
 
 	// Duplicate-event guard. Salesforce emits several UPDATED events per save
 	// and the portal replays the envelope after its own write, so the same
@@ -163,9 +170,14 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		}
 	}
 
-	contact, err := s.membership.SalesEntity.GetContact(ctx, contactSfID)
-	if err != nil {
-		return err
+	var contact salesentity.Contact
+	if known != nil {
+		contact = *known
+	} else {
+		contact, err = s.membership.SalesEntity.GetContact(ctx, contactSfID)
+		if err != nil {
+			return err
+		}
 	}
 
 	in, ignored, err := buildMembershipUpsert(pc, contact)
@@ -173,7 +185,16 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		return err
 	}
 	if len(ignored) > 0 {
-		slog.WarnContext(ctx, "salesforce: project contact carries roles the ingest does not map", "membershipSfId", membershipSfID, "ignoredRoles", ignored)
+		// One line per membership. The six labels with no CSM group are
+		// dropped by decision (D2); anything else is a vocabulary gap.
+		byDecision, unknown := splitIgnoredRoles(ignored)
+		if len(unknown) > 0 {
+			slog.WarnContext(ctx, "salesforce: project contact carries roles the ingest does not map",
+				"membershipSfId", membershipSfID, "unknownRoles", unknown, "ignoredRoles", byDecision)
+		} else {
+			slog.InfoContext(ctx, "salesforce: project contact carries roles CSM does not store",
+				"membershipSfId", membershipSfID, "ignoredRoles", byDecision)
+		}
 	}
 
 	step := domain.UpsertOnboardingStepRequest{
@@ -187,6 +208,9 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		UpdatedBy:       domain.SalesforceSyncActor,
 	}
 	res, err := s.membership.Memberships.Upsert(ctx, in, step)
+	if err != nil && s.ensureMissingProjectForMembership(ctx, err, membershipSfID, in.ProjectSfID) {
+		res, err = s.membership.Memberships.Upsert(ctx, in, step)
+	}
 	if err != nil {
 		s.recordDatabaseStepFailed(ctx, step, err)
 		return err
@@ -213,17 +237,75 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 	// the person would never be told — the previous state is what tells
 	// that apart from our own write returning. A genuinely
 	// Salesforce-originated first invitation (or the historical backfill)
-	// still creates the row and still publishes. The state check stays: an
-	// event that lands on REGISTERED or DEACTIVATED is not an invitation.
+	// still creates the row and still publishes. A membership that lands
+	// REGISTERED publishes only when it is new (see addedAsRegistered).
 	invited := in.State == domain.MembershipStateInvited || in.State == domain.MembershipStateReInvited
 	movedIntoInvited := res.CreatedProjectContact || !strings.EqualFold(res.PreviousState, in.State)
-	if invited && movedIntoInvited {
+	if (invited && movedIntoInvited) || addedAsRegistered(in.State, eventType, res, pc.CreatedDate) {
 		s.publishProjectContactInvited(ctx, in, pc, eventModifiedOn, hasModified)
 	} else if invited {
 		slog.InfoContext(ctx, "salesforce: membership already in this state, not re-publishing project_contact.invited",
 			"membershipSfId", membershipSfID, "state", in.State)
 	}
+	// Welcome only on INVITED/RE-INVITED -> REGISTERED: echoes, replays and
+	// backfilled rows (created already REGISTERED) stay silent.
+	if strings.EqualFold(in.State, domain.MembershipStateRegistered) && !res.CreatedProjectContact && wasInvitedState(res.PreviousState) {
+		s.publishProjectContactRegistered(ctx, in, pc, eventModifiedOn, hasModified)
+	}
 	return nil
+}
+
+// newMembershipWindow bounds how old a Salesforce record created REGISTERED
+// may be and still count as a new membership rather than a backfill.
+const newMembershipWindow = 24 * time.Hour
+
+// addedAsRegistered reports a NEW membership that Salesforce saved REGISTERED
+// because the contact is already unlocked (has signed in before).
+func addedAsRegistered(state, eventType string, res domain.SalesforceMembershipUpsertResult, createdDate *string) bool {
+	if !strings.EqualFold(state, domain.MembershipStateRegistered) || eventType == domain.SalesforceEventRestored {
+		return false
+	}
+	if !res.CreatedProjectContact {
+		return strings.EqualFold(res.PreviousState, domain.MembershipStateDeactivated)
+	}
+	created, ok := parseSalesforceLastModified(createdDate)
+	return ok && time.Since(created) < newMembershipWindow
+}
+
+func wasInvitedState(state string) bool {
+	return strings.EqualFold(state, domain.MembershipStateInvited) || strings.EqualFold(state, domain.MembershipStateReInvited)
+}
+
+// publishProjectContactRegistered emits project_contact.registered for the
+// Welcome email. Failures are logged, like publishProjectContactInvited.
+func (s *salesforceEventService) publishProjectContactRegistered(ctx context.Context, in domain.SalesforceMembershipUpsert, pc salesentity.ProjectContact, eventModifiedOn time.Time, hasModified bool) {
+	if s.membership.Publisher == nil {
+		return
+	}
+	modifiedOn := ""
+	if hasModified {
+		modifiedOn = eventModifiedOn.UTC().Format(time.RFC3339Nano)
+	}
+	payload, err := json.Marshal(events.ProjectContactRegisteredPayload{
+		MembershipSfID:    in.MembershipSfID,
+		ContactSfID:       in.ContactSfID,
+		Email:             in.Email,
+		GivenName:         in.ContactFirstName,
+		FamilyName:        in.ContactLastName,
+		ProjectName:       strings.TrimSpace(derefString(pc.Subscription.Name)),
+		ProjectKey:        in.ProjectKey,
+		IsIntegrationUser: in.IsCsIntegrationUser,
+		EventModifiedOn:   modifiedOn,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "salesforce: encode project_contact.registered payload", "membershipSfId", in.MembershipSfID, "err", err)
+		return
+	}
+	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), publishInvitedTimeout)
+	defer cancel()
+	if err := s.membership.Publisher.Publish(pubCtx, events.TypeProjectContactRegistered, in.MembershipSfID, payload); err != nil {
+		slog.ErrorContext(ctx, "salesforce: publish project_contact.registered", "membershipSfId", in.MembershipSfID, "err", err)
+	}
 }
 
 // recordDatabaseStepFailed writes DATABASE=FAILED best-effort so the
@@ -284,8 +366,9 @@ func (s *salesforceEventService) publishProjectContactInvited(ctx context.Contex
 }
 
 // buildMembershipUpsert translates the two sales-entity-service records into
-// the repository's write request, applying the §6.4 role mapping. ignored
-// lists Salesforce roles that map to nothing.
+// the repository's write request, applying the role mapping: project groups
+// from the membership's roles, global roles from the contact's account
+// classification. ignored lists Salesforce roles that map to nothing.
 func buildMembershipUpsert(pc salesentity.ProjectContact, contact salesentity.Contact) (domain.SalesforceMembershipUpsert, []string, error) {
 	state, err := normalizeMembershipState(derefString(pc.State))
 	if err != nil {
@@ -315,7 +398,10 @@ func buildMembershipUpsert(pc salesentity.ProjectContact, contact salesentity.Co
 	isIntegration := contact.IsCsIntegrationUser != nil && *contact.IsCsIntegrationUser
 	membershipType := strings.TrimSpace(derefString(pc.Type))
 
-	globalRoles, managed, adminRole := mapGlobalRoles(membershipType, isIntegration)
+	// customer/partner (and which admin role applies) follow the contact's
+	// account classification, the same basis the Contact writer uses, not
+	// the membership type.
+	globalRoles := mapGlobalRoles(contact.Account, isIntegration)
 	groups, ignored := mapProjectGroups(roles)
 
 	name := strings.TrimSpace(derefString(contact.Name))
@@ -345,11 +431,13 @@ func buildMembershipUpsert(pc salesentity.ProjectContact, contact salesentity.Co
 		ContactAccountSfID:  accountSfID,
 		IsCsAdmin:           isCsAdmin,
 		IsCsIntegrationUser: isIntegration,
+		IsPrimaryContact:    contact.IsPrimaryContact,
 		ProjectSfID:         strings.TrimSpace(derefString(pc.Subscription.ID)),
 		ProjectKey:          strings.TrimSpace(derefString(pc.Subscription.Key)),
-		GlobalRoles:         globalRoles,
-		ManagedAdminRoles:   managed,
-		AdminRoleName:       adminRole,
+		GlobalRoles:         globalRoles.Grant,
+		ManagedGlobalRoles:  globalRoles.ManagedGlobal,
+		ManagedAdminRoles:   globalRoles.ManagedAdmin,
+		AdminRoleName:       globalRoles.AdminRole,
 		ProjectGroups:       groups,
 	}, ignored, nil
 }

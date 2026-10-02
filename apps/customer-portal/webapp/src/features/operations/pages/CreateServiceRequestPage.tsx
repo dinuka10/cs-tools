@@ -53,6 +53,7 @@ import {
   isDateTimeField,
 } from "@features/operations/utils/serviceRequestValidation";
 import { datetimeLocalWallTimeToUtcMs } from "@features/support/utils/support";
+import { isRegisteredContact } from "@features/support/utils/watchList";
 import { resolveDisplayTimeZone } from "@utils/dateTime";
 import useGetUserDetails from "@features/settings/api/useGetUserDetails";
 import useGetProjectContacts from "@features/settings/api/useGetProjectContacts";
@@ -343,7 +344,7 @@ export default function CreateServiceRequestPage(): JSX.Element {
   const { data: contactsData, isLoading: isContactsLoading, isError: isContactsError } = useGetProjectContacts(projectId || "");
   const contactOptions = useMemo(
     () =>
-      (contactsData ?? []).map((c) => ({
+      (contactsData ?? []).filter(isRegisteredContact).map((c) => ({
         label: `${c.firstName} ${c.lastName}`.trim() || c.email,
         value: c.email,
       })),

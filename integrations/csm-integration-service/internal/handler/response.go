@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strings"
 
 	"github.com/wso2-open-operations/cs-tools/operations/csm-integration-service/internal/apierror"
 )
@@ -77,7 +78,7 @@ func mapUpstreamError(w http.ResponseWriter, err error, fallbackMsg string) {
 		case http.StatusNotFound:
 			writeError(w, http.StatusNotFound, ErrMsgNotFound)
 		case http.StatusBadRequest:
-			writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+			writeError(w, http.StatusBadRequest, upstreamBadRequestMessage(apiErr.Body))
 		case http.StatusConflict, http.StatusUnprocessableEntity:
 			writeError(w, apiErr.StatusCode, fallbackMsg)
 		case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
@@ -88,6 +89,26 @@ func mapUpstreamError(w http.ResponseWriter, err error, fallbackMsg string) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, fallbackMsg)
+}
+
+// maxPassThroughMsgLen caps a passed-through upstream 400 message.
+const maxPassThroughMsgLen = 1024
+
+// internalDetailRe matches database or driver detail that must never reach a caller.
+var internalDetailRe = regexp.MustCompile(`(?i)key \(|table "|violates|constraint|sqlstate|\bpgx?\b|\bpq:|\bsql\b|character varying|invalid input syntax`)
+
+// upstreamBadRequestMessage returns entity-service's 400 message, which is written
+// for clients, or ErrMsgBadRequest when it is missing, oversized or looks internal.
+func upstreamBadRequestMessage(body string) string {
+	var env errorBody
+	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		return ErrMsgBadRequest
+	}
+	msg := strings.TrimSpace(env.Message)
+	if msg == "" || len(msg) > maxPassThroughMsgLen || strings.ContainsAny(msg, "\r\n\t") || internalDetailRe.MatchString(msg) {
+		return ErrMsgBadRequest
+	}
+	return msg
 }
 
 // summarizeErr returns a short, log-safe description of err: the upstream status

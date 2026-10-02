@@ -9,7 +9,7 @@ alerts-core's own tables (`alert_cursor`, `incidents_*`, `processor_lease`).
 ```
 vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids → insert + read back) ──▶ alerts
                                            │                                               ▲
-                                           └── POST /alert (wake-up) ──▶ alerts-core ──reads┘
+                                           └── POST /alertz (wake-up) ──▶ alerts-core ──reads┘
 ```
 
 ## What it does
@@ -28,10 +28,16 @@ vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids →
   After the deadline, or `store.insert_attempts` other failures, a `VOID: <reason>` filler row is
   written under the same id so alerts-core skips it immediately instead of waiting its gap
   timeout, and a DB-failure Chat card is posted.
+- **AWS SNS subscriptions**: when an SNS topic subscribes the AWS URL, SNS first sends a
+  `SubscriptionConfirmation`. The service confirms it (fetching its `SubscribeURL`, only from
+  `sns.<region>.amazonaws.com`), emails the team named by `?team=` on the URL (default `Default`,
+  from `AWS_SNS_SUBSCRIPTION_NOTIFICATION_CONFIG`), and answers `200` without storing an alert,
+  as the ServiceNow AWS Alert API did. With no email configured and a failed confirmation it
+  logs a CRITICAL error.
 - **Memory**: everything accepted but not finished is capped at `allocator.queue_max_bytes`; past
   it, new webhooks get `503` at once.
 - **Response**: `201` only after every alert in the request has been written and read back.
-- **Wake-up**: one `POST /alert` to alerts-core per written batch. Calls are coalesced so at most
+- **Wake-up**: one `POST /alertz` to alerts-core per written batch. Calls are coalesced so at most
   one is in flight. If it fails, alerts-core's own 10-second poll still picks the rows up.
 - **Chat cards** (Google Chat, cardsV2): a *rejected webhook* card (at most one per vendor + error
   class, and 10 in total, per `reject.window`) and a *DB failure* card (at most `fallback.cards_per_minute`, then one
@@ -48,6 +54,16 @@ vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids →
 
 Vendors: `aws`, `azure`, `datadog`, `elasticsearch`, `gcp`, `icinga`, `openobserve`,
 `opensearch`, `prometheus`, `site24x7`.
+
+`servicenow` is temporary, for the parallel run: ServiceNow forwards the alerts it has already
+transformed, so the body is the canonical alert itself (one object, or an array), with no mapping
+or defaults applied. The original vendor stays in `source`. Remove the route once the vendors
+point here directly.
+
+```json
+{"service":"svc","metric_name":"HighCPU","severity":"Critical","category":"cat",
+ "environment":"production","source":"AWS","unique_identifier":"id-1","description":"..."}
+```
 
 Responses:
 
@@ -104,8 +120,13 @@ docker run --rm -p 8080:8080 --env-file .env \
 | `CASSANDRA_KEY` | yes | Cosmos DB primary or secondary key (secret) |
 | `CASSANDRA_USERNAME` | no | Defaults to the account name (first DNS label of the contact point) |
 | `CASSANDRA_PORT` | no | Default `10350` |
-| `ALERT_CORE_WAKE_URL` | no | alerts-core's `POST /alert` URL. Empty: no wake-up, alerts-core's poll still works |
+| `AUTH_ENABLED` | no | `true` checks every vendor webhook against alerts-core's `integration_users` table, sent as `curl -u user:secret` or `Authorization: Bearer base64("user:secret")`; anything else gets `401`. Default `false`: every request is accepted |
+| `AUTH_AUDIT_ONLY` | no | With `AUTH_ENABLED=true`: check credentials and log `auth would reject request`, but reject nothing. The rollout step, so vendors can be given credentials one at a time without dropping alerts. Default `false` |
+| `ALERT_CORE_WAKE_URL` | no | alerts-core's `POST /alertz` URL. Empty: no wake-up, alerts-core's poll still works |
+| `ALERT_CORE_WAKE_USERNAME`, `ALERT_CORE_WAKE_SECRET` | no | An `integration_users` credential for the wake call, sent as `Bearer base64("<user>:<secret>")` and only over https. Provision with alerts-core's `cmd/user`. The secret is a secret |
 | `FALLBACK_CHAT_WEBHOOK_URLS` | no | Comma-separated Google Chat webhook URLs (secret). Empty: no cards, only logs |
+| `AWS_SNS_SUBSCRIPTION_NOTIFICATION_CONFIG` | no | `{"teams":{"<team>":"<email>","Default":"<email>"}}`: who is emailed about SNS subscription confirmations, by the AWS URL's `?team=` |
+| `EMAIL_BASE_URL`, `EMAIL_TOKEN_URL`, `EMAIL_CLIENT_ID`, `EMAIL_CLIENT_SECRET`, `EMAIL_FROM_ADDRESS` | no | WSO2 email notification service (OAuth2 client credentials) for those emails. `EMAIL_CLIENT_SECRET` is a secret. Empty `EMAIL_BASE_URL` disables email |
 | `<VENDOR>_ALERT_CONFIG` | no* | Per-vendor JSON overrides, same keys and shapes as the ServiceNow Edge API alert-config properties, e.g. `DATADOG_ALERT_CONFIG` |
 | `CONFIG_PATH` | no | Path to `config.toml`. Default `./config.toml`; a missing file means built-in defaults |
 | `PORT` | no | Default `8080` |
@@ -129,7 +150,6 @@ default and a comment. The main knobs:
 | `server.write_timeout` | `30s` | Connection write limit; must be at least 1s above `request_wait` |
 | `server.idle_timeout` | `60s` | Idle keep-alive connections are closed after this |
 | `server.max_body_bytes` | `1048576` | Larger bodies get `413` |
-| `auth.mode` | `none` | Hook for vendor authentication; only `none` exists today |
 | `allocator.queue_size` | `5000` | Queued submissions per replica before `503` |
 | `allocator.queue_max_bytes` | `268435456` | Memory cap (256 MiB) on accepted, unfinished alerts before `503`; about half the container memory limit |
 | `allocator.max_batch` | `200` | Most ids claimed in one compare-and-set |
@@ -195,7 +215,7 @@ curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STAT
    - `healthz`, Public; use `/healthz` as the readiness probe.
    - `livez`, Project; use `/livez` as the liveness probe.
 3. **Environment variables**: set everything from [Environment variables](#environment-variables).
-   Mark `CASSANDRA_KEY` and `FALLBACK_CHAT_WEBHOOK_URLS` as secrets.
+   Mark `CASSANDRA_KEY`, `FALLBACK_CHAT_WEBHOOK_URLS` and `EMAIL_CLIENT_SECRET` as secrets.
 4. **config.toml file mount**: to change any default, add a *file mount* under
    Configs & Secrets with mount path `/etc/sre-alert-ingestion-service/config.toml` and the contents
    of your edited `config.toml.example`, then set
@@ -204,7 +224,7 @@ curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STAT
    defaults.
 5. **Connecting to alerts-core**: add a connection from this component to the
    `sre-alert-core-service` component's endpoint (Project visibility is enough) and set
-   `ALERT_CORE_WAKE_URL` to that endpoint's URL plus `/alert`. Both components must use the same
+   `ALERT_CORE_WAKE_URL` to that endpoint's URL plus `/alertz`. Both components must use the same
    `CASSANDRA_*` values: this service writes the `alerts` rows that alerts-core reads.
 6. **Replicas**: any number. Ids stay unique across replicas because every claim is a
    compare-and-set on `alert_seq`.

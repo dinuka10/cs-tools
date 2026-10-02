@@ -15,8 +15,9 @@
 // under the License.
 
 import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
+import { clearUserPreferredTimeZone, setUserPreferredTimeZone } from "@utils/dateTime";
 import type {
   CloneChangeRequestNavState,
   CreateChangeRequestFromIncidentNavState,
@@ -105,7 +106,12 @@ vi.mock("@components/rich-text-editor/Editor", () => ({
 
 // Imported after the mocks above so the module picks them up.
 import CreateChangeRequestPage from "@features/csm-operations/pages/CreateChangeRequestPage";
-import { encodeParentRecordValue } from "@features/csm-operations/utils/changeRequests";
+import {
+  changeRequestDraftKey,
+  encodeParentRecordValue,
+  saveChangeRequestDraft,
+  type ChangeRequestDraft,
+} from "@features/csm-operations/utils/changeRequests";
 
 /**
  * Fill the one field the form requires, so a test can reach the submit path
@@ -163,10 +169,10 @@ describe("CreateChangeRequestPage — Clone prefill", () => {
     expect(screen.getByText(/cloned from an existing change request/i)).toBeInTheDocument();
   });
 
-  it("always resets state to 'new' regardless of the clone source", () => {
+  it("never offers a state picker, even when cloning -- every change request starts at New", () => {
     locationState = { subject: "Upgrade the gateway cluster" };
     render(<CreateChangeRequestPage />);
-    expect(screen.getByText("New")).toBeInTheDocument();
+    expect(screen.queryByText("State")).not.toBeInTheDocument();
   });
 
   it("leaves the planned start/end schedule empty even when cloning", () => {
@@ -609,5 +615,115 @@ describe("CreateChangeRequestPage — in-progress draft survives navigating away
 
     render(<CreateChangeRequestPage />);
     expect(screen.getByLabelText(/subject/i)).toHaveValue("Original subject");
+  });
+});
+
+describe("CreateChangeRequestPage — planned dates are sent as UTC", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    navigateMock.mockReset();
+    postChangeRequestMutateMock.mockReset();
+    patchChangeRequestMutateMock.mockReset();
+    showErrorMock.mockReset();
+    locationState = undefined;
+  });
+
+  afterEach(() => {
+    clearUserPreferredTimeZone();
+  });
+
+  it("converts the picker's wall-clock values from the user's time zone to UTC", () => {
+    // Asia/Colombo is UTC+05:30 with no daylight saving.
+    setUserPreferredTimeZone("Asia/Colombo");
+    const draft: ChangeRequestDraft = {
+      subject: "Roll out fix to production",
+      type: "normal",
+      impact: "low",
+      priority: "",
+      plannedStartDate: "2030-03-01T15:30",
+      plannedEndDate: "2030-03-01T17:30",
+      description: "",
+      justification: "",
+      implementationPlan: "",
+      riskImpactAnalysis: "",
+      backoutPlan: "",
+      testPlan: "",
+      isPlanningVisibleToCustomers: false,
+      groupId: "",
+      assignedEngineerId: "",
+      requestedById: "",
+      parentValue: "",
+    };
+    saveChangeRequestDraft(changeRequestDraftKey({ kind: "new" }), draft);
+
+    render(<CreateChangeRequestPage />);
+    fireEvent.click(screen.getByRole("button", { name: /create change request/i }));
+
+    const [payload] = postChangeRequestMutateMock.mock.calls[0];
+    expect(payload.plannedStartDate).toBe("2030-03-01 10:00:00");
+    expect(payload.plannedEndDate).toBe("2030-03-01 12:00:00");
+  });
+});
+
+describe("CreateChangeRequestPage — the 'in the past' hint follows the profile time zone", () => {
+  const PAST_HINT = /this date is in the past/i;
+
+  function seedDraft(plannedStartDate: string, plannedEndDate: string): void {
+    saveChangeRequestDraft(changeRequestDraftKey({ kind: "new" }), {
+      subject: "Roll out fix to production",
+      type: "normal",
+      impact: "low",
+      priority: "",
+      plannedStartDate,
+      plannedEndDate,
+      description: "",
+      justification: "",
+      implementationPlan: "",
+      riskImpactAnalysis: "",
+      backoutPlan: "",
+      testPlan: "",
+      isPlanningVisibleToCustomers: false,
+      groupId: "",
+      assignedEngineerId: "",
+      requestedById: "",
+      parentValue: "",
+    });
+  }
+
+  beforeAll(() => {
+    // Pin the browser zone so it differs from the profile zone under test.
+    vi.stubEnv("TZ", "UTC");
+  });
+
+  afterAll(() => {
+    vi.unstubAllEnvs();
+  });
+
+  beforeEach(() => {
+    sessionStorage.clear();
+    locationState = undefined;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2030-03-01T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    clearUserPreferredTimeZone();
+  });
+
+  it("warns when the value is past in the profile zone but would look future in the browser zone", () => {
+    setUserPreferredTimeZone("Asia/Colombo");
+    // 15:30 Colombo is 10:00Z (past); as browser (UTC) digits it is 15:30Z (future).
+    seedDraft("2030-03-01T15:30", "2030-03-01T15:30");
+    render(<CreateChangeRequestPage />);
+    expect(screen.getAllByText(PAST_HINT)).toHaveLength(2);
+  });
+
+  it("does not warn when the value is future in the profile zone but would look past in the browser zone", () => {
+    setUserPreferredTimeZone("America/Los_Angeles");
+    // 08:00 Los Angeles is 16:00Z (future); as browser (UTC) digits it is 08:00Z (past).
+    seedDraft("2030-03-01T08:00", "2030-03-01T09:00");
+    render(<CreateChangeRequestPage />);
+    expect(screen.queryByText(PAST_HINT)).not.toBeInTheDocument();
   });
 });

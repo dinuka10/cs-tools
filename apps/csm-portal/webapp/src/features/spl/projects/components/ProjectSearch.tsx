@@ -27,13 +27,13 @@ import {
 } from "@wso2/oxygen-ui";
 import { SearchIcon } from "@wso2/oxygen-ui-icons-react";
 import { useNavigate } from "react-router";
-import { useSearchProjects } from "../api/useSplProjectsApi";
+import { useSearchSplProjects } from "../api/useProjectsApi";
 
 export default function ProjectSearch({ setShowTable }: { setShowTable: (value: boolean) => void }) {
   const [inputValue, setInputValue] = useState("");
   const navigate = useNavigate();
   const enabled = inputValue.length >= 4;
-  const { data: results } = useSearchProjects({ phrase: inputValue, offset: 0, limit: 10, enabled });
+  const { data: results } = useSearchSplProjects({ phrase: inputValue, offset: 0, limit: 10, enabled });
 
   const handleChange = (value: string) => {
     setInputValue(value);

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -54,10 +55,14 @@ type snProjectClosureFields struct {
 }
 
 type snProject struct {
-	ID        string                  `json:"id"`
-	Name      string                  `json:"name"`
-	Key       string                  `json:"key"`
-	Type      snProjectType           `json:"type"`
+	ID   string        `json:"id"`
+	Name string        `json:"name"`
+	Key  string        `json:"key"`
+	Type snProjectType `json:"type"`
+	// SfID is the project's Salesforce id, nil when not recorded for this
+	// project. Sourced by a secondary lookup on the entity-service side; not
+	// every project search response carries it yet.
+	SfID      *string                 `json:"sfId"`
 	StartDate *string                 `json:"startDate"`
 	EndDate   string                  `json:"endDate"`
 	CreatedOn string                  `json:"createdOn"`
@@ -404,6 +409,7 @@ func (s *snProjectService) fetchProjectsPage(ctx context.Context, req domain.Sea
 			ID:               sysidToUUID(p.ID),
 			Name:             p.Name,
 			Key:              p.Key,
+			SfID:             p.SfID,
 			SubscriptionType: subType,
 			StartDate:        startDate,
 			EndDate:          endDate,
@@ -724,6 +730,19 @@ var validClosureStatuses = map[string]struct{}{
 	"Restricted": {},
 }
 
+// closureStatusNames lists validClosureStatuses for error messages.
+var closureStatusNames = []string{"Open", "Restricted", "Suspended"}
+
+// subscriptionTypeNames lists validSubscriptionTypes, sorted, for error messages.
+func subscriptionTypeNames() []string {
+	out := make([]string, 0, len(validSubscriptionTypes))
+	for t := range validSubscriptionTypes {
+		out = append(out, string(t))
+	}
+	sort.Strings(out)
+	return out
+}
+
 // validSortOrders is the set of accepted SortOrder values.
 var validSortOrders = map[string]struct{}{
 	"":     {}, // unset defaults to the service's own default ordering
@@ -736,33 +755,33 @@ var validSortOrders = map[string]struct{}{
 func validateProjectSearchFilters(req domain.SearchProjectsRequest) error {
 	if req.ClosureStatus != "" {
 		if _, ok := validClosureStatuses[req.ClosureStatus]; !ok {
-			return &apierror.ValidationError{Msg: "closureStatus must be one of: Open, Suspended, Restricted"}
+			return apierror.InvalidValue("closureStatus", req.ClosureStatus, "closure state", closureStatusNames)
 		}
 	}
 	if req.SortBy != "" && req.SortBy != "endDate" {
-		return &apierror.ValidationError{Msg: `sortBy must be "endDate" if provided`}
+		return apierror.InvalidValue("sortBy", req.SortBy, "sort field", []string{"endDate"})
 	}
 	if _, ok := validSortOrders[req.SortOrder]; !ok {
-		return &apierror.ValidationError{Msg: `sortOrder must be "asc" or "desc" if provided`}
+		return apierror.InvalidValue("sortOrder", req.SortOrder, "sort order", []string{"asc", "desc"})
 	}
 	if req.EndDateFrom != "" {
 		if _, err := time.Parse(snDateLayout, req.EndDateFrom); err != nil {
-			return &apierror.ValidationError{Msg: "endDateFrom must be a valid date (yyyy-MM-dd)"}
+			return apierror.InvalidValue("endDateFrom", req.EndDateFrom, "date", []string{"yyyy-MM-dd"})
 		}
 	}
 	if req.EndDateTo != "" {
 		if _, err := time.Parse(snDateLayout, req.EndDateTo); err != nil {
-			return &apierror.ValidationError{Msg: "endDateTo must be a valid date (yyyy-MM-dd)"}
+			return apierror.InvalidValue("endDateTo", req.EndDateTo, "date", []string{"yyyy-MM-dd"})
 		}
 	}
 	for _, s := range req.ExcludeClosureStates {
 		if _, ok := validClosureStatuses[s]; !ok {
-			return &apierror.ValidationError{Msg: "excludeClosureStates must each be one of: Open, Suspended, Restricted"}
+			return apierror.InvalidValue("excludeClosureStates", s, "closure state", closureStatusNames)
 		}
 	}
 	for _, t := range req.ExcludeSubscriptionTypes {
 		if _, ok := validSubscriptionTypes[t]; !ok {
-			return &apierror.ValidationError{Msg: "excludeSubscriptionTypes contains invalid value: " + string(t)}
+			return apierror.InvalidValue("excludeSubscriptionTypes", string(t), "subscription type", subscriptionTypeNames())
 		}
 	}
 	for _, k := range req.ExcludeProjectKeys {

@@ -29,6 +29,18 @@
 -- Asia/Kolkata, and schedule_span.start_on/end_on below are wall-clock times IN
 -- THIS ZONE rather than instants. The zone lives here, once per schedule,
 -- exactly as it does upstream.
+-- Wrapped in a transaction deliberately. `make migrate` runs each file with
+-- `psql -f`, not `--single-transaction`, so every statement would otherwise
+-- commit on its own. For a file that drops and recreates a trigger that means
+-- a window where the table has no trigger at all, and a write landing in it
+-- produces no outbox row and no notice -- silently, with nothing to retry.
+--
+-- Postgres makes DDL transactional, so the swap becomes one step: a concurrent
+-- write waits for the lock instead of slipping through the gap. It also makes
+-- the whole migration all-or-nothing, rather than half-applied and unrecorded
+-- in csm_migration_applied_migration if a later statement fails.
+BEGIN;
+
 CREATE TABLE IF NOT EXISTS schedule (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,
@@ -67,6 +79,15 @@ CREATE TABLE IF NOT EXISTS user_schedule (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,
     updated_on TIMESTAMPTZ NOT NULL,
+    -- Nullable, unlike most tables here (21 NOT NULL vs 7 nullable, "user"
+    -- itself among the latter). sys_created_by/sys_updated_by are inherited
+    -- columns on these platform tables and were NOT confirmed populated during
+    -- discovery -- the dictionary query that shaped this migration only returns
+    -- columns declared on the table itself. NOT NULL here would fail the whole
+    -- row for metadata the upsert never reads, so it buys nothing and risks the
+    -- load. created_on/updated_on stay NOT NULL: the merge predicate
+    -- (EXCLUDED.updated_on >= t.updated_on) compares them, and a NULL there
+    -- would make the row never update.
     created_by VARCHAR(255),
     updated_by VARCHAR(255),
     user_id UUID NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
@@ -85,6 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_user_schedule_schedule_id ON user_schedule (sched
 -- 23:59:59 of a LOCAL day. A TIMESTAMPTZ column would label those digits UTC
 -- and shift every span by the zone offset -- enough to move a whole-day span
 -- onto the neighbouring day, which is exactly what the rotation lookup keys on.
+-- See the schedule_date_time transform in internal/transform.
 --
 -- NO RECURRENCE COLUMNS, on evidence rather than simplification: repeat_type is
 -- empty on all 891 rotation/leave spans upstream, which makes days_of_week /
@@ -100,6 +122,15 @@ CREATE TABLE IF NOT EXISTS schedule_span (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,
     updated_on TIMESTAMPTZ NOT NULL,
+    -- Nullable, unlike most tables here (21 NOT NULL vs 7 nullable, "user"
+    -- itself among the latter). sys_created_by/sys_updated_by are inherited
+    -- columns on these platform tables and were NOT confirmed populated during
+    -- discovery -- the dictionary query that shaped this migration only returns
+    -- columns declared on the table itself. NOT NULL here would fail the whole
+    -- row for metadata the upsert never reads, so it buys nothing and risks the
+    -- load. created_on/updated_on stay NOT NULL: the merge predicate
+    -- (EXCLUDED.updated_on >= t.updated_on) compares them, and a NULL there
+    -- would make the row never update.
     created_by VARCHAR(255),
     updated_by VARCHAR(255),
     schedule_id UUID NOT NULL REFERENCES schedule(id) ON DELETE CASCADE,
@@ -118,3 +149,5 @@ CREATE TABLE IF NOT EXISTS schedule_span (
 CREATE INDEX IF NOT EXISTS idx_schedule_span_type_window ON schedule_span (span_type, start_on, end_on);
 CREATE INDEX IF NOT EXISTS idx_schedule_span_schedule_id ON schedule_span (schedule_id);
 CREATE INDEX IF NOT EXISTS idx_schedule_span_user_id ON schedule_span (user_id);
+
+COMMIT;

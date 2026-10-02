@@ -66,7 +66,7 @@ describe("top-level nav order", () => {
   });
 
   it("keeps the remaining sections in their existing relative order", () => {
-    expect(ids.filter((id) => id !== "spl")).toEqual([
+    expect(ids.filter((id) => id !== "viewer")).toEqual([
       "dashboard",
       "support",
       "operations",
@@ -138,6 +138,13 @@ describe("navNodeMatchForPath", () => {
 
   it("returns undefined for an unknown route", () => {
     expect(navNodeMatchForPath("/nothing-here")).toBeUndefined();
+  });
+
+  it("prefers a child over its parent on an equal-length prefix tie (viewer's href aliases viewer.cases')", () => {
+    expect(navNodeMatchForPath("/spl/cases")).toMatchObject({
+      node: { id: "viewer.cases" },
+      prefix: "/spl/cases",
+    });
   });
 });
 

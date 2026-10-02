@@ -32,10 +32,7 @@ import (
 // ErrMalformedAlert marks a decode failure as permanent, unlike retryable transient read errors.
 var ErrMalformedAlert = errors.New("malformed alert payload")
 
-// ErrAlertNotFound marks a row not yet visible -- expected during replication lag right after
-// alert-ingestion writes it. Distinct from other read errors (e.g. Cosmos being unreachable), so
-// callers may bound only this specific, expected case with a timeout; a real outage must never be
-// silently skipped, since that would drop an alert rather than just delay it.
+// ErrAlertNotFound marks a row not yet visible (expected during replication lag), distinct from other read errors so callers bound only this expected case with a timeout, never a real outage.
 var ErrAlertNotFound = errors.New("alert not found")
 
 type alertRow struct {

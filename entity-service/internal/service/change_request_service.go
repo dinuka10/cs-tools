@@ -219,6 +219,11 @@ func (s *changeRequestService) PatchChangeRequest(ctx context.Context, id string
 		return domain.PatchChangeRequestResponse{}, err
 	}
 	ids := []string{}
+	for _, pp := range []**string{req.RequestedByID, req.CustomerGroupID} {
+		if pp != nil && *pp != nil {
+			ids = append(ids, **pp)
+		}
+	}
 	for _, ptr := range []*string{req.ProjectID, req.CaseID, req.DeploymentID, req.DeployedProductID, req.ServiceID, req.ServiceOfferingID, req.AssignedEngineerID} {
 		if ptr != nil {
 			ids = append(ids, *ptr)
@@ -239,8 +244,17 @@ func (s *changeRequestService) PatchChangeRequest(ctx context.Context, id string
 		req.Impact == nil && req.State == nil && req.Type == nil && req.Justification == nil &&
 		req.ImpactDescription == nil && req.ServiceOutage == nil && req.CommunicationPlan == nil &&
 		req.RollbackPlan == nil && req.TestPlan == nil && req.IsCustomerApproved == nil &&
-		req.IsCustomerReviewed == nil && req.RequestApproval == nil {
+		req.IsCustomerReviewed == nil && req.RequestApproval == nil &&
+		req.IsPlanningVisibleToCustomers == nil &&
+		req.ImplementationPlan == nil && req.Priority == nil && req.Category == nil &&
+		req.RequestedByID == nil && req.AffectedServicesText == nil && req.AffectedComponentsText == nil &&
+		req.RollbackDurationText == nil && req.CustomerGroupID == nil {
 		return domain.PatchChangeRequestResponse{}, &apierror.ValidationError{Msg: "at least one field must be provided"}
+	}
+	// Accepted by the contract (and mirrored) but with no Postgres column
+	// or table behind them: reject rather than silently drop them.
+	if req.EnvironmentIDs != nil || req.DeploymentProductIDs != nil || req.Comment != nil || req.WorkNote != nil || req.DurationInput != nil {
+		return domain.PatchChangeRequestResponse{}, &apierror.ValidationError{Msg: "environmentIds, deploymentProductIds, comment, workNote, and durationInput are not supported on this data source"}
 	}
 
 	token := middleware.UserIDTokenFromContext(ctx)

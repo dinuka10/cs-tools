@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/dto"
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/entity"
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/middleware"
@@ -35,9 +36,45 @@ type entityAttachmentClient interface {
 	GetAttachmentContent(ctx context.Context, id string) (body []byte, contentType string, err error)
 	DeleteAttachment(ctx context.Context, id string) (entity.DeleteAttachmentResponse, error)
 	GetAttachment(ctx context.Context, id string) (entity.AttachmentDetails, error)
-	// GetCase backs DeleteAttachment's closed-case guard only — this handler
-	// serves no case route of its own (see caseIsClosed in cases.go).
+	// GetCase backs both authorizeAttachmentAccess (every route in this file)
+	// and DeleteAttachment's closed-case guard — this handler serves no case
+	// route of its own (see caseIsClosed in cases.go).
 	GetCase(ctx context.Context, id string) (entity.CaseView, error)
+}
+
+// authorizeAttachmentAccess verifies the caller may see attachment's
+// underlying case before GetAttachmentContent/GetAttachment/DeleteAttachment
+// act on it, and returns that case so DeleteAttachment's own closed-case
+// guard can reuse it instead of a second lookup. None of those three routes
+// is nested under a project/case path, so unlike every other authorization
+// check in this backend there is no path segment to trust — the attachment's
+// own opaque UUID is the only thing identifying the resource, and without
+// this check any authenticated caller could read or delete any other
+// customer's attachment just by guessing or observing its id.
+//
+// Deliberately does NOT gate on attachment.ReferenceType, even though it
+// looks like the obvious discriminator: entity-service's own SN-backed
+// GetAttachmentByID doc comment says it is left nil unconditionally ("the
+// upstream attachment-details response carries no reference type... callers
+// must fail closed on it") — attachments are SN-backed in the live
+// deployment today, so gating on ReferenceType would deny every attachment
+// unconditionally, not just the unauthorized ones.
+//
+// ReferenceID plus a scoped GetCase call is what actually verifies ownership
+// instead: entity-service's GetCase already 404s both a caller outside their
+// project scope AND an id that simply isn't a case at all (e.g. a
+// deployment-referenced attachment's ReferenceID, which never matches a real
+// case) — see entity-service's own CLAUDE.md, "Where this is actually
+// enforced". So this one call closes the IDOR for case attachments and
+// denies every other reference type (deployment, conversation,
+// change_request, incident — none of which has a scoped ownership check
+// anywhere in this codebase yet) in one step, without needing to tell them
+// apart first.
+func authorizeAttachmentAccess(ctx context.Context, client entityAttachmentClient, attachment entity.AttachmentDetails) (entity.CaseView, error) {
+	if attachment.ReferenceID == "" {
+		return entity.CaseView{}, &apierror.Error{StatusCode: http.StatusNotFound}
+	}
+	return client.GetCase(ctx, attachment.ReferenceID)
 }
 
 // AttachmentHandler handles HTTP requests for attachment operations.
@@ -111,7 +148,8 @@ func (h *AttachmentHandler) SearchAttachments(w http.ResponseWriter, r *http.Req
 // GetAttachmentContent handles GET /attachments/{id}/content. The response is
 // the raw file content, not JSON. Content-Disposition: attachment is always
 // set (mirroring entity-service's own XSS mitigation for this endpoint) so
-// browsers never render an attachment inline.
+// browsers never render an attachment inline. Rejected with 404 unless the
+// caller can see the attachment's own case (see authorizeAttachmentAccess).
 func (h *AttachmentHandler) GetAttachmentContent(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -122,6 +160,18 @@ func (h *AttachmentHandler) GetAttachmentContent(w http.ResponseWriter, r *http.
 	id := r.PathValue("id")
 	if id == "" || !isAttachmentID(id) {
 		writeError(w, http.StatusBadRequest, ErrMsgInvalidUUID)
+		return
+	}
+
+	attachment, err := h.entity.GetAttachment(r.Context(), id)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity GetAttachment failed", "userID", user.UserID, "attachmentID", id, "err", summarizeErr(err))
+		mapUpstreamError(w, err, "Failed to download attachment.")
+		return
+	}
+	if _, err := authorizeAttachmentAccess(r.Context(), h.entity, attachment); err != nil {
+		slog.WarnContext(r.Context(), "rejected attachment access outside caller's scope", "userID", user.UserID, "attachmentID", id)
+		mapUpstreamError(w, err, "Failed to download attachment.")
 		return
 	}
 
@@ -138,8 +188,23 @@ func (h *AttachmentHandler) GetAttachmentContent(w http.ResponseWriter, r *http.
 	_, _ = w.Write(content) // #nosec G705 -- Content-Type set from entity-service's own sanitized value; Content-Disposition forces download, never inline rendering
 }
 
-// DeleteAttachment handles DELETE /attachments/{id}. Rejected with 400 when the
-// attachment belongs to a closed case (see caseIsClosed).
+// DeleteAttachment handles DELETE /attachments/{id}. Rejected with 404 unless
+// the caller can see the attachment's own case (see authorizeAttachmentAccess),
+// and with 400 when that case is closed.
+//
+// The closed-case check here deliberately does NOT reuse caseIsClosed
+// (used by CreateCaseAttachment/PatchCaseAttachment, both nested under an
+// already-trusted /cases/{caseId}/... path) — caseIsClosed fails OPEN on an
+// entity-service error, which is the right call there since it's a pure
+// business-rule check layered on top of an already-authorized request. Here
+// the GetCase call IS the authorization check (see authorizeAttachmentAccess)
+// and must fail closed, so this reuses its already-fetched CaseView directly
+// instead of a second, separately-failing-open lookup. A previous version of
+// this handler only ran its closed-case check when a fetch of the attachment
+// succeeded AND its referenceId was non-empty — silently skipping the check
+// entirely otherwise, which is the same class of bug this rewrite closes:
+// every path now either resolves a real case and checks its state, or denies
+// outright.
 func (h *AttachmentHandler) DeleteAttachment(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -153,16 +218,22 @@ func (h *AttachmentHandler) DeleteAttachment(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// This route is not nested under a case, so the case has to be recovered
-	// from the attachment's own referenceId before the closed-case rule can be
-	// applied. referenceId may name a deployment or conversation instead, in
-	// which case caseIsClosed's fail-open lookup leaves the delete untouched.
-	if attachment, err := h.entity.GetAttachment(r.Context(), id); err == nil && attachment.ReferenceID != "" {
-		if caseIsClosed(r.Context(), h.entity, attachment.ReferenceID) {
-			slog.WarnContext(r.Context(), "rejected attachment delete on a closed case", "userID", user.UserID, "attachmentID", id, "caseID", attachment.ReferenceID)
-			writeError(w, http.StatusBadRequest, ErrMsgCaseClosedForAttachmentDelete)
-			return
-		}
+	attachment, err := h.entity.GetAttachment(r.Context(), id)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "entity GetAttachment failed", "userID", user.UserID, "attachmentID", id, "err", summarizeErr(err))
+		mapUpstreamError(w, err, "Failed to delete attachment.")
+		return
+	}
+	caseView, err := authorizeAttachmentAccess(r.Context(), h.entity, attachment)
+	if err != nil {
+		slog.WarnContext(r.Context(), "rejected attachment access outside caller's scope", "userID", user.UserID, "attachmentID", id)
+		mapUpstreamError(w, err, "Failed to delete attachment.")
+		return
+	}
+	if dto.IsCaseStateClosed(caseView.State) {
+		slog.WarnContext(r.Context(), "rejected attachment delete on a closed case", "userID", user.UserID, "attachmentID", id, "caseID", attachment.ReferenceID)
+		writeError(w, http.StatusBadRequest, ErrMsgCaseClosedForAttachmentDelete)
+		return
 	}
 
 	result, err := h.entity.DeleteAttachment(r.Context(), id)
@@ -176,7 +247,9 @@ func (h *AttachmentHandler) DeleteAttachment(w http.ResponseWriter, r *http.Requ
 }
 
 // GetAttachment handles GET /attachments/{id} — metadata plus base64-encoded
-// content, distinct from GetAttachmentContent's raw binary stream.
+// content, distinct from GetAttachmentContent's raw binary stream. Rejected
+// with 404 unless the caller can see the attachment's own case (see
+// authorizeAttachmentAccess).
 func (h *AttachmentHandler) GetAttachment(w http.ResponseWriter, r *http.Request) {
 	user := middleware.UserInfoFromContext(r.Context())
 	if user == nil {
@@ -193,6 +266,11 @@ func (h *AttachmentHandler) GetAttachment(w http.ResponseWriter, r *http.Request
 	result, err := h.entity.GetAttachment(r.Context(), id)
 	if err != nil {
 		slog.ErrorContext(r.Context(), "entity GetAttachment failed", "userID", user.UserID, "attachmentID", id, "err", summarizeErr(err))
+		mapUpstreamError(w, err, "Failed to retrieve attachment.")
+		return
+	}
+	if _, err := authorizeAttachmentAccess(r.Context(), h.entity, result); err != nil {
+		slog.WarnContext(r.Context(), "rejected attachment access outside caller's scope", "userID", user.UserID, "attachmentID", id)
 		mapUpstreamError(w, err, "Failed to retrieve attachment.")
 		return
 	}

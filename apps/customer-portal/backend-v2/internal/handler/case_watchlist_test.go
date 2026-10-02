@@ -34,12 +34,14 @@ type fakeWatchListEntityClient struct {
 	entityCaseClient
 	usersByEmail   map[string]string
 	searchUsersErr error
+	searchCalls    int
 
 	gotCreateCaseReq entity.CreateCaseRequest
 	gotUpdateCaseReq entity.UpdateCaseRequest
 }
 
 func (f *fakeWatchListEntityClient) SearchUsers(ctx context.Context, req entity.SearchUsersRequest) (entity.SearchUsersResponse, error) {
+	f.searchCalls++
 	if f.searchUsersErr != nil {
 		return entity.SearchUsersResponse{}, f.searchUsersErr
 	}
@@ -128,11 +130,12 @@ func TestResolveWatchListUserIDs_UpstreamErrorIsPropagated(t *testing.T) {
 	}
 }
 
-// TestCreateCase_WatchList_ResolvesEmailsToUserIDs is the regression test for
-// the real bug this fix addresses: the frontend sends project-contact email
-// addresses in watchList, but entity-service's CreateCase requires UUIDs.
-// Before this fix, CreateCase forwarded the emails verbatim.
-func TestCreateCase_WatchList_ResolvesEmailsToUserIDs(t *testing.T) {
+// TestCreateCase_WatchList_ForwardsEmailsAsIs: create sends the caller's
+// watch-list emails to entity-service untouched and makes no user lookup.
+// entity-service resolves emails itself on create; a lookup here only turned
+// them into ids that entity-service had to turn back into emails (and the
+// user search it used for that is gated to internal roles).
+func TestCreateCase_WatchList_ForwardsEmailsAsIs(t *testing.T) {
 	fake := &fakeWatchListEntityClient{
 		usersByEmail: map[string]string{
 			"alice@example.com": "11111111-1111-1111-1111-111111111111",
@@ -140,7 +143,7 @@ func TestCreateCase_WatchList_ResolvesEmailsToUserIDs(t *testing.T) {
 	}
 	h := NewCaseHandler(fake)
 
-	reqBody := `{"projectId":"33333333-3333-3333-3333-333333333333","title":"Test Case","description":"Details","watchList":["alice@example.com"]}`
+	reqBody := `{"projectId":"33333333-3333-3333-3333-333333333333","title":"Test Case","description":"Details","watchList":["alice@example.com","bob@example.com"]}`
 	req := authedRequest(http.MethodPost, "/cases", reqBody)
 	rec := httptest.NewRecorder()
 
@@ -149,9 +152,13 @@ func TestCreateCase_WatchList_ResolvesEmailsToUserIDs(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("expected 201 Created, got %d: %s", rec.Code, rec.Body.String())
 	}
-	want := []string{"11111111-1111-1111-1111-111111111111"}
-	if len(fake.gotCreateCaseReq.WatchList) != 1 || fake.gotCreateCaseReq.WatchList[0] != want[0] {
-		t.Fatalf("entity CreateCaseRequest.WatchList = %v, want %v (resolved UUID, not the raw email)", fake.gotCreateCaseReq.WatchList, want)
+	want := []string{"alice@example.com", "bob@example.com"}
+	got := fake.gotCreateCaseReq.WatchList
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("entity CreateCaseRequest.WatchList = %v, want %v (raw emails)", got, want)
+	}
+	if fake.searchCalls != 0 {
+		t.Fatalf("SearchUsers called %d times on create, want 0", fake.searchCalls)
 	}
 }
 
@@ -189,27 +196,6 @@ func TestPatchCase_WatchList_ResolvesEmailsToUserIDs(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("entity UpdateCaseRequest.WatchList[%d] = %q, want %q", i, got[i], want[i])
 		}
-	}
-}
-
-// TestCreateCase_WatchList_ResolveFailure_StopsCreate is the regression test
-// for the CodeRabbit finding that a SearchUsers failure must stop the write,
-// not silently create a case with no requested watchers.
-func TestCreateCase_WatchList_ResolveFailure_StopsCreate(t *testing.T) {
-	fake := &fakeWatchListEntityClient{searchUsersErr: errors.New("upstream unavailable")}
-	h := NewCaseHandler(fake)
-
-	reqBody := `{"projectId":"33333333-3333-3333-3333-333333333333","title":"Test Case","description":"Details","watchList":["alice@example.com"]}`
-	req := authedRequest(http.MethodPost, "/cases", reqBody)
-	rec := httptest.NewRecorder()
-
-	h.CreateCase(rec, req)
-
-	if rec.Code == http.StatusCreated {
-		t.Fatalf("expected CreateCase to fail when watch-list resolution fails, got 201: %s", rec.Body.String())
-	}
-	if fake.gotCreateCaseReq.ProjectID != "" {
-		t.Fatalf("entity CreateCase must not be called when watch-list resolution fails, got %+v", fake.gotCreateCaseReq)
 	}
 }
 

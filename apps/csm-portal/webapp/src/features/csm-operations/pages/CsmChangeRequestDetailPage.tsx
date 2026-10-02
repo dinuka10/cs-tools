@@ -115,16 +115,18 @@ function backendErrorMessage(err: unknown, fallback: string): string {
 /**
  * The patch that performs a transition into `target`.
  *
- * Every target goes through the generic `state` field except `assess`: the
- * New -> Assess move has its own `requestApproval` flag, which additionally
- * raises the approval request that setting `state` alone does not. Both are
- * accepted on the same endpoint; `state` is not mutually exclusive with
- * anything (only `isCustomerApproved`/`isCustomerReviewed`/`requestApproval`
- * are, with each other), but a transition is always sent on its own anyway so
- * a rejection can only ever be about the transition.
+ * Every target — including `assess` — goes through the plain `state` field.
+ * New -> Assess used to be modeled as a special "approval request" action
+ * (`{requestApproval: true}`), but that was backwards relative to the real
+ * ServiceNow process (confirmed against the live instance): it's a direct,
+ * ungated state change, exactly like every other forward transition in this
+ * bar ("Schedule", "Mark implemented", …) — there is no approval gate on this
+ * move at all. `requestApproval` is a separate, unrelated bookkeeping flag on
+ * the same PATCH endpoint that this action bar no longer has any reason to
+ * set.
  */
 function buildTransitionPatch(target: string): BePatchChangeRequestPayload {
-  return target === "assess" ? { requestApproval: true } : { state: target };
+  return { state: target };
 }
 
 /**
@@ -132,7 +134,6 @@ function buildTransitionPatch(target: string): BePatchChangeRequestPayload {
  * no usable 4xx reason of its own.
  */
 function transitionFallbackMessage(target: string): string {
-  if (target === "assess") return "Could not request approval for this change request.";
   return `Could not move this change request to ${changeRequestStateLabel(target)}.`;
 }
 

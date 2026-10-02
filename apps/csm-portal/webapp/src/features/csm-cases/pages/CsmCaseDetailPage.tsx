@@ -173,6 +173,7 @@ import { caseIdLabel } from "@features/csm-cases/utils/caseIdentity";
 import { useReportCaseTabDraft } from "@features/case-tabs/hooks/useReportCaseTabDraft";
 import { useReportCaseTabMeta } from "@features/case-tabs/hooks/useReportCaseTabMeta";
 import { useCaseRouteOverride } from "@context/case-tabs/CaseRouteOverrideContext";
+import { replaceUuids } from "@utils/redactIds";
 import { formatAbsoluteForUser } from "@utils/dateTime";
 import {
   isBlankHtml,
@@ -1712,12 +1713,14 @@ export default function CsmCaseDetailPage(): JSX.Element {
               sticky: false,
             }),
           onError: (err) => {
-            // The watch-list 400s name the offending value (an unknown or
-            // malformed user id), which is far more actionable than a generic
-            // string — same treatment as every other 4xx on this page.
+            // The watch-list 4xx messages name the offending user by id, which
+            // is meaningful to a log but not to the person reading the toast, so
+            // the id is swapped for "that user". The rest of the message (e.g.
+            // "... is not a contact on this case's project") is the actionable
+            // part and is kept.
             const msg =
               err instanceof BackendApiError && err.status < 500 && err.message
-                ? err.message
+                ? replaceUuids(err.message, "user")
                 : action === "add"
                   ? "Could not add the watcher."
                   : "Could not remove the watcher.";
@@ -3176,6 +3179,10 @@ export default function CsmCaseDetailPage(): JSX.Element {
           currentDeployedProductId={c.productContext.deployedProductId}
           isSaving={patchCase.isPending}
           onClose={() => setEditDetailsOpen(false)}
+          onAllSaved={() => {
+            setEditDetailsOpen(false);
+            setFeedback({ message: "Case details saved.", severity: "success", sticky: false });
+          }}
           onSubmit={onEditCaseDetails}
         />
       )}
@@ -3305,7 +3312,7 @@ export default function CsmCaseDetailPage(): JSX.Element {
           defaultTitle={c.subject}
           defaultDescription={c.description}
           showRepoField={isCloudSupportSubscription(caseProject?.subscriptionType)}
-          productName={c.product}
+          productName={c.productCatalogueName || c.product}
           onboardingInProgress={caseProject?.onboardingStatus === "In-Progress"}
           projectStatusPending={Boolean(c.projectId) && caseProject === undefined && !isCaseProjectError}
           projectStatusFailed={Boolean(c.projectId) && isCaseProjectError}

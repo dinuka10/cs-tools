@@ -32,7 +32,12 @@ import { useSearchGroups } from "@api/useSearchGroups";
 import { useSearchInternalUsersByName } from "@api/useSearchUsersByName";
 import AsyncEntitySelect from "@components/AsyncEntitySelect";
 import { userLabel } from "@features/csm-operations/utils/incidentFormOptions";
-import { formatDateTimeLocal, parseDateTimeLocal } from "@utils/dateTime";
+import {
+  backendUtcToZonedInput,
+  formatDateTimeLocal,
+  parseDateTimeLocal,
+  zonedInputToBackendUtc,
+} from "@utils/dateTime";
 import type { BeGroup, BeProblemDetail, BeUpdateProblemPayload, BeUser } from "@api/backend/types";
 
 const { DateTimePicker, LocalizationProvider } = DatePickers;
@@ -46,17 +51,6 @@ interface EditProblemDialogProps {
   onClose: () => void;
   /** Submit only the changed/filled-in fields (`PATCH /problems/{id}`). */
   onSave: (patch: BeUpdateProblemPayload) => void;
-}
-
-/** Convert a backend timestamp (`YYYY-MM-DD HH:MM:SS`) to `YYYY-MM-DDTHH:MM`. */
-function toDateTimeLocal(raw?: string | null): string {
-  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(raw?.trim() ?? "");
-  return m ? `${m[1]}T${m[2]}` : "";
-}
-
-/** Convert a `datetime-local` value back to the BE's `YYYY-MM-DD HH:MM:SS`. */
-function toBackendDateTime(local: string): string {
-  return `${local.replace("T", " ")}:00`;
 }
 
 /**
@@ -90,7 +84,7 @@ export default function EditProblemDialog({
   const initialAssignedToId = problem.assignedTo?.id ?? "";
   const initialWorkaround = problem.workaround ?? "";
 
-  const dateValue = useMemo(() => parseDateTimeLocal(toDateTimeLocal(targetResolutionDate)), [
+  const dateValue = useMemo(() => parseDateTimeLocal(backendUtcToZonedInput(targetResolutionDate)), [
     targetResolutionDate,
   ]);
 
@@ -162,7 +156,7 @@ export default function EditProblemDialog({
               onChange={(next) =>
                 setTargetResolutionDate(
                   next instanceof Date && !Number.isNaN(next.getTime())
-                    ? toBackendDateTime(formatDateTimeLocal(next))
+                    ? (zonedInputToBackendUtc(formatDateTimeLocal(next)) ?? "")
                     : "",
                 )
               }

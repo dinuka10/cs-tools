@@ -22,8 +22,10 @@ package corewake
 
 import (
 	"context"
+	"encoding/base64"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 )
@@ -32,21 +34,47 @@ import (
 // while a call is in flight is coalesced into a single follow-up call, so a batch written
 // mid-call is never left waiting for alerts-core's backstop poll.
 type Client struct {
-	logger  *slog.Logger
-	url     string
-	http    *http.Client
-	mu      sync.Mutex
-	running bool
-	pending bool
-	idle    *sync.Cond
+	logger   *slog.Logger
+	url      string
+	username string
+	secret   string
+	secure   bool
+	http     *http.Client
+	mu       sync.Mutex
+	running  bool
+	pending  bool
+	idle     *sync.Cond
 }
 
 // New returns a Client. An empty url logs a warning and makes Wake a no-op (local dev).
-func New(logger *slog.Logger, url string, timeout time.Duration) *Client {
-	if url == "" {
+// username/secret are an integration_users credential, sent as Bearer
+// base64("<username>:<secret>"). They are only attached over https, so a plain-http
+// URL sends the call unauthenticated rather than leak the secret in cleartext.
+func New(logger *slog.Logger, wakeURL, username, secret string, timeout time.Duration) *Client {
+	secure := false
+	if wakeURL == "" {
 		logger.Warn("ALERT_CORE_WAKE_URL not set; alerts-core will pick alerts up on its own poll")
+	} else {
+		if u, err := url.Parse(wakeURL); err == nil && u.Scheme == "https" {
+			secure = true
+		}
+		switch {
+		case username == "" || secret == "":
+			logger.Warn("ALERT_CORE_WAKE_USERNAME/ALERT_CORE_WAKE_SECRET not set; wake calls will be unauthenticated")
+		case !secure:
+			logger.Warn("ALERT_CORE_WAKE_URL is not https; wake calls will be sent without credentials")
+		}
 	}
-	c := &Client{logger: logger, url: url, http: &http.Client{Timeout: timeout}}
+	// Redirects are never followed: Go keeps Authorization on a same-host redirect even
+	// from https to http, so following one could send the secret in cleartext. A 3xx
+	// is returned as-is and logged as an unexpected status.
+	client := &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	c := &Client{logger: logger, url: wakeURL, username: username, secret: secret, secure: secure, http: client}
 	c.idle = sync.NewCond(&c.mu)
 	return c
 }
@@ -86,6 +114,10 @@ func (c *Client) send() {
 	if err != nil {
 		c.logger.Warn("alerts-core wake-up request invalid", "error", err)
 		return
+	}
+	if c.secure && c.username != "" && c.secret != "" {
+		token := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.secret))
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

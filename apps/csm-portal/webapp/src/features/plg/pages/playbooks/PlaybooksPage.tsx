@@ -55,7 +55,8 @@ import {
   type PlaybookTaskInput,
   type TaskValueType,
 } from "@features/plg/api/types";
-import { EmptyState, ErrorBlock, LoadingBlock, PageHeader, SectionCard, StatusChip } from "@features/plg/components/common";
+import { EmptyState, ErrorBlock, Field, LoadingBlock, PageHeader, SectionCard, StatusChip } from "@features/plg/components/common";
+import { usePortalAccess } from "@context/current-user/usePortalAccess";
 import { selectLabelProps } from "@features/plg/components/selectLabelProps";
 
 /**
@@ -69,8 +70,19 @@ import { selectLabelProps } from "@features/plg/components/selectLabelProps";
  *
  * Editing a template never touches runs already in flight. Task instances are
  * copies, so a change reaches new runs only.
+ *
+ * TWO AUDIENCES, TWO RENDERINGS. Authoring a playbook is admin's — the backend's
+ * PermManagePlaybooks — while a CS engineer reaches this page to see what a
+ * template contains before running it. Rather than disable a form for them, the
+ * read-only path renders a different component: PlaybookCardReadOnly, which
+ * presents the same facts as text. A greyed-out input invites clicking and then
+ * refuses, which is the worst of both; see BookendTask's own comment for the
+ * same reasoning applied to the two structural tasks.
+ *
+ * The hiding here is an affordance, not the gate. The backend 403s either way.
  */
 export default function PlaybooksPage() {
+  const { canManagePlaybooks } = usePortalAccess();
   const { data: products } = useProducts();
   const { data: lifecycle } = useLifecycle();
   const [productCode, setProductCode] = useState("");
@@ -95,7 +107,11 @@ export default function PlaybooksPage() {
           clipped instead of the page scrolling. */}
       <PageHeader
         title="Playbook manager"
-        subtitle="Templates that move a pairing along one of the seven paths"
+        subtitle={
+          canManagePlaybooks
+            ? "Templates that move a pairing along one of the seven paths"
+            : "Templates that move a pairing along one of the seven paths — read-only"
+        }
         actions={
           <Stack direction="row" spacing={1}>
             <TextField
@@ -114,25 +130,29 @@ export default function PlaybooksPage() {
                 </MenuItem>
               ))}
             </TextField>
-            <Button
-              variant="contained"
-              startIcon={<AddIcon />}
-              disabled={!productCode}
-              onClick={() => setCreating(true)}
-            >
-              New playbook
-            </Button>
+            {canManagePlaybooks ? (
+              <Button
+                variant="contained"
+                startIcon={<AddIcon />}
+                disabled={!productCode}
+                onClick={() => setCreating(true)}
+              >
+                New playbook
+              </Button>
+            ) : null}
           </Stack>
         }
       />
 
       {!productCode ? (
         <Alert severity="info" sx={{ mb: 2 }}>
-          Pick a platform to add a playbook to it.
+          {canManagePlaybooks
+            ? "Pick a platform to add a playbook to it."
+            : "Pick a platform to narrow the list, or read on for all of them."}
         </Alert>
       ) : null}
 
-      {creating && productCode && lifecycle ? (
+      {creating && canManagePlaybooks && productCode && lifecycle ? (
         <Box mb={2}>
           <NewPlaybookForm
             productCode={productCode}
@@ -151,9 +171,13 @@ export default function PlaybooksPage() {
         {[...grouped.entries()].map(([code, list]) => (
           <SectionCard key={code} title={list[0]?.product.name ?? code}>
             <Stack spacing={1}>
-              {list.map((pb) => (
-                <PlaybookCard key={pb.id} playbook={pb} />
-              ))}
+              {list.map((pb) =>
+                canManagePlaybooks ? (
+                  <PlaybookCard key={pb.id} playbook={pb} />
+                ) : (
+                  <PlaybookCardReadOnly key={pb.id} playbook={pb} />
+                ),
+              )}
             </Stack>
           </SectionCard>
         ))}
@@ -571,6 +595,139 @@ function PlaybookCard({ playbook }: { playbook: Playbook }) {
               Saved. Runs already in flight keep the tasks they started with.
             </Typography>
           )}
+        </Stack>
+      </AccordionDetails>
+    </Accordion>
+  );
+}
+
+/**
+ * A playbook as a CS engineer sees it: everything the editor holds, none of the
+ * controls.
+ *
+ * WHY THIS IS A SEPARATE COMPONENT rather than PlaybookCard with a `readOnly`
+ * prop. Two reasons, and the second is the one that matters.
+ *
+ * Presentationally, a disabled form is the wrong answer — it invites a click
+ * and then refuses it, and MUI renders disabled text faint enough to be harder
+ * to read than the plain text it replaces. What an engineer wants here is to
+ * read a template before running it, so text is what they get.
+ *
+ * Structurally, PlaybookCard opens with three mutation hooks. A `readOnly` prop
+ * would still mount all three for a caller who may not use any of them, and
+ * every control inside would need its own guard — which is precisely the shape
+ * where one gets forgotten. Choosing the component in the parent means the
+ * mutations are not reachable from this path at all.
+ *
+ * The task list is rendered flat, bookends included, in the same order and
+ * numbering the editor shows, so the two views describe one thing.
+ */
+function PlaybookCardReadOnly({ playbook }: { playbook: Playbook }) {
+  // The editor hides the bookends from its list and lets the backend put them
+  // back; here they are shown in place, because a reader wants the run as it
+  // will actually appear rather than the author's slice of it.
+  const middle = playbook.tasks.filter((t) => !t.isBookend);
+
+  return (
+    <Accordion disableGutters sx={{ border: "1px solid", borderColor: "divider", borderRadius: 2 }}>
+      <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+        <Box flexGrow={1} mr={2}>
+          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+            <Typography variant="body2" fontWeight={600}>
+              {playbook.name}
+            </Typography>
+            <StatusChip value={playbook.lifecycleStage} kind="lifecycle" />
+            <Chip size="small" label={PLAYBOOK_TYPE_LABEL[playbook.playbookType]} />
+            {!playbook.active ? <Chip size="small" label="Inactive" /> : null}
+          </Stack>
+          <Typography variant="caption" color="text.secondary">
+            {playbook.tasks.length} tasks · {playbook.activeRuns} open of {playbook.runCount} runs
+          </Typography>
+        </Box>
+      </AccordionSummary>
+
+      <AccordionDetails>
+        <Grid container spacing={1.5}>
+          <Grid size={{ xs: 12, md: 6 }}>
+            <Field label="Name" value={playbook.name} />
+          </Grid>
+          <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+            <Field
+              label="Kind"
+              value={
+                <Stack spacing={0.25}>
+                  <span>{PLAYBOOK_TYPE_LABEL[playbook.playbookType]}</span>
+                  <Typography variant="caption" color="text.secondary">
+                    {PLAYBOOK_TYPE_HELP[playbook.playbookType]}
+                  </Typography>
+                </Stack>
+              }
+            />
+          </Grid>
+          <Grid size={{ xs: 12, sm: 6, md: 3 }}>
+            <Field label="Status" value={playbook.active ? "Active" : "Inactive"} />
+          </Grid>
+          <Grid size={12}>
+            <Field label="Description" value={playbook.description || "—"} />
+          </Grid>
+        </Grid>
+
+        <Typography variant="subtitle2" mb={1}>
+          Tasks
+        </Typography>
+
+        <Stack spacing={1}>
+          <BookendTask position={1} name="Initiate playbook" hint="Completing this starts the run" />
+
+          {middle.map((task, index) => (
+            <Box
+              key={task.code || index}
+              sx={{
+                px: 1.5,
+                py: 1,
+                borderRadius: 1,
+                border: "1px solid",
+                borderColor: "divider",
+              }}
+            >
+              <Stack direction="row" spacing={1} alignItems="baseline" flexWrap="wrap" useFlexGap>
+                <Typography variant="body2" fontWeight={600}>
+                  {index + 2}. {task.name}
+                </Typography>
+                <Chip size="small" variant="outlined" label={TASK_VALUE_TYPE_LABEL[task.valueType ?? "BOOLEAN"]} />
+              </Stack>
+
+              {task.description ? (
+                <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
+                  {task.description}
+                </Typography>
+              ) : null}
+
+              {task.options?.length ? (
+                <Box sx={{ ml: 1, mt: 0.75, pl: 1.5, borderLeft: "2px solid", borderColor: "divider" }}>
+                  <Typography variant="caption" color="text.secondary" display="block" mb={0.5}>
+                    Reasons to choose from
+                  </Typography>
+                  <Stack spacing={0.25}>
+                    {task.options.map((option, i) => (
+                      <Stack key={option.code || i} direction="row" spacing={1} alignItems="center">
+                        <Box sx={{ display: "flex", color: "text.disabled" }}>
+                          <CheckBoxIcon size={16} />
+                        </Box>
+                        <Typography variant="body2">{option.label}</Typography>
+                      </Stack>
+                    ))}
+                  </Stack>
+                </Box>
+              ) : null}
+            </Box>
+          ))}
+
+          <BookendTask
+            position={middle.length + 2}
+            name="Close playbook"
+            hint="Completing this closes the run"
+          />
         </Stack>
       </AccordionDetails>
     </Accordion>

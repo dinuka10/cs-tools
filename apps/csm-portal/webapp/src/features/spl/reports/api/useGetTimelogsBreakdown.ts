@@ -18,7 +18,7 @@ import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
 import type { TimeLogBreakdownDetails } from "@features/spl/reports/api/reportTypes";
 
-/** `GET /spl/generate-timelogs-breakdown-report` — see internal/servicenow/reports.go. */
+/** `GET /generate-timelogs-breakdown-report` — see internal/servicenow/reports.go. */
 export function useGetTimelogsBreakdown(
   projectId: string | undefined,
 ): UseQueryResult<TimeLogBreakdownDetails, Error> {
@@ -28,7 +28,7 @@ export function useGetTimelogsBreakdown(
     queryKey: ["spl-timelogs-breakdown", projectId ?? ""],
     queryFn: () =>
       api.get<TimeLogBreakdownDetails>(
-        `/spl/generate-timelogs-breakdown-report?projectId=${encodeURIComponent(projectId ?? "")}`,
+        `/generate-timelogs-breakdown-report?projectId=${encodeURIComponent(projectId ?? "")}`,
       ) as Promise<TimeLogBreakdownDetails>,
     enabled: Boolean(projectId),
   });

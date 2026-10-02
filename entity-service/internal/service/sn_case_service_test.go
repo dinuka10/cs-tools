@@ -2869,7 +2869,7 @@ func TestSNCaseService_PatchCaseFields_NoGetCaseByIDOrEventPublish(t *testing.T)
 			publisher := &mockEventPublisher{}
 			svc := NewServiceNowCaseService(client, nil, publisher, nil, nil, "", nil).(*snCaseService)
 
-			result, err := svc.patchCaseFields(contextWithUserIDToken("token"), testDeploymentUUID, tt.state, tt.severity, tt.workState, nil)
+			result, err := svc.patchCaseFields(contextWithUserIDToken("token"), testDeploymentUUID, tt.state, tt.severity, tt.workState, nil, nil)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}

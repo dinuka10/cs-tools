@@ -18,8 +18,11 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
@@ -237,6 +240,16 @@ func (s *problemService) createProblemSNFirst(ctx context.Context, req domain.Cr
 		return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
 	}
 
+	// Validate everything the Postgres insert will later depend on BEFORE the
+	// ServiceNow call: a failure after it leaves a ServiceNow record with no
+	// Postgres row.
+	if utf8.RuneCountInString(req.Subject) > maxWorkItemSubjectLength {
+		return domain.ProblemDetail{}, &apierror.ValidationError{Msg: fmt.Sprintf("subject cannot exceed %d characters", maxWorkItemSubjectLength)}
+	}
+	if req.Category != nil && strings.TrimSpace(*req.Category) != "" && !validProblemCategoryPG[strings.ToUpper(strings.TrimSpace(*req.Category))] {
+		return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "category contains invalid value: " + *req.Category}
+	}
+
 	snResp, err := s.snMirror.CreateProblem(ctx, req)
 	if err != nil {
 		// ServiceNow never accepted the problem -- nothing is written to
@@ -417,3 +430,10 @@ func (s *problemService) UpdateProblem(ctx context.Context, req domain.UpdatePro
 		Problem: view,
 	}, nil
 }
+
+// maxWorkItemSubjectLength is work_item.subject's VARCHAR length (migration
+// 0090). Longer values fail the Postgres insert.
+const maxWorkItemSubjectLength = 512
+
+// validProblemCategoryPG is problem_category_enum's label set (migration 0059).
+var validProblemCategoryPG = map[string]bool{"SOFTWARE": true, "HARDWARE": true, "NETWORK": true, "DATABASE": true}

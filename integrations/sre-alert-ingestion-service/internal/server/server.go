@@ -51,9 +51,12 @@ type Request struct {
 	RemoteAddr  string
 	ContentType string
 	Body        []byte
+	// Team is the ?team= query parameter (AWS SNS subscription emails).
+	Team string
 }
 
-// Result is the Pipeline's outcome. Status is one of 201, 400 or 503; Error is the message
+// Result is the Pipeline's outcome. Status is one of 200 (SNS subscription confirmation, nothing
+// stored), 201, 400 or 503; Error is the message
 // returned in the body for 400/503.
 type Result struct {
 	Status int
@@ -201,6 +204,17 @@ func (s *Server) vendorRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Before the body is read, so an unauthenticated caller costs a header parse rather
+	// than up to server.max_body_bytes of allocation plus an integration_users lookup.
+	// Every credential position is in the headers, so nothing here needs the body.
+	if err := s.auth.Authenticate(r, vendor); err != nil {
+		// GCP only sends webhook credentials after a 401 carrying this header, and
+		// AWS SNS sends a subscription confirmation's first request without any.
+		w.Header().Set("WWW-Authenticate", `Basic realm="sre_alert_api", charset="UTF-8"`)
+		writeJSON(w, http.StatusUnauthorized, rejected("unauthorized"))
+		return
+	}
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxBodyBytes))
 	if err != nil {
 		var tooLarge *http.MaxBytesError
@@ -219,11 +233,6 @@ func (s *Server) vendorRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.auth.Authenticate(r, vendor); err != nil {
-		writeJSON(w, http.StatusUnauthorized, rejected("unauthorized"))
-		return
-	}
-
 	if s.pipeline == nil {
 		writeUnavailable(w, "ingestion not configured")
 		return
@@ -237,10 +246,13 @@ func (s *Server) vendorRoute(w http.ResponseWriter, r *http.Request) {
 		RemoteAddr:  r.RemoteAddr,
 		ContentType: r.Header.Get("Content-Type"),
 		Body:        body,
+		Team:        r.URL.Query().Get("team"),
 	}
 	res := s.pipeline.Ingest(r.Context(), req)
 	info.altIDs, info.err = res.AltIDs, res.Error
 	switch res.Status {
+	case http.StatusOK:
+		writeJSON(w, http.StatusOK, map[string]string{"status": "subscription confirmation handled"})
 	case http.StatusCreated:
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"status":  "stored",

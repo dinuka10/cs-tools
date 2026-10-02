@@ -34,11 +34,32 @@ var instanceDataSourceEnum = map[int]string{
 
 type instanceService struct {
 	repo repository.InstanceRepository
+	// snMirror is set only under DATA_SOURCE=postgres-servicenow-dual-write
+	// (see NewInstanceServiceWithSNFallback) -- every method reads from it
+	// instead of repo when non-nil. Unlike deploymentService/
+	// deployedProductService, there is no writeback half here: instances
+	// have no create/update endpoint of their own, this is read-only data.
+	// The reason for reading ServiceNow at all under dual-write is the same
+	// one documented on deploymentService.SearchDeployments: Postgres's
+	// instance/usage-tracking tables (deployment_node, deployment_information,
+	// hourly_usage_summary) were never backfilled with ServiceNow's existing
+	// history, so a deployment/product that predates dual-write (or was
+	// never touched through this service's own write paths) has no rows
+	// here at all, while ServiceNow remains complete.
+	snMirror InstanceService
 }
 
 // NewInstanceService constructs an InstanceService backed by Postgres.
 func NewInstanceService(repo repository.InstanceRepository) InstanceService {
 	return &instanceService{repo: repo}
+}
+
+// NewInstanceServiceWithSNFallback constructs an InstanceService for
+// DATA_SOURCE=postgres-servicenow-dual-write -- see the snMirror field's own
+// doc comment for why every read goes to ServiceNow rather than Postgres
+// under this mode.
+func NewInstanceServiceWithSNFallback(repo repository.InstanceRepository, snMirror InstanceService) InstanceService {
+	return &instanceService{repo: repo, snMirror: snMirror}
 }
 
 func validateInstanceIDFilters(projectIDs, deploymentIDs, deployedProductIDs []string) error {
@@ -56,6 +77,10 @@ func validateInstanceIDFilters(projectIDs, deploymentIDs, deployedProductIDs []s
 
 // SearchInstances implements InstanceService.
 func (s *instanceService) SearchInstances(ctx context.Context, req domain.SearchInstancesRequest) (domain.SearchInstancesResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchInstances(ctx, req)
+	}
+
 	if err := normalizePagination(&req.Pagination); err != nil {
 		return domain.SearchInstancesResponse{}, err
 	}
@@ -105,6 +130,10 @@ func validateInstanceDateRangeFiltersPostgres(f domain.InstanceDateRangeFilters)
 
 // SearchInstanceMetrics implements InstanceService.
 func (s *instanceService) SearchInstanceMetrics(ctx context.Context, req domain.InstanceMetricsRequest) (domain.InstanceMetricsResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchInstanceMetrics(ctx, req)
+	}
+
 	if err := validateInstanceDateRangeFiltersPostgres(req.Filters); err != nil {
 		return domain.InstanceMetricsResponse{}, err
 	}
@@ -124,6 +153,10 @@ func (s *instanceService) SearchInstanceMetrics(ctx context.Context, req domain.
 
 // SearchInstanceUsage implements InstanceService.
 func (s *instanceService) SearchInstanceUsage(ctx context.Context, req domain.InstanceUsageRequest) (domain.InstanceUsageResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchInstanceUsage(ctx, req)
+	}
+
 	if err := validateInstanceDateRangeFiltersPostgres(req.Filters); err != nil {
 		return domain.InstanceUsageResponse{}, err
 	}
@@ -150,6 +183,10 @@ func (s *instanceService) SearchInstanceUsage(ctx context.Context, req domain.In
 // ignored, same convention as SearchDeployedProducts' ProductCategories
 // rejection (deployed_product_service.go).
 func (s *instanceService) SearchInstanceMetricsStats(ctx context.Context, req domain.InstanceMetricsStatsRequest) (domain.InstanceMetricsStatsResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchInstanceMetricsStats(ctx, req)
+	}
+
 	if err := validateInstanceDateRangeFiltersPostgres(req.Filters.InstanceDateRangeFilters); err != nil {
 		return domain.InstanceMetricsStatsResponse{}, err
 	}
@@ -164,6 +201,10 @@ func (s *instanceService) SearchInstanceMetricsStats(ctx context.Context, req do
 
 // SearchInstanceUsageStats implements InstanceService.
 func (s *instanceService) SearchInstanceUsageStats(ctx context.Context, req domain.InstanceUsageStatsRequest) (domain.InstanceUsageStatsResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchInstanceUsageStats(ctx, req)
+	}
+
 	if err := validateInstanceDateRangeFiltersPostgres(req.Filters.InstanceDateRangeFilters); err != nil {
 		return domain.InstanceUsageStatsResponse{}, err
 	}

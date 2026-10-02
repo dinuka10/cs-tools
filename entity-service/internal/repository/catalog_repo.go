@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -50,11 +49,12 @@ type CatalogRepository interface {
 }
 
 type catalogRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewCatalogRepository constructs a CatalogRepository backed by the given connection pool.
-func NewCatalogRepository(db *pgxpool.Pool) CatalogRepository {
+// NewCatalogRepository constructs a CatalogRepository whose queries run under the
+// caller identity on ctx (it reads deployed_product, which has row-level security).
+func NewCatalogRepository(db *Scoped) CatalogRepository {
 	return &catalogRepo{db: db}
 }
 

@@ -25,6 +25,8 @@ import {
   normalizeCaseTypeOptions,
   replaceInlineImageSources,
   stripCodeWrapper,
+  toUtcEndOfDay,
+  toUtcStartOfDay,
 } from "@features/support/utils/support";
 
 describe("extractInlineImageRefId", () => {
@@ -114,5 +116,40 @@ describe("linkifyBareUrls", () => {
     expect(output).toContain(
       '<a href="https://wso2.com/docs" target="_blank" rel="noopener noreferrer"',
     );
+  });
+});
+
+// Regression tests: a Date with fewer than 4 digits in its year (reachable
+// live from a partially-typed MUI DatePicker year section) used to
+// serialize into a malformed, non-zero-padded RFC3339 string (e.g.
+// "2-01-10T00:00:00Z") that entity-service's filter parser rejected with a
+// 400. Month/day were already zero-padded; only the year was missed.
+describe("toUtcStartOfDay", () => {
+  it("zero-pads a short year to 4 digits", () => {
+    // new Date(2, 0, 10) would NOT give year 2 -- the Date constructor
+    // special-cases a 0-99 year argument as 1900+year. setFullYear has no
+    // such special-casing, so it's the only way to construct a genuinely
+    // short year for this test.
+    const date = new Date(2026, 0, 10);
+    date.setFullYear(2);
+    expect(toUtcStartOfDay(date)).toBe("0002-01-10T00:00:00Z");
+  });
+
+  it("formats a normal 4-digit year unchanged", () => {
+    const date = new Date(2026, 0, 10);
+    expect(toUtcStartOfDay(date)).toBe("2026-01-10T00:00:00Z");
+  });
+});
+
+describe("toUtcEndOfDay", () => {
+  it("zero-pads a short year to 4 digits", () => {
+    const date = new Date(2026, 0, 10);
+    date.setFullYear(2);
+    expect(toUtcEndOfDay(date)).toBe("0002-01-11T00:00:00Z");
+  });
+
+  it("formats a normal 4-digit year unchanged", () => {
+    const date = new Date(2026, 0, 10);
+    expect(toUtcEndOfDay(date)).toBe("2026-01-11T00:00:00Z");
   });
 });

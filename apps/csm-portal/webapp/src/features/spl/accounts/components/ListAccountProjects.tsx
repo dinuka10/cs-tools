@@ -16,7 +16,7 @@
 
 import { useState } from "react";
 import { useNavigate } from "react-router";
-import { useGetAccountProjects } from "../api/useSplAccountsApi";
+import { useGetAccountProjects } from "../api/useAccountsApi";
 import AccountsDataTable from "./AccountsDataTable";
 
 export default function ListAccountProjects({ id }: { id: string }) {

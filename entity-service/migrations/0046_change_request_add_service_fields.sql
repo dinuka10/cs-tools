@@ -16,5 +16,6 @@
 
 ALTER TABLE change_request ADD COLUMN IF NOT EXISTS service_id UUID REFERENCES service(id) ON DELETE SET NULL;
 ALTER TABLE change_request ADD COLUMN IF NOT EXISTS service_offering_id UUID REFERENCES service_offering(id) ON DELETE SET NULL;
+
 CREATE INDEX IF NOT EXISTS idx_change_request_service_id ON change_request (service_id);
 CREATE INDEX IF NOT EXISTS idx_change_request_service_offering_id ON change_request (service_offering_id);

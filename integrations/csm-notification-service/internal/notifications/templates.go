@@ -63,6 +63,9 @@ var projectContactInvitedExistingTemplateRaw string
 //go:embed templates/project_contact_invited_reminder.html
 var projectContactInvitedReminderTemplateRaw string
 
+//go:embed templates/project_contact_registered.html
+var projectContactRegisteredTemplate string
+
 // wso2LogoURL is WSO2's own official logo asset, served from wso2.cachefly.net
 // (WSO2's public CDN for site assets — not third-party hosting). An earlier
 // version embedded the logo as an inline base64 data: URI instead, avoiding
@@ -527,10 +530,15 @@ func applyOptionalBlock(tmpl, name, value string) string {
 // "View Case" link and the case-title link target. caseNumber is the
 // case's human-readable reference (e.g. "CS0023001") — display-only,
 // distinct from the caseLink URL, which already carries whatever id the
-// portal needs.
-func RenderCommentAddedEmail(name, caseNumber, caseTitle, caseComment, commentLink, caseLink string) (string, []InlineImage) {
+// portal needs. intendedFor, when non-empty, shows a "Sent to: <value>" row
+// — the real recipient(s), for a debug-redirected send (see dispatch.go's
+// own EMAIL_DEBUG_MODE handling); empty omits the row entirely rather than
+// rendering it blank, so a real (non-debug) send never shows it.
+func RenderCommentAddedEmail(name, caseNumber, caseTitle, caseComment, commentLink, caseLink, intendedFor string) (string, []InlineImage) {
+	tmpl := applyOptionalBlock(commentAddedTemplate, "INTENDED_FOR", intendedFor)
 	comment, images := sanitizeRichText(caseComment, &inlineImageBudget{})
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(intendedFor),
 		"<!-- [NAME] -->", escapeHTML(name),
 		"<!-- [CASE_NUMBER] -->", escapeHTML(caseNumber),
 		"<!-- [CASE_TITLE] -->", escapeHTML(caseTitle),
@@ -538,7 +546,7 @@ func RenderCommentAddedEmail(name, caseNumber, caseTitle, caseComment, commentLi
 		"<!-- [COMMENT_LINK] -->", escapeHTML(commentLink),
 		"<!-- [CASE_LINK] -->", escapeHTML(caseLink),
 	)
-	return replacer.Replace(commentAddedTemplate), images
+	return replacer.Replace(tmpl), images
 }
 
 // RenderInternalNoteEmail fills in the "internal note" HTML email
@@ -551,9 +559,11 @@ func RenderCommentAddedEmail(name, caseNumber, caseTitle, caseComment, commentLi
 // (dispatch.handleCommentAdded's own concern which value to pass), not
 // the ServiceNow CaseNumber every other template uses — the internal case
 // reference is the one this audience actually recognizes.
-func RenderInternalNoteEmail(name, caseNumber, caseTitle, caseComment, commentLink, caseLink string) (string, []InlineImage) {
+func RenderInternalNoteEmail(name, caseNumber, caseTitle, caseComment, commentLink, caseLink, intendedFor string) (string, []InlineImage) {
+	tmpl := applyOptionalBlock(internalNoteTemplate, "INTENDED_FOR", intendedFor)
 	comment, images := sanitizeRichText(caseComment, &inlineImageBudget{})
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(intendedFor),
 		"<!-- [NAME] -->", escapeHTML(name),
 		"<!-- [CASE_NUMBER] -->", escapeHTML(caseNumber),
 		"<!-- [CASE_TITLE] -->", escapeHTML(caseTitle),
@@ -561,7 +571,7 @@ func RenderInternalNoteEmail(name, caseNumber, caseTitle, caseComment, commentLi
 		"<!-- [COMMENT_LINK] -->", escapeHTML(commentLink),
 		"<!-- [CASE_LINK] -->", escapeHTML(caseLink),
 	)
-	return replacer.Replace(internalNoteTemplate), images
+	return replacer.Replace(tmpl), images
 }
 
 // RenderStatusChangedEmail fills in the "case status changed" HTML email
@@ -569,14 +579,16 @@ func RenderInternalNoteEmail(name, caseNumber, caseTitle, caseComment, commentLi
 // line and the "View Case" link; commentLink is the "Add Comment"
 // call-to-action target. caseNumber — see RenderCommentAddedEmail's own doc
 // comment.
-func RenderStatusChangedEmail(caseNumber, newStatus, caseLink, commentLink string) string {
+func RenderStatusChangedEmail(caseNumber, newStatus, caseLink, commentLink, intendedFor string) string {
+	tmpl := applyOptionalBlock(statusChangedTemplate, "INTENDED_FOR", intendedFor)
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(intendedFor),
 		"<!-- [CASE_NUMBER] -->", escapeHTML(caseNumber),
 		"<!-- [NEW_STATUS] -->", escapeHTML(newStatus),
 		"<!-- [CASE_LINK] -->", escapeHTML(caseLink),
 		"<!-- [COMMENT_LINK] -->", escapeHTML(commentLink),
 	)
-	return replacer.Replace(statusChangedTemplate)
+	return replacer.Replace(tmpl)
 }
 
 // RenderSeverityChangedEmail fills in the "case severity changed" HTML
@@ -590,29 +602,33 @@ func RenderStatusChangedEmail(caseNumber, newStatus, caseLink, commentLink strin
 // "High (P2)") — email uses entity-service's own S0..S4 severity notation,
 // Chat keeps its established P0..P4 convention; the two are not meant to
 // match.
-func RenderSeverityChangedEmail(caseNumber, oldSeverity, newSeverity, caseLink, commentLink string) string {
+func RenderSeverityChangedEmail(caseNumber, oldSeverity, newSeverity, caseLink, commentLink, intendedFor string) string {
+	tmpl := applyOptionalBlock(severityChangedTemplate, "INTENDED_FOR", intendedFor)
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(intendedFor),
 		"<!-- [CASE_NUMBER] -->", escapeHTML(caseNumber),
 		"<!-- [OLD_SEVERITY] -->", escapeHTML(oldSeverity),
 		"<!-- [NEW_SEVERITY] -->", escapeHTML(newSeverity),
 		"<!-- [CASE_LINK] -->", escapeHTML(caseLink),
 		"<!-- [COMMENT_LINK] -->", escapeHTML(commentLink),
 	)
-	return replacer.Replace(severityChangedTemplate)
+	return replacer.Replace(tmpl)
 }
 
 // RenderCaseAssignedEmail fills in the "case assigned" HTML email template.
 // assigneeEmail is rendered both as a mailto: link and as plain text.
 // caseNumber — see RenderCommentAddedEmail's own doc comment.
-func RenderCaseAssignedEmail(assigneeName, assigneeEmail, caseNumber, caseLink, commentLink string) string {
+func RenderCaseAssignedEmail(assigneeName, assigneeEmail, caseNumber, caseLink, commentLink, intendedFor string) string {
+	tmpl := applyOptionalBlock(caseAssignedTemplate, "INTENDED_FOR", intendedFor)
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(intendedFor),
 		"<!-- [ASSIGNEE_NAME] -->", escapeHTML(assigneeName),
 		"<!-- [ASSIGNEE_EMAIL] -->", escapeHTML(assigneeEmail),
 		"<!-- [CASE_NUMBER] -->", escapeHTML(caseNumber),
 		"<!-- [CASE_LINK] -->", escapeHTML(caseLink),
 		"<!-- [COMMENT_LINK] -->", escapeHTML(commentLink),
 	)
-	return replacer.Replace(caseAssignedTemplate)
+	return replacer.Replace(tmpl)
 }
 
 // CaseCreatedEmailData holds every value substituted into the "case created"
@@ -635,6 +651,9 @@ type CaseCreatedEmailData struct {
 	IncidentImpactDescription string
 	CaseLink                  string
 	CommentLink               string
+	// IntendedFor, when non-empty, shows a "Sent to: <value>" row — see
+	// RenderCommentAddedEmail's own doc comment for the convention.
+	IntendedFor string
 }
 
 // RenderCaseCreatedEmail fills in the "case created" HTML email template.
@@ -646,6 +665,7 @@ func RenderCaseCreatedEmail(data CaseCreatedEmailData) (string, []InlineImage) {
 	tmpl := applyOptionalBlock(caseCreatedTemplate, "IMPACT", data.IncidentImpactDescription)
 	tmpl = applyOptionalBlock(tmpl, "PRIORITY", data.Priority)
 	tmpl = applyOptionalBlock(tmpl, "PRODUCT", data.Product)
+	tmpl = applyOptionalBlock(tmpl, "INTENDED_FOR", data.IntendedFor)
 	// Description and IncidentImpactDescription both end up as attachments
 	// on this same outgoing email, so they must share one budget — see
 	// inlineImageBudget's own doc comment for why a fresh one per call
@@ -654,6 +674,7 @@ func RenderCaseCreatedEmail(data CaseCreatedEmailData) (string, []InlineImage) {
 	description, descImages := sanitizeRichText(data.Description, budget)
 	impact, impactImages := sanitizeRichText(data.IncidentImpactDescription, budget)
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(data.IntendedFor),
 		"<!-- [REPORTER_NAME] -->", escapeHTML(data.ReporterName),
 		"<!-- [PROJECT_NAME] -->", escapeHTML(data.ProjectName),
 		"<!-- [CASE_NUMBER] -->", escapeHTML(data.CaseNumber),
@@ -692,6 +713,9 @@ type CRApprovalEmailData struct {
 	RequesterName string
 	ProjectName   string
 	Link          string
+	// IntendedFor, when non-empty, shows a "Sent to: <value>" row — see
+	// RenderCommentAddedEmail's own doc comment for the convention.
+	IntendedFor string
 }
 
 // RenderCRApprovalRequestedEmail fills in the "a change request needs your
@@ -732,7 +756,9 @@ func RenderCRApprovalRequestedEmail(d CRApprovalEmailData) string {
 		requester = "Someone"
 	}
 
+	tmpl := applyOptionalBlock(crApprovalRequestedTemplate, "INTENDED_FOR", d.IntendedFor)
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(d.IntendedFor),
 		"<!-- [CR_NUMBER] -->", escapeHTML(d.Number),
 		"<!-- [STATE_LABEL] -->", escapeHTML(state),
 		"<!-- [AUDIENCE_LABEL] -->", escapeHTML(audience),
@@ -740,7 +766,7 @@ func RenderCRApprovalRequestedEmail(d CRApprovalEmailData) string {
 		"<!-- [CR_LINK] -->", escapeHTML(d.Link),
 		"<!-- [CONTEXT_LINE] -->", context,
 	)
-	return replacer.Replace(crApprovalRequestedTemplate)
+	return replacer.Replace(tmpl)
 }
 
 // CRPlanDateEmailData is what the plan-start-date notice renders from.
@@ -754,6 +780,9 @@ type CRPlanDateEmailData struct {
 	ShortDescription string
 	Description      string
 	Link             string
+	// IntendedFor, when non-empty, shows a "Sent to: <value>" row — see
+	// RenderCommentAddedEmail's own doc comment for the convention.
+	IntendedFor string
 }
 
 // crPlanDateWording is the per-kind text, reproduced from the ServiceNow
@@ -803,7 +832,9 @@ func RenderCRPlanDateNoticeEmail(d CRPlanDateEmailData) (string, []InlineImage) 
 	budget := &inlineImageBudget{}
 	shortDescription, shortDescImages := sanitizeRichText(d.ShortDescription, budget)
 	description, descImages := sanitizeRichText(d.Description, budget)
+	tmpl := applyOptionalBlock(crPlanDateNoticeTemplate, "INTENDED_FOR", d.IntendedFor)
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(d.IntendedFor),
 		"<!-- [CR_NUMBER] -->", escapeHTML(d.Number),
 		"<!-- [HEADLINE] -->", headline,
 		"<!-- [PROJECT_AND_NUMBER] -->", projectAndNumber,
@@ -812,7 +843,7 @@ func RenderCRPlanDateNoticeEmail(d CRPlanDateEmailData) (string, []InlineImage) 
 		"<!-- [CLOSING_LINE] -->", escapeHTML(w.closing),
 		"<!-- [CR_LINK] -->", escapeHTML(d.Link),
 	)
-	return replacer.Replace(crPlanDateNoticeTemplate), append(shortDescImages, descImages...)
+	return replacer.Replace(tmpl), append(shortDescImages, descImages...)
 }
 
 // ProjectContactInvitedEmailData holds every value substituted into the
@@ -836,6 +867,9 @@ type ProjectContactInvitedEmailData struct {
 	// otherwise it only explains how to sign in, making no claim about
 	// whether an account exists.
 	AccountCreated bool
+	// IntendedFor, when non-empty, shows a "Sent to: <value>" row — see
+	// RenderCommentAddedEmail's own doc comment for the convention.
+	IntendedFor string
 }
 
 // RenderProjectContactInvitedNewEmail fills in the invitation for a contact
@@ -879,7 +913,9 @@ func renderProjectContactInvited(tmpl string, d ProjectContactInvitedEmailData) 
 	}
 	tmpl = applyOptionalBlock(tmpl, "ACCOUNT_CREATED", created)
 	tmpl = applyOptionalBlock(tmpl, "ACCOUNT_UNKNOWN", unknown)
+	tmpl = applyOptionalBlock(tmpl, "INTENDED_FOR", d.IntendedFor)
 	replacer := strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(d.IntendedFor),
 		"<!-- [DISPLAY_NAME] -->", escapeHTML(d.DisplayName),
 		"<!-- [EMAIL] -->", escapeHTML(d.Email),
 		"<!-- [PROJECT_NAME] -->", escapeHTML(d.ProjectName),
@@ -888,4 +924,28 @@ func renderProjectContactInvited(tmpl string, d ProjectContactInvitedEmailData) 
 		"<!-- [PORTAL_URL] -->", escapeHTML(d.PortalURL),
 	)
 	return replacer.Replace(tmpl)
+}
+
+// ProjectContactRegisteredEmailData fills the Welcome email sent after a
+// contact's first sign-in moves their membership to REGISTERED.
+type ProjectContactRegisteredEmailData struct {
+	DisplayName string
+	ProjectName string
+	ProjectKey  string
+	PortalURL   string
+	// IntendedFor, when non-empty, shows a "Sent to: <value>" row — see
+	// RenderCommentAddedEmail's own doc comment for the convention.
+	IntendedFor string
+}
+
+// RenderProjectContactRegisteredEmail fills in the Welcome email.
+func RenderProjectContactRegisteredEmail(d ProjectContactRegisteredEmailData) string {
+	tmpl := applyOptionalBlock(projectContactRegisteredTemplate, "INTENDED_FOR", d.IntendedFor)
+	return strings.NewReplacer(
+		"<!-- [INTENDED_FOR] -->", escapeHTML(d.IntendedFor),
+		"<!-- [DISPLAY_NAME] -->", escapeHTML(d.DisplayName),
+		"<!-- [PROJECT_NAME] -->", escapeHTML(d.ProjectName),
+		"<!-- [PROJECT_KEY] -->", escapeHTML(d.ProjectKey),
+		"<!-- [PORTAL_URL] -->", escapeHTML(d.PortalURL),
+	).Replace(tmpl)
 }

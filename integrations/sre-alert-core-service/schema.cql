@@ -57,10 +57,14 @@ CREATE TABLE IF NOT EXISTS alertintegration.incidents_processed (
   csm_confirmed           boolean,
   csm_attempts            int,        -- failed CreateIncident attempts against this incident
   csm_permanently_failed  boolean,    -- true once csm_attempts hits notify.max_csm_attempts, or CSM returned a non-retryable 4xx
-  csm_last_attempt_at     timestamp   -- backs exponential retry backoff during a CSM outage
+  csm_last_attempt_at     timestamp,  -- backs exponential retry backoff during a CSM outage
+  version                 bigint      -- optimistic-concurrency fence; every mutating write is IF version = <value just read>
 ) WITH cosmosdb_cell_level_timestamp = true
   AND cosmosdb_cell_level_timestamp_tombstones = true
   AND cosmosdb_cell_level_timetolive = true;
+
+-- On a pre-existing incidents_processed table, run once (not part of routine `make migrate`-style setup); the server backfills version=0 on every existing row itself at startup (IncidentRepo.BackfillVersions), since a NULL column never satisfies casUpdate's "IF version = 0" equality check.
+--   ALTER TABLE alertintegration.incidents_processed ADD version bigint;
 
 -- Maintained index of incidents still owing CSM/Chat delivery work, so RetrySweep never has to scan all of incidents_processed.
 CREATE TABLE IF NOT EXISTS alertintegration.incidents_pending (
@@ -80,6 +84,24 @@ CREATE TABLE IF NOT EXISTS alertintegration.processor_lease (
   name       text PRIMARY KEY,
   owner      text,
   expires_at timestamp
+) WITH cosmosdb_cell_level_timestamp = true
+  AND cosmosdb_cell_level_timestamp_tombstones = true
+  AND cosmosdb_cell_level_timetolive = true;
+
+-- Internal service accounts (e.g. webhook-integration-user) that authenticate via Authorization: Bearer base64("username:secret") or Basic auth.
+CREATE TABLE IF NOT EXISTS alertintegration.integration_users (
+  username          text PRIMARY KEY,
+  id                uuid,      -- stable identity id, generated once at creation
+  secret_hash       text,      -- base64 PBKDF2-SHA256 derived key
+  salt              text,      -- base64 random salt, unique per user
+  iterations        int,       -- PBKDF2 iteration count used for this row
+  enabled           boolean,
+  created_at        timestamp, -- account creation time, stable across rotations
+  created_by        text,      -- operator who provisioned it
+  updated_at        timestamp, -- bumped on every create/rotate/enable/disable
+  secret_rotated_at timestamp, -- bumped only when secret_hash/salt actually change
+  last_used_at      timestamp, -- reserved for future RequireAuth wiring; always null today
+  expires_at        timestamp  -- null = never expires
 ) WITH cosmosdb_cell_level_timestamp = true
   AND cosmosdb_cell_level_timestamp_tombstones = true
   AND cosmosdb_cell_level_timetolive = true;

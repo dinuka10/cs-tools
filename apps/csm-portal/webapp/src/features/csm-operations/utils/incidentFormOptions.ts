@@ -100,8 +100,19 @@ export const SUBCATEGORY_OPTIONS_BY_CATEGORY: Record<
   ],
 };
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Picker label for a user: full name, else email, else username, else a neutral
+ * placeholder. Never the raw record id: a UUID is not something a person can
+ * recognise, and a directory row that has no name or email is a data problem to
+ * surface as such, not to paper over with an identifier. A name/username that
+ * itself is a UUID (provisioning leaves that behind) is treated as missing. */
 export function userLabel(u: BeUser): string {
-  return [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || u.id || "";
+  const name = [u.firstName, u.lastName].filter(Boolean).join(" ").trim();
+  if (name && !UUID_RE.test(name)) return name;
+  if (u.email) return u.email;
+  if (u.userName && !UUID_RE.test(u.userName)) return u.userName;
+  return "Unnamed user";
 }
 
 export function itServiceLabel(s: BeItService): string {

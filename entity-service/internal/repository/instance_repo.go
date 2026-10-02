@@ -23,7 +23,6 @@ import (
 	"sort"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
 
@@ -62,11 +61,13 @@ type InstanceRepository interface {
 }
 
 type instanceRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewInstanceRepository constructs an InstanceRepository backed by the given connection pool.
-func NewInstanceRepository(db *pgxpool.Pool) InstanceRepository {
+// NewInstanceRepository constructs an InstanceRepository whose queries run under
+// the caller identity on ctx (it joins deployment and deployed_product, which
+// have row-level security, migration 0176).
+func NewInstanceRepository(db *Scoped) InstanceRepository {
 	return &instanceRepo{db: db}
 }
 

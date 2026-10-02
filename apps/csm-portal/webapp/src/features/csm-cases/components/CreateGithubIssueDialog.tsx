@@ -37,7 +37,7 @@ import type {
   BeCreateCaseGithubIssuePayload,
   BeCreateCaseGithubIssueResponse,
 } from "@api/backend/types";
-import { useGetGithubIssueRepoOptions } from "@features/csm-cases/api/useGetGithubIssueRepoOptions";
+import { useGetProductRepoMapping } from "@features/csm-cases/api/useGetProductRepoMapping";
 
 // ---------------------------------------------------------------------------
 // Option lists. Every select starts unset ("" → "-- Select --") and omits its
@@ -60,50 +60,6 @@ const SEVERITY_OPTIONS: Array<{ value: string; label: string }> = [
   { value: "Priority/High", label: "P2 - High" },
   { value: "Priority/Medium", label: "P3 - Medium" },
 ];
-
-function containsTerm(haystack: string, term: string): boolean {
-  if (term === "") return false;
-  const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`).test(haystack);
-}
-
-function matchProductRepo(
-  options: Array<{ value: string; displayLabel: string; owner: string; repo: string; githubLabel?: string }>,
-  productName: string | undefined,
-) {
-  const name = productName?.trim().toLowerCase();
-  if (!name || name === "—" || name === "-") return undefined;
-  const namesOf = (o: (typeof options)[number]) => ({
-    label: o.displayLabel.trim().toLowerCase(),
-    gitLabel: (o.githubLabel ?? "").trim().toLowerCase(),
-  });
-  const exactHits = options.filter((o) => {
-    const { label, gitLabel } = namesOf(o);
-    return label === name || gitLabel === name;
-  });
-  // One exact row is the product. Several exact rows, or several looser
-  // rows and no exact row, are ambiguous: filing would follow catalogue
-  // order, and the engineer can no longer pick a different repository.
-  if (exactHits.length === 1) return exactHits[0];
-  if (exactHits.length > 1) return undefined;
-  const looseHits = options.filter((o) => {
-    const { label, gitLabel } = namesOf(o);
-    return (
-      containsTerm(name, label) ||
-      containsTerm(label, name) ||
-      containsTerm(name, gitLabel) ||
-      containsTerm(gitLabel, name)
-    );
-  });
-  if (looseHits.length === 1) return looseHits[0];
-  return undefined;
-}
-
-// Cloud-case repositories. Fetched from GET /metadata's
-// githubIssueRepoOptions field (useGetGithubIssueRepoOptions) rather than
-// hardcoded here — each option
-// carries its own real owner/repo, sent as repoOverride to bypass the SN
-// product-unit routing (which only covers on-prem/product-unit-mapped cases).
 
 // ---------------------------------------------------------------------------
 // Types
@@ -160,8 +116,8 @@ export interface CreateGithubIssueDialogProps {
  *   - Patch: Severity is hidden. Hotfix Required is shown. On a non-cloud
  *     case, Update Level and Public Git Issue are required.
  * Migration sends reason "migration"; otherwise reason is "default".
- * The repository comes from the case product. Submit stays disabled until
- * exactly one catalogue row matches.
+ * The repository comes from GET /products/github-repo for the case product.
+ * Submit stays disabled until that lookup returns a mapping.
  */
 export function CreateGithubIssueDialog({
   open,
@@ -202,15 +158,18 @@ export function CreateGithubIssueDialog({
   // CsmCaseDetailPage.tsx's `githubIssueOpen &&` guard), so this only fires
   // per open, not on every case detail page load.
   const {
-    data: repoOptionsData,
+    data: productRepo,
     isLoading: repoOptionsLoading,
     isError: repoOptionsError,
-  } = useGetGithubIssueRepoOptions();
-  const repoOptions = repoOptionsData ?? [];
-  // Submit stays disabled until the catalogue has loaded. There is no
-  // product-unit fallback when it has not.
+  } = useGetProductRepoMapping(productName);
   const repoOptionsUnavailable = repoOptionsLoading || repoOptionsError;
-  const selectedRepoOption = matchProductRepo(repoOptions, productName);
+  const selectedRepoOption = productRepo
+    ? {
+        owner: productRepo.owner,
+        repo: productRepo.repository,
+        displayLabel: productRepo.productName,
+      }
+    : undefined;
 
   // Type drives which fields apply — see the component doc comment above.
   const showSeverity = type === "Type/Discussion";

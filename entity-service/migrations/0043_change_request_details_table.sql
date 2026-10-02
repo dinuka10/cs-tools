@@ -57,7 +57,7 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- Shared-primary-key extension of work_item, same pattern as "case" (see
--- 000018_case_table.up.sql): change_request.id IS work_item.id. The FK's ON DELETE
+-- 0023_case_table.sql): change_request.id IS work_item.id. The FK's ON DELETE
 -- CASCADE is why change_request_details.yaml doesn't need its own delete_sync -
 -- deleting the work_item row (via change_request.yaml's delete_sync) cascades here.
 -- change_request_type isn't named "type" because work_item already has its own

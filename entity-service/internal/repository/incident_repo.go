@@ -25,7 +25,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -146,11 +145,11 @@ type IncidentRepository interface {
 }
 
 type incidentRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewIncidentRepository constructs an IncidentRepository backed by the given connection pool.
-func NewIncidentRepository(db *pgxpool.Pool) IncidentRepository {
+func NewIncidentRepository(db *Scoped) IncidentRepository {
 	return &incidentRepo{db: db}
 }
 
@@ -441,8 +440,10 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		       inc.resolution_code::TEXT, inc.close_notes,
 		       rb.id, COALESCE(rb.name, NULLIF(TRIM(CONCAT_WS(' ', rb.first_name, rb.last_name)), '')),
 		       inc.resolved_on, inc.incident_report, wi.description,
-		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by
+		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by,
+		       ag.id, ag.name
 		` + incidentFromJoins + `
+		LEFT JOIN "group" ag ON ag.id = wi.assignment_group_id
 		WHERE wi.id = $1 AND wi.type = 'INCIDENT'`
 
 	var (
@@ -465,6 +466,7 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		description                        *string
 		createdOn, updatedOn               time.Time
 		createdBy, updatedBy               string
+		agID, agName                       *string
 	)
 	err := r.db.QueryRow(ctx, query, id).Scan(
 		&id2, &number, &subject, &openedOn,
@@ -482,6 +484,7 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 		&rbID, &rbName,
 		&resolvedOn, &incidentReport, &description,
 		&createdOn, &createdBy, &updatedOn, &updatedBy,
+		&agID, &agName,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.IncidentView{}, &apierror.NotFoundError{Msg: "incident not found"}
@@ -520,6 +523,9 @@ func (r *incidentRepo) GetIncidentByID(ctx context.Context, id string) (domain.I
 	}
 	if aeID != nil {
 		v.AssignedTo = &domain.EntityRef{ID: *aeID, Name: stringOrEmpty(aeName)}
+	}
+	if agID != nil {
+		v.AssignmentGroup = &domain.EntityRef{ID: *agID, Name: stringOrEmpty(agName)}
 	}
 	if svcID != nil {
 		v.Service = &domain.EntityRef{ID: *svcID, Name: stringOrEmpty(svcName)}
@@ -777,6 +783,14 @@ func (r *incidentRepo) CreateIncidentFromServiceNow(ctx context.Context, req dom
 		contactType = &v
 	}
 
+	// WithSystemIdentity: this insert never sets a project_id on the new
+	// work_item row at all (incidents have no project concept -- see this
+	// file's own package doc comment), so work_item's INSERT policy
+	// (migration 0147) can only be satisfied by is_internal, not
+	// is_project_member(NULL). Same reasoning as CreateChangeRequestFromServiceNow/
+	// CreateCaseFromServiceNow's own identical stamps: this insert only ever
+	// runs after ServiceNow's own workflow already accepted the create.
+	ctx = WithSystemIdentity(ctx)
 	var (
 		outID, outNumber, outSubject, outCreatedBy string
 		outCreatedOn, outUpdatedOn                 time.Time

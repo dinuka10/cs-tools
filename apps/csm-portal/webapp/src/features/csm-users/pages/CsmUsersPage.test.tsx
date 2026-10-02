@@ -366,7 +366,9 @@ describe("CsmUsersPage — Add User (admin only)", () => {
     expect(await screen.findByRole("heading", { name: "Add user" })).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("First name"), { target: { value: "Jane" } });
-    fireEvent.change(screen.getByLabelText(/^Email/), { target: { value: "new.user@example.com" } });
+    fireEvent.change(screen.getByLabelText(/^Email/), { target: { value: "new.user@wso2.com" } });
+    fireEvent.mouseDown(screen.getByLabelText(/user type/i));
+    fireEvent.click(screen.getByRole("option", { name: "Internal (WSO2 staff)" }));
 
     const submitButton = screen.getByRole("button", { name: "Add user" });
     await waitFor(() => expect(submitButton).not.toBeDisabled());
@@ -375,7 +377,7 @@ describe("CsmUsersPage — Add User (admin only)", () => {
     await waitFor(() =>
       expect(postMock).toHaveBeenCalledWith(
         "/users",
-        expect.objectContaining({ firstName: "Jane", email: "new.user@example.com" }),
+        expect.objectContaining({ firstName: "Jane", email: "new.user@wso2.com", roles: ["internal"] }),
       ),
     );
     await waitFor(() =>
@@ -383,7 +385,7 @@ describe("CsmUsersPage — Add User (admin only)", () => {
     );
   });
 
-  it("disables submit until at least a name and a plausible email are entered", async () => {
+  it("disables submit until at least a name, a plausible email, and a user type are entered", async () => {
     mockRoles = ["admin"];
     renderPage("/admin/users");
 
@@ -399,7 +401,11 @@ describe("CsmUsersPage — Add User (admin only)", () => {
     fireEvent.change(screen.getByLabelText(/^Email/), { target: { value: "not-an-email" } });
     expect(submitButton).toBeDisabled();
 
-    fireEvent.change(screen.getByLabelText(/^Email/), { target: { value: "jane.doe@example.com" } });
+    fireEvent.change(screen.getByLabelText(/^Email/), { target: { value: "jane.doe@wso2.com" } });
+    expect(submitButton).toBeDisabled();
+
+    fireEvent.mouseDown(screen.getByLabelText(/user type/i));
+    fireEvent.click(screen.getByRole("option", { name: "Internal (WSO2 staff)" }));
     expect(submitButton).not.toBeDisabled();
     expect(postMock).not.toHaveBeenCalledWith("/users", expect.anything());
   });

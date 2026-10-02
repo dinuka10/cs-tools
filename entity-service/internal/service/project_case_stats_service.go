@@ -106,7 +106,7 @@ func (s *projectCaseStatsService) GetProjectCaseStats(
 
 	// Scope before existence: the id is caller-controlled, so a project the
 	// caller may not see must be indistinguishable from one that is not there.
-	if err := authorizeProject(ctx, s.access, projectID); err != nil {
+	if _, err := authorizeProject(ctx, s.access, projectID); err != nil {
 		return domain.ProjectCaseStatsResponse{}, err
 	}
 

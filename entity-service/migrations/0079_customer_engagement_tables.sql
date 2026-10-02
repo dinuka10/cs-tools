@@ -21,6 +21,10 @@
 -- operations/csm-scheduled-tasks. That flow reads all three tables to work out
 -- who owes an update for last week, and none of them had a Postgres home.
 --
+-- Column lists are field-for-field against the sys_dictionary dump taken
+-- 2026-09-21 (cs-tools docs/servicenow-discovery/41-engagement-allocation-tables.js
+-- PASS 1); every choice list below is PASS 2's, verbatim.
+--
 -- ---------------------------------------------------------------------------
 -- THREE THINGS THE DICTIONARY REVEALED THAT THE FLOW IGNORES
 -- ---------------------------------------------------------------------------
@@ -50,11 +54,16 @@
 -- u_sf_opportunity, u_sf_opportunity_product.
 --
 -- u_parent (engagement -> engagement) is left out of this initial version
--- entirely: the full migration pages in sys_id order, not hierarchy order, so
--- a child can be inserted before its parent and violate the FK. Add it as a
--- field_backfill once every engagement row exists.
+-- entirely, for the same reason "group".parent_id was in migration 0074: the
+-- full migration pages in sys_id order, not hierarchy order, so a child can be
+-- inserted before its parent and violate the FK. Add it as a field_backfill
+-- once every engagement row exists.
 
 -- ---------- enums ----------
+-- Keys in each mapping YAML's value_map are the RAW ServiceNow choice values,
+-- which for u_state are numeric strings and elsewhere are the labels
+-- themselves. See the YAMLs for the exact mapping.
+
 DO $$ BEGIN
     CREATE TYPE customer_engagement_state_enum AS ENUM
         ('NEW', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED', 'ON_HOLD', 'REQUESTED');
@@ -155,8 +164,8 @@ CREATE TABLE IF NOT EXISTS customer_engagement_allocation_resource (
     updated_by    VARCHAR(255),
     -- u_allocation_id: a human-readable reference, not a sys_id.
     allocation_id VARCHAR(20),
-    -- Nullable despite being dictionary-mandatory: a small number of existing
-    -- rows have it empty. The mapping's source_filter drops those rather than
+    -- Nullable despite being dictionary-mandatory: PASS 3 found 3 existing
+    -- rows with it empty. The mapping's source_filter drops those rather than
     -- loading rows the reminder query could never join anyway.
     engagement_id UUID REFERENCES customer_engagement(id) ON DELETE CASCADE,
     resource_id   UUID REFERENCES "user"(id) ON DELETE SET NULL,
@@ -190,7 +199,7 @@ CREATE TABLE IF NOT EXISTS customer_engagement_status_update (
     created_by       VARCHAR(255),
     updated_by       VARCHAR(255),
     engagement_id    UUID REFERENCES customer_engagement(id) ON DELETE CASCADE,
-    -- A real FK: no rows with an empty reference on this table.
+    -- A real FK: PASS 3 found 0 rows with an empty reference on this table.
     allocation_id    UUID REFERENCES customer_engagement_allocation_resource(id) ON DELETE SET NULL,
     -- Who wrote it. The reminder is per-person, so this column is what makes
     -- "has THIS resource updated?" answerable at all; without it the check

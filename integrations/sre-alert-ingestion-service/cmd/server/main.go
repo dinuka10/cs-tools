@@ -14,8 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Command server wires Cassandra, the allocator and the vendor transforms, then serves the
-// vendor webhook routes and health endpoints.
+// Command server wires Cassandra, the allocator and vendor transforms, then serves the webhook routes.
 package main
 
 import (
@@ -37,7 +36,9 @@ import (
 	"sre-alert-ingestion-service/internal/chat"
 	"sre-alert-ingestion-service/internal/config"
 	"sre-alert-ingestion-service/internal/corewake"
+	"sre-alert-ingestion-service/internal/email"
 	"sre-alert-ingestion-service/internal/server"
+	"sre-alert-ingestion-service/internal/snsconfirm"
 	"sre-alert-ingestion-service/internal/vendors"
 )
 
@@ -49,6 +50,15 @@ const chatTimeout = 10 * time.Second
 
 // dbFailureInterval is the window fallback.cards_per_minute applies to.
 const dbFailureInterval = time.Minute
+
+// authCacheTTL is how long a verified credential is reused, capped at the row's expires_at.
+const authCacheTTL = 60 * time.Second
+
+// snsConfirmTimeout bounds the SubscribeURL fetch; emailTimeout bounds each email-service call.
+const (
+	snsConfirmTimeout = 10 * time.Second
+	emailTimeout      = 15 * time.Second
+)
 
 func main() {
 	base := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("app", "sre-alert-ingestion-service")
@@ -63,14 +73,6 @@ func main() {
 	if err != nil {
 		logger.Error("failed to read environment", "error", err)
 		os.Exit(1)
-	}
-	authn, err := auth.New(cfg.Auth.Mode)
-	if err != nil {
-		logger.Error("failed to initialise auth hook", "error", err)
-		os.Exit(1)
-	}
-	if cfg.Auth.Mode == "none" {
-		logger.Warn("auth.mode is \"none\": vendor routes are unauthenticated")
 	}
 	registry, err := vendors.New()
 	if err != nil {
@@ -92,6 +94,26 @@ func main() {
 	}
 	defer session.Close()
 
+	if cfg.LegacyAuthSection {
+		logger.Warn("config.toml has an [auth] section, which is no longer read; set AUTH_ENABLED (and AUTH_AUDIT_ONLY) in the environment instead")
+	}
+	// After the session: AUTH_ENABLED checks webhooks against alerts-core's integration_users.
+	var authn auth.Authenticator = auth.None{}
+	switch {
+	case envCfg.AuthEnabled && envCfg.AuthAuditOnly:
+		authn = auth.NewAudit(auth.NewIntegrationUsers(session, cfg.Store.QueryTimeout.Duration(), authCacheTTL),
+			base.With("component", "auth"))
+		logger.Warn("AUTH_AUDIT_ONLY is set: credentials are checked but nothing is rejected")
+	case envCfg.AuthEnabled:
+		authn = auth.NewIntegrationUsers(session, cfg.Store.QueryTimeout.Duration(), authCacheTTL)
+		logger.Info("auth enabled: vendor webhooks are checked against integration_users")
+	default:
+		logger.Warn("AUTH_ENABLED is not true: vendor routes are unauthenticated")
+		if envCfg.AuthAuditOnly {
+			logger.Warn("AUTH_AUDIT_ONLY is set but ignored, since AUTH_ENABLED is not true")
+		}
+	}
+
 	store := cassandra.NewStore(session, cfg.Store.QueryTimeout.Duration(), cfg.Store.ClaimTimeout.Duration())
 	if err := store.SeedSeq(context.Background()); err != nil {
 		logger.Error("failed to seed alert_seq", "error", err)
@@ -110,7 +132,13 @@ func main() {
 		SummaryInterval:  dbFailureInterval,
 		HTTPTimeout:      chatTimeout,
 	})
-	waker := corewake.New(base.With("component", "corewake"), envCfg.WakeURL, cfg.Wake.Timeout.Duration())
+	waker := corewake.New(base.With("component", "corewake"), envCfg.WakeURL, envCfg.WakeUsername, envCfg.WakeSecret, cfg.Wake.Timeout.Duration())
+
+	sns, err := newSNSConfirmer(base.With("component", "snsconfirm"))
+	if err != nil {
+		logger.Error("failed to configure SNS subscription handling", "error", err)
+		os.Exit(1)
+	}
 
 	alloc := allocator.New(base.With("component", "allocator"), store, cards, waker, allocator.Config{
 		QueueSize:        cfg.Allocator.QueueSize,
@@ -128,7 +156,7 @@ func main() {
 	srv := server.New(server.Options{
 		Logger:       base.With("component", "server"),
 		Auth:         authn,
-		Pipeline:     server.NewIngestor(registry, alloc, cfg.Server.RequestWait.Duration()),
+		Pipeline:     server.NewIngestor(registry, alloc, cfg.Server.RequestWait.Duration()).WithSNSConfirmer(sns),
 		Rejects:      cards,
 		Vendors:      registry.Names(),
 		MaxBodyBytes: cfg.Server.MaxBodyBytes,
@@ -164,12 +192,34 @@ func main() {
 			DrainDelay:     cfg.Server.DrainDelay.Duration(),
 			RequestWait:    cfg.Server.RequestWait.Duration(),
 			AllocatorDrain: cfg.Server.AllocatorDrain.Duration(),
-		}, waker.Wait, cards.Close)
+		}, waker.Wait, sns.Wait, cards.Close)
 	}
 }
 
-// connectWithRetry retries with exponential backoff so a transient startup outage doesn't
-// crash-loop the pod.
+// newSNSConfirmer builds the SNS subscription handler; without EMAIL_BASE_URL it still auto-confirms.
+func newSNSConfirmer(logger *slog.Logger) (*snsconfirm.Handler, error) {
+	teams, err := snsconfirm.LoadConfig()
+	if err != nil {
+		return nil, err
+	}
+	emailCfg, err := email.ConfigFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	var mailer snsconfirm.Mailer
+	if emailCfg.Enabled() {
+		client, err := email.New(emailCfg, emailTimeout)
+		if err != nil {
+			return nil, err
+		}
+		mailer = client
+	} else {
+		logger.Warn("EMAIL_BASE_URL not set; SNS subscription emails are disabled")
+	}
+	return snsconfirm.New(logger, teams, mailer, snsConfirmTimeout), nil
+}
+
+// connectWithRetry backs off exponentially so a transient startup outage doesn't crash-loop the pod.
 func connectWithRetry(logger *slog.Logger, cfg cassandra.Config, ccfg config.CassandraConfig, queryTimeout time.Duration) (*gocql.Session, error) {
 	var session *gocql.Session
 	attempt := 0

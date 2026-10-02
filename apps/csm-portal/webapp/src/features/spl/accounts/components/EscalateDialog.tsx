@@ -36,8 +36,8 @@ import {
 import DOMPurify from "dompurify";
 import { useSuccessBanner } from "@context/success-banner/SuccessBannerContext";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
-import { useEscalateCase } from "../api/useSplAccountsApi";
-import type { AccountDetails } from "../api/splAccountTypes";
+import { useEscalateCase } from "../api/useAccountsApi";
+import type { AccountDetails } from "../api/accountTypes";
 
 type EscalateDialogProps = {
   isEscalateDialogOpen: boolean;

@@ -206,6 +206,72 @@ func TestNormalizeCaseEngagementTypeChoices_PostgresEnumLabels(t *testing.T) {
 	}
 }
 
+// change_request_state_enum's Postgres labels have the same non-numeric-id
+// problem as engagement type -- and this one was a real, live downstream
+// break: ChangeRequestsPage.tsx's filters.stateIds?.map(Number) on a raw
+// label like "ROLLBACK" is NaN. That alone wouldn't necessarily break
+// anything (Array.prototype.includes matches NaN via SameValueZero, so the
+// value survived the allowed-states filter), but it meant every selected
+// state reached the search request as null instead of a real key --
+// GET /projects/{id}/filters never ran ChangeRequestStates through this
+// normalizer at all, unlike every sibling field (CaseStates, Severities,
+// IssueTypes, EngagementTypes) on the same response.
+func TestNormalizeChangeRequestStateChoices_PostgresEnumLabels(t *testing.T) {
+	in := []ReferenceItem{
+		{ID: "CUSTOMER_APPROVAL", Label: "CUSTOMER_APPROVAL"},
+		{ID: "SCHEDULED", Label: "SCHEDULED"},
+		{ID: "IMPLEMENT", Label: "IMPLEMENT"},
+		{ID: "REVIEW", Label: "REVIEW"},
+		{ID: "CUSTOMER_REVIEW", Label: "CUSTOMER_REVIEW"},
+		{ID: "ROLLBACK", Label: "ROLLBACK"},
+		{ID: "CLOSED", Label: "CLOSED"},
+		{ID: "CANCELED", Label: "CANCELED"},
+	}
+	want := []ReferenceItem{
+		{ID: "5", Label: "Customer Approval"},
+		{ID: "-2", Label: "Scheduled"},
+		{ID: "-1", Label: "Implement"},
+		{ID: "0", Label: "Review"},
+		{ID: "1", Label: "Customer Review"},
+		{ID: "2", Label: "Rollback"},
+		{ID: "3", Label: "Closed"},
+		{ID: "4", Label: "Canceled"},
+	}
+
+	got := normalizeChangeRequestStateChoices(in)
+	if len(got) != len(want) {
+		t.Fatalf("got %d items, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ID != want[i].ID || got[i].Label != want[i].Label {
+			t.Errorf("[%d] = {%s, %s}, want {%s, %s}", i, got[i].ID, got[i].Label, want[i].ID, want[i].Label)
+		}
+	}
+}
+
+func TestNormalizeChangeRequestImpactChoices_PostgresEnumLabels(t *testing.T) {
+	in := []ReferenceItem{
+		{ID: "HIGH", Label: "HIGH"},
+		{ID: "MEDIUM", Label: "MEDIUM"},
+		{ID: "LOW", Label: "LOW"},
+	}
+	want := []ReferenceItem{
+		{ID: "1", Label: "High"},
+		{ID: "2", Label: "Medium"},
+		{ID: "3", Label: "Low"},
+	}
+
+	got := normalizeChangeRequestImpactChoices(in)
+	if len(got) != len(want) {
+		t.Fatalf("got %d items, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ID != want[i].ID || got[i].Label != want[i].Label {
+			t.Errorf("[%d] = {%s, %s}, want {%s, %s}", i, got[i].ID, got[i].Label, want[i].ID, want[i].Label)
+		}
+	}
+}
+
 // deployment_type_enum's Postgres labels have the same non-numeric-id problem
 // as issue type/engagement type. This one had a real, live downstream break:
 // EditDeploymentModal.tsx's Number(form.typeKey) on a raw label like

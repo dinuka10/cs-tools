@@ -234,3 +234,21 @@ func TestSucceededEmailStep_UpstreamErrorIsReturned(t *testing.T) {
 		t.Errorf("error = %v, want *apierror.Error", err)
 	}
 }
+
+// TestSucceededStep_WelcomeEmail: the Welcome lookup matches only its own step.
+func TestSucceededStep_WelcomeEmail(t *testing.T) {
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"steps": []map[string]any{
+			{"step": "EMAIL", "status": "SUCCEEDED"}, {"step": "WELCOME_EMAIL", "status": "SUCCEEDED", "eventModifiedOn": "2026-09-01T08:00:00Z"},
+		}})
+	}))
+	defer apiSrv.Close()
+	tokenSrv := newCustomerTokenServer(t)
+	defer tokenSrv.Close()
+
+	got, err := newTestCustomerClient(t, tokenSrv, apiSrv).SucceededStep(context.Background(), "a0e000000000001AAA", OnboardingStepWelcomeEmail)
+	if err != nil || got == nil || got.Step != OnboardingStepWelcomeEmail {
+		t.Fatalf("SucceededStep() = %+v, %v, want the WELCOME_EMAIL row", got, err)
+	}
+}

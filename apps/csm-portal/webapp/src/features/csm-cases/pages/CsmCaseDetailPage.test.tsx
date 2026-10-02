@@ -1725,6 +1725,26 @@ describe("CsmCaseDetailPage — Watchers tab", () => {
     // still showing the server's list.
     expect(screen.getByTestId("watchers-widget")).toBeInTheDocument();
   });
+
+  it("replaces the user id in the backend's message with 'that user'", () => {
+    openWatchers();
+    fireEvent.click(screen.getByRole("button", { name: /stub add watcher/i }));
+
+    const handlers = patchCaseMutateMock.mock.calls.at(-1)?.[1] as {
+      onError: (err: unknown) => void;
+    };
+    handlers.onError(
+      new BackendApiError(
+        400,
+        "user 00000000-0000-0000-0000-000000000001 is not a contact on this case's project",
+      ),
+    );
+
+    expect(showErrorMock).toHaveBeenCalledWith(
+      "That user is not a contact on this case's project",
+      expect.anything(),
+    );
+  });
 });
 
 describe("CsmCaseDetailPage — change case type", () => {

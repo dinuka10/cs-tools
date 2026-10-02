@@ -44,6 +44,7 @@ func TestValidate_Valid(t *testing.T) {
 		"sla.tier_reached":                      {"CASE-1", TypeSLATierReached, `{"caseId":"CASE-1","clockType":"response","tier":"50"}`},
 		"project_contact.invited":               {"a0e000000000001AAA", TypeProjectContactInvited, `{"membershipSfId":"a0e000000000001AAA","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin","Portal user"],"isIntegrationUser":false,"type":"OWN CONTACT"}`},
 		"project_contact.invited resend":        {"a0e000000000001AAA", TypeProjectContactInvited, `{"membershipSfId":"a0e000000000001AAA","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":["Admin"],"isIntegrationUser":false,"type":"OWN CONTACT","isResend":true}`},
+		"project_contact.registered":            {"a0e000000000001AAA", TypeProjectContactRegistered, `{"membershipSfId":"a0e000000000001AAA","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","eventModifiedOn":"2026-09-18T06:37:07Z"}`},
 		"project_contact.invited without names": {"a0e000000000001AAA", TypeProjectContactInvited, `{"membershipSfId":"a0e000000000001AAA","contactSfId":"","email":"svc@acme.com","givenName":"","familyName":"","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":null,"isIntegrationUser":true,"type":"OWN CONTACT"}`},
 	}
 	for name, c := range cases {
@@ -92,8 +93,8 @@ func TestValidate_RequiresFields(t *testing.T) {
 		"severity_changed missing recipients":                      {"CASE-1", TypeSeverityChanged, `{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW"}`},
 		"severity_changed caseId/entityId mismatch":                {"CASE-1", TypeSeverityChanged, `{"projectId":"PROJ-1","caseId":"CASE-2","oldSeverity":"HIGH","newSeverity":"LOW","recipients":["r@x.com"]}`},
 		"severity_changed no-op transition":                        {"CASE-1", TypeSeverityChanged, `{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"HIGH","recipients":["r@x.com"]}`},
-		"severity_changed whitespace-only oldSeverity":              {"CASE-1", TypeSeverityChanged, `{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"   ","newSeverity":"LOW","recipients":["r@x.com"]}`},
-		"severity_changed whitespace-only newSeverity":              {"CASE-1", TypeSeverityChanged, `{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"   ","recipients":["r@x.com"]}`},
+		"severity_changed whitespace-only oldSeverity":             {"CASE-1", TypeSeverityChanged, `{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"   ","newSeverity":"LOW","recipients":["r@x.com"]}`},
+		"severity_changed whitespace-only newSeverity":             {"CASE-1", TypeSeverityChanged, `{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"   ","recipients":["r@x.com"]}`},
 		"incident missing title":                                   {"INC-1", TypeIncidentCreated, `{"product":"api-manager","shortDescription":"d","callTo":"+15551234567"}`},
 		"incident malformed callTo":                                {"INC-1", TypeIncidentCreated, `{"product":"api-manager","title":"t","shortDescription":"d","callTo":"555-1234"}`},
 		"incident missing entityId":                                {"", TypeIncidentCreated, `{"title":"t","shortDescription":"d"}`},
@@ -106,6 +107,10 @@ func TestValidate_RequiresFields(t *testing.T) {
 		"project_contact.invited missing email":                    {"a0e000000000001AAA", TypeProjectContactInvited, `{"membershipSfId":"a0e000000000001AAA","contactSfId":"003000000000001AAA","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":[],"isIntegrationUser":false,"type":"OWN CONTACT"}`},
 		"project_contact.invited malformed email":                  {"a0e000000000001AAA", TypeProjectContactInvited, `{"membershipSfId":"a0e000000000001AAA","contactSfId":"003000000000001AAA","email":"not-an-email","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":[],"isIntegrationUser":false,"type":"OWN CONTACT"}`},
 		"project_contact.invited membershipSfId/entityId mismatch": {"a0e000000000001AAA", TypeProjectContactInvited, `{"membershipSfId":"a0e000000000002AAA","contactSfId":"003000000000001AAA","email":"jane@acme.com","givenName":"Jane","familyName":"Doe","projectName":"Acme Cloud","projectKey":"ACMECLOUD","roles":[],"isIntegrationUser":false,"type":"OWN CONTACT"}`},
+		"project_contact.registered missing email":                 {"a0e000000000001AAA", TypeProjectContactRegistered, `{"membershipSfId":"a0e000000000001AAA","projectName":"Acme Cloud"}`},
+		"project_contact.registered entityId mismatch":             {"a0e000000000001AAA", TypeProjectContactRegistered, `{"membershipSfId":"a0e000000000002AAA","email":"jane@acme.com"}`},
+		"project_contact.registered unknown field":                 {"a0e000000000001AAA", TypeProjectContactRegistered, `{"membershipSfId":"a0e000000000001AAA","email":"jane@acme.com","roles":[]}`},
+		"project_contact.registered bad eventModifiedOn":           {"a0e000000000001AAA", TypeProjectContactRegistered, `{"membershipSfId":"a0e000000000001AAA","email":"jane@acme.com","eventModifiedOn":"yesterday"}`},
 		"project_contact.invited unknown field":                    {"a0e000000000001AAA", TypeProjectContactInvited, `{"membershipSfId":"a0e000000000001AAA","email":"jane@acme.com","password":"x"}`},
 	}
 	for name, c := range cases {

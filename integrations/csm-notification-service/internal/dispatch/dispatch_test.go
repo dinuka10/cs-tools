@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/chataudience"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/notifications"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/recipientlinks"
@@ -35,7 +36,9 @@ import (
 type sentEmail struct {
 	from        string
 	to          []string
+	cc          []string
 	bcc         []string
+	replyTo     []string
 	subject     string
 	htmlBody    string
 	attachments []notifications.EmailAttachment
@@ -73,7 +76,7 @@ func (m *mockEmailSender) SendEmailFrom(ctx context.Context, from string, to, cc
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.calls = append(m.calls, sentEmail{from: from, to: to, bcc: bcc, subject: subject, htmlBody: htmlBody, attachments: attachments})
+	m.calls = append(m.calls, sentEmail{from: from, to: to, cc: cc, bcc: bcc, replyTo: replyTo, subject: subject, htmlBody: htmlBody, attachments: attachments})
 	if m.onSend != nil {
 		m.onSend()
 	}
@@ -83,82 +86,57 @@ func (m *mockEmailSender) SendEmailFrom(ctx context.Context, from string, to, cc
 	return m.err
 }
 
-type sentChatAlert struct {
-	product, title, shortDescription, portalURL string
-}
-
 type sentCaseCreatedAlert struct {
-	product, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string
+	audience, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string
 }
 
 type sentSecurityReportAnalysisAlert struct {
-	product, caseNumber, wso2CaseID, productName, title, team, caseLink string
+	audience, caseNumber, wso2CaseID, productName, title, team, caseLink string
 }
 
 type sentCaseAcknowledgedAlert struct {
-	product, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string
+	audience, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string
 }
 
 type sentSeverityChangedAlert struct {
-	product, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string
+	audience, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string
 }
 
 type mockGoogleChatSender struct {
 	err error
 	// mu guards calls — see mockEmailSender.mu's doc comment.
 	mu                          sync.Mutex
-	calls                       []sentChatAlert
 	caseCreatedCalls            []sentCaseCreatedAlert
 	caseAcknowledgedCalls       []sentCaseAcknowledgedAlert
 	severityChangedCalls        []sentSeverityChangedAlert
 	securityReportAnalysisCalls []sentSecurityReportAnalysisAlert
-	// hasAudienceSpace, when set, backs HasAudienceSpace; nil means every
-	// audience is "unconfigured" (false), matching a deployment with no
-	// GOOGLE_CHAT_AUDIENCE_SPACES set at all — the default every existing
-	// test (none of which set a Team) already relies on, since
-	// resolveChatAudiences never even calls this for an empty team.
-	hasAudienceSpace func(audience string) bool
 }
 
-func (m *mockGoogleChatSender) HasAudienceSpace(audience string) bool {
-	if m.hasAudienceSpace != nil {
-		return m.hasAudienceSpace(audience)
-	}
-	return false
-}
-
-func (m *mockGoogleChatSender) SendIncidentAlert(ctx context.Context, product, title, shortDescription, portalURL string) error {
+func (m *mockGoogleChatSender) SendCaseCreatedAlert(ctx context.Context, audience, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.calls = append(m.calls, sentChatAlert{product, title, shortDescription, portalURL})
+	m.caseCreatedCalls = append(m.caseCreatedCalls, sentCaseCreatedAlert{audience, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink})
 	return m.err
 }
 
-func (m *mockGoogleChatSender) SendCaseCreatedAlert(ctx context.Context, product, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string) error {
+func (m *mockGoogleChatSender) SendSecurityReportAnalysisAlert(ctx context.Context, audience, caseNumber, wso2CaseID, productName, title, team, caseLink string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.caseCreatedCalls = append(m.caseCreatedCalls, sentCaseCreatedAlert{product, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink})
+	m.securityReportAnalysisCalls = append(m.securityReportAnalysisCalls, sentSecurityReportAnalysisAlert{audience, caseNumber, wso2CaseID, productName, title, team, caseLink})
 	return m.err
 }
 
-func (m *mockGoogleChatSender) SendSecurityReportAnalysisAlert(ctx context.Context, product, caseNumber, wso2CaseID, productName, title, team, caseLink string) error {
+func (m *mockGoogleChatSender) SendCaseAcknowledgedAlert(ctx context.Context, audience, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.securityReportAnalysisCalls = append(m.securityReportAnalysisCalls, sentSecurityReportAnalysisAlert{product, caseNumber, wso2CaseID, productName, title, team, caseLink})
+	m.caseAcknowledgedCalls = append(m.caseAcknowledgedCalls, sentCaseAcknowledgedAlert{audience, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName})
 	return m.err
 }
 
-func (m *mockGoogleChatSender) SendCaseAcknowledgedAlert(ctx context.Context, product, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string) error {
+func (m *mockGoogleChatSender) SendSeverityChangedAlert(ctx context.Context, audience, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.caseAcknowledgedCalls = append(m.caseAcknowledgedCalls, sentCaseAcknowledgedAlert{product, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName})
-	return m.err
-}
-
-func (m *mockGoogleChatSender) SendSeverityChangedAlert(ctx context.Context, product, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.severityChangedCalls = append(m.severityChangedCalls, sentSeverityChangedAlert{product, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink})
+	m.severityChangedCalls = append(m.severityChangedCalls, sentSeverityChangedAlert{audience, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink})
 	return m.err
 }
 
@@ -200,12 +178,6 @@ func (m *mockLinkResolver) CSMLink(caseID string) string {
 	return "https://csm.example/cases/" + caseID
 }
 
-// IncidentLink mirrors recipientlinks.Resolver.IncidentLink's own shape
-// closely enough for tests that check the Google Chat alert's portal link.
-func (m *mockLinkResolver) IncidentLink(incidentID string) string {
-	return "https://csm.example/operations/incidents/" + incidentID
-}
-
 // ChangeRequestLink mirrors the real resolver's audience split: a customer
 // notice links into the customer portal, under the project; everyone else
 // links into the CSM portal.
@@ -237,7 +209,7 @@ func (m *mockLinkResolver) ResolveLinks(ctx context.Context, emails []string, pr
 const testRecipient = "test-recipient@example.com"
 
 func newTestDispatcher(email emailSender, chat googleChatSender, call callSender) *Dispatcher {
-	return NewDispatcher(email, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
+	return NewDispatcher(email, chat, call, &mockLinkResolver{}, true, false, nil, true, "", nil)
 }
 
 func TestDispatcher_Handle_CaseCreated(t *testing.T) {
@@ -384,205 +356,6 @@ func TestDispatcher_Handle_CaseCreated_EmailShowsHumanReadableCaseType(t *testin
 	}
 }
 
-// TestDispatcher_Handle_CaseCreated_ChatUsesDefaultProduct verifies
-// case.created's Chat alert falls back to Dispatcher.defaultChatProduct when
-// the payload omits product, the same fallback handleIncidentCreated uses.
-// TestDispatcher_Handle_CaseCreated_ChatRoutesToTeamOrIncidentMonitor
-// verifies case.created's Chat audience: a team with a configured space
-// gets its own alert; a case with no team (or DEFAULT_CHAT_PRODUCT/product
-// entirely absent — case.created's Chat routing no longer depends on
-// either) falls back to the shared "Incident Monitor" audience rather than
-// being skipped.
-func TestDispatcher_Handle_CaseCreated_ChatRoutesToTeamOrIncidentMonitor(t *testing.T) {
-	t.Run("configured team gets its own alert", func(t *testing.T) {
-		chat := &mockGoogleChatSender{hasAudienceSpace: func(a string) bool { return a == "Castor" }}
-		d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
-
-		record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"CASE","priority":"HIGH","team":"Castor","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
-
-		if err := d.Handle(context.Background(), record); err != nil {
-			t.Fatalf("Handle() error = %v", err)
-		}
-		if len(chat.caseCreatedCalls) != 1 || chat.caseCreatedCalls[0].product != "Castor" {
-			t.Fatalf("expected exactly 1 chat alert routed to audience %q, got %+v", "Castor", chat.caseCreatedCalls)
-		}
-	})
-
-	t.Run("no team falls back to Incident Monitor, not skipped", func(t *testing.T) {
-		mock := &mockEmailSender{}
-		chat := &mockGoogleChatSender{}
-		d := newTestDispatcher(mock, chat, &mockCallSender{})
-
-		record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"CASE","priority":"HIGH","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
-
-		if err := d.Handle(context.Background(), record); err != nil {
-			t.Fatalf("Handle() error = %v", err)
-		}
-		if len(chat.caseCreatedCalls) != 1 || chat.caseCreatedCalls[0].product != chatAudienceIncidentMonitor {
-			t.Fatalf("expected exactly 1 chat alert routed to %q, got %+v", chatAudienceIncidentMonitor, chat.caseCreatedCalls)
-		}
-		if len(mock.calls) != 1 {
-			t.Errorf("expected the email to still be sent, got %d calls", len(mock.calls))
-		}
-	})
-
-	t.Run("an unconfigured team also falls back to Incident Monitor", func(t *testing.T) {
-		chat := &mockGoogleChatSender{} // hasAudienceSpace nil -> every audience unconfigured
-		d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
-
-		record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"CASE","priority":"HIGH","team":"Polaris","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
-
-		if err := d.Handle(context.Background(), record); err != nil {
-			t.Fatalf("Handle() error = %v", err)
-		}
-		if len(chat.caseCreatedCalls) != 1 || chat.caseCreatedCalls[0].product != chatAudienceIncidentMonitor {
-			t.Fatalf("expected exactly 1 chat alert routed to %q for an unconfigured team, got %+v", chatAudienceIncidentMonitor, chat.caseCreatedCalls)
-		}
-	})
-}
-
-// TestDispatcher_Handle_CaseCreated_MultipleAudiencesEachGetTheirOwnAlert
-// verifies a case whose facts resolve to more than one audience (its own
-// team, plus Onboarding) sends one Chat alert per resolved audience, not
-// just one overall.
-func TestDispatcher_Handle_CaseCreated_MultipleAudiencesEachGetTheirOwnAlert(t *testing.T) {
-	chat := &mockGoogleChatSender{hasAudienceSpace: func(a string) bool { return a == "Castor" }}
-	d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
-
-	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"CASE","priority":"HIGH","team":"Castor","projectOnboardingStatus":"IN_PROGRESS","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
-
-	if err := d.Handle(context.Background(), record); err != nil {
-		t.Fatalf("Handle() error = %v", err)
-	}
-	if len(chat.caseCreatedCalls) != 2 {
-		t.Fatalf("expected 2 chat alerts (Castor + Onboarding), got %d: %+v", len(chat.caseCreatedCalls), chat.caseCreatedCalls)
-	}
-	var gotAudiences []string
-	for _, c := range chat.caseCreatedCalls {
-		gotAudiences = append(gotAudiences, c.product)
-	}
-	if !slices.Contains(gotAudiences, "Castor") || !slices.Contains(gotAudiences, chatAudienceOnboarding) {
-		t.Errorf("audiences = %v, want both Castor and %q", gotAudiences, chatAudienceOnboarding)
-	}
-}
-
-// TestDispatcher_Handle_CaseCreated_EvaluationOverridesEverything verifies
-// an Evaluation Subscription case routes exclusively to the "Evaluation"
-// audience, regardless of team.
-func TestDispatcher_Handle_CaseCreated_EvaluationOverridesEverything(t *testing.T) {
-	chat := &mockGoogleChatSender{hasAudienceSpace: func(a string) bool { return true }}
-	d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
-
-	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"CASE","priority":"HIGH","team":"Castor","isEvaluationAccount":true,"projectOnboardingStatus":"IN_PROGRESS","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
-
-	if err := d.Handle(context.Background(), record); err != nil {
-		t.Fatalf("Handle() error = %v", err)
-	}
-	if len(chat.caseCreatedCalls) != 1 || chat.caseCreatedCalls[0].product != chatAudienceEvaluation {
-		t.Fatalf("expected exactly 1 chat alert routed to %q, got %+v", chatAudienceEvaluation, chat.caseCreatedCalls)
-	}
-}
-
-// TestResolveChatAudiences is a table-driven unit test for the pure
-// resolution function — the Americas/weekend clock rules can't be
-// exercised deterministically through a full Handle() call (which reads
-// the real wall clock), so they're tested directly here instead.
-func TestResolveChatAudiences(t *testing.T) {
-	configuredTeam := func(a string) bool { return a == "Castor" }
-	noneConfigured := func(a string) bool { return false }
-
-	// A Monday at noon IST — outside both the Americas overnight window
-	// and the weekend window, so it isolates whichever rule each subtest
-	// is actually checking.
-	weekdayNoon := time.Date(2026, time.January, 5, 6, 30, 0, 0, time.UTC) // 12:00 IST
-
-	testCases := []struct {
-		name             string
-		team             string
-		isEvaluation     bool
-		onboardingStatus string
-		now              time.Time
-		hasAudience      func(string) bool
-		want             []string
-	}{
-		{"recognized team", "Castor", false, "", weekdayNoon, configuredTeam, []string{"Castor"}},
-		{"unrecognized team falls back", "Polaris", false, "", weekdayNoon, noneConfigured, []string{chatAudienceIncidentMonitor}},
-		{"no team falls back", "", false, "", weekdayNoon, noneConfigured, []string{chatAudienceIncidentMonitor}},
-		{"evaluation overrides team and onboarding", "Castor", true, "IN_PROGRESS", weekdayNoon, configuredTeam, []string{chatAudienceEvaluation}},
-		{"onboarding IN_PROGRESS adds Onboarding", "Castor", false, "IN_PROGRESS", weekdayNoon, configuredTeam, []string{"Castor", chatAudienceOnboarding}},
-		{"onboarding NOT_STARTED adds Onboarding", "Castor", false, "NOT_STARTED", weekdayNoon, configuredTeam, []string{"Castor", chatAudienceOnboarding}},
-		{"onboarding COMPLETED does not add Onboarding", "Castor", false, "COMPLETED", weekdayNoon, configuredTeam, []string{"Castor"}},
-		{
-			"9pm IST is inside the Americas window", "Castor", false, "",
-			time.Date(2026, time.January, 5, 15, 30, 0, 0, time.UTC), // 21:00 IST
-			configuredTeam, []string{"Castor", chatAudienceAmericas},
-		},
-		{
-			// Wednesday, not Monday: a pre-6am Monday instant also falls
-			// inside the weekend tail (see the deliberate-overlap case
-			// below) — this one isolates the Americas window alone.
-			"5:59am IST on a weekday is inside the Americas window", "Castor", false, "",
-			time.Date(2026, time.January, 7, 0, 29, 0, 0, time.UTC), // Wed 05:59 IST
-			configuredTeam, []string{"Castor", chatAudienceAmericas},
-		},
-		{
-			"6:00am IST is outside the Americas window", "Castor", false, "",
-			time.Date(2026, time.January, 5, 0, 30, 0, 0, time.UTC), // 06:00 IST
-			configuredTeam, []string{"Castor"},
-		},
-		{
-			"Saturday 6am IST starts the weekend window", "Castor", false, "",
-			time.Date(2026, time.January, 3, 0, 30, 0, 0, time.UTC), // Sat 06:00 IST
-			configuredTeam, []string{"Castor", chatAudienceIncidentMonitor},
-		},
-		{
-			// Any pre-6am instant also falls inside the Americas overnight
-			// window (it covers all of 00:00-06:00 IST as part of its own
-			// wraparound), so "not yet weekend" is isolated with a Friday
-			// evening instant instead, clear of both windows entirely.
-			"Friday evening is before both the Americas and weekend windows", "Castor", false, "",
-			time.Date(2026, time.January, 2, 14, 30, 0, 0, time.UTC), // Fri 20:00 IST
-			configuredTeam, []string{"Castor"},
-		},
-		{
-			"Sunday is inside the weekend window", "Castor", false, "",
-			time.Date(2026, time.January, 4, 6, 30, 0, 0, time.UTC), // Sun 12:00 IST
-			configuredTeam, []string{"Castor", chatAudienceIncidentMonitor},
-		},
-		{
-			// Deliberately exercises the genuine overlap between the two
-			// windows: a pre-6am Monday instant is simultaneously still
-			// inside the weekend tail AND inside the Americas overnight
-			// window (00:00-06:00 IST is common to both) — both audiences
-			// are correctly added, deduped against the Incident Monitor
-			// fallback (no configured team-of-its-own webhook contention
-			// here since Castor is configured).
-			"Monday before 6am IST overlaps the weekend and Americas windows", "Castor", false, "",
-			time.Date(2026, time.January, 5, 0, 0, 0, 0, time.UTC), // Mon 05:30 IST
-			configuredTeam, []string{"Castor", chatAudienceAmericas, chatAudienceIncidentMonitor},
-		},
-		{
-			"Monday 6am IST ends the weekend window", "Castor", false, "",
-			time.Date(2026, time.January, 5, 0, 30, 0, 0, time.UTC), // Mon 06:00 IST
-			configuredTeam, []string{"Castor"},
-		},
-		{
-			"no team during the weekend window dedupes to one Incident Monitor entry", "", false, "",
-			time.Date(2026, time.January, 4, 6, 30, 0, 0, time.UTC), // Sun 12:00 IST
-			noneConfigured, []string{chatAudienceIncidentMonitor},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := resolveChatAudiences(tc.team, tc.isEvaluation, tc.onboardingStatus, tc.now, tc.hasAudience)
-			if !slices.Equal(got, tc.want) {
-				t.Errorf("resolveChatAudiences(...) = %v, want %v", got, tc.want)
-			}
-		})
-	}
-}
-
 // TestDispatcher_Handle_CaseCreated_ChatFailureStillSendsEmail verifies the
 // two reactions are independent, the same as
 // TestDispatcher_Handle_IncidentCreated_ChatFailureStillPlacesCall.
@@ -689,7 +462,7 @@ func TestDispatcher_Handle_EmailDebugMode_RedirectsToConfiguredRecipients(t *tes
 	mock := &mockEmailSender{}
 	links := &mockLinkResolver{}
 	debugRecipients := []string{"debug-1@example.com", "debug-2@example.com"}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, true, debugRecipients, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, true, debugRecipients, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"Incident","priority":"P3","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
 
@@ -728,7 +501,7 @@ func TestDispatcher_Handle_EmailDebugMode_MultipleGroups_SendsOnePerGroup(t *tes
 		},
 	}
 	debugRecipients := []string{"debug-1@example.com", "debug-2@example.com"}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, true, debugRecipients, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, true, debugRecipients, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"Incident","priority":"P3","createdAt":"2026-01-01","description":"desc","recipients":["customer@example.com","csm-agent@example.com"]}}`)}
 
@@ -751,7 +524,7 @@ func TestDispatcher_Handle_EmailDebugMode_MultipleGroups_SendsOnePerGroup(t *tes
 // recipients.
 func TestDispatcher_Handle_EmailDebugMode_NoRecipientsConfigured_SkipsSend(t *testing.T) {
 	mock := &mockEmailSender{}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, nil, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, true, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"Incident","priority":"P3","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
 
@@ -861,7 +634,7 @@ func TestDispatcher_Handle_CommentAdded_InternalNote_UsesInternalNoteLayout(t *t
 func TestDispatcher_Handle_CommentAdded_LinksToCommentFragment(t *testing.T) {
 	mock := &mockEmailSender{}
 	links := &mockLinkResolver{linkFor: func(string) string { return "https://csm.example.com/cases/CASE-1" }}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","recipients":["test-recipient@example.com"]}}`)}
 
@@ -903,9 +676,8 @@ func TestDispatcher_Handle_CaseAssigned(t *testing.T) {
 }
 
 // TestDispatcher_Handle_CaseAcknowledged verifies the happy path: a
-// case.acknowledged event with no team posts exactly one Google Chat alert
-// (no email — see events.CaseAcknowledgedPayload's own doc comment),
-// routed to the Incident Monitor fallback audience, with the severity
+// case.acknowledged event posts exactly one Google Chat alert (no email —
+// see events.CaseAcknowledgedPayload's own doc comment) with the severity
 // mapped to its display label/color, the case reference, and the
 // acknowledger's name.
 func TestDispatcher_Handle_CaseAcknowledged(t *testing.T) {
@@ -913,7 +685,7 @@ func TestDispatcher_Handle_CaseAcknowledged(t *testing.T) {
 	chat := &mockGoogleChatSender{}
 	d := newTestDispatcher(mock, chat, &mockCallSender{})
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","wso2CaseId":"WSO2-1000","severity":"CRITICAL","acknowledgerName":"Jane Doe"}}`)}
+	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","wso2CaseId":"WSO2-1000","severity":"CRITICAL","product":"api-manager","acknowledgerName":"Jane Doe"}}`)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -925,7 +697,7 @@ func TestDispatcher_Handle_CaseAcknowledged(t *testing.T) {
 		t.Fatalf("expected 1 Google Chat alert sent, got %d", len(chat.caseAcknowledgedCalls))
 	}
 	got := chat.caseAcknowledgedCalls[0]
-	if got.product != chatAudienceIncidentMonitor || got.severityLabel != "Critical (P1)" || got.caseNumber != "CS0001001" ||
+	if got.audience != chataudience.IncidentMonitor || got.severityLabel != "Critical (P1)" || got.caseNumber != "CS0001001" ||
 		got.wso2CaseID != "WSO2-1000" || got.acknowledgerName != "Jane Doe" {
 		t.Errorf("unexpected SendCaseAcknowledgedAlert args: %+v", got)
 	}
@@ -940,7 +712,7 @@ func TestDispatcher_Handle_CaseAcknowledged_BlankSeverityRendersUnknownNotEmpty(
 	chat := &mockGoogleChatSender{}
 	d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","acknowledgerName":"Jane Doe"}}`)}
+	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","product":"api-manager","acknowledgerName":"Jane Doe"}}`)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -953,41 +725,6 @@ func TestDispatcher_Handle_CaseAcknowledged_BlankSeverityRendersUnknownNotEmpty(
 	}
 }
 
-// TestDispatcher_Handle_CaseAcknowledged_ChatRoutesToTeamOrIncidentMonitor
-// mirrors TestDispatcher_Handle_CaseCreated_ChatRoutesToTeamOrIncidentMonitor
-// for case.acknowledged: audience-routed the same way, not product-routed,
-// so a resolved audience always exists (there is no "no product configured"
-// skip any more — Incident Monitor is the unconditional fallback).
-func TestDispatcher_Handle_CaseAcknowledged_ChatRoutesToTeamOrIncidentMonitor(t *testing.T) {
-	t.Run("configured team gets its own alert", func(t *testing.T) {
-		chat := &mockGoogleChatSender{hasAudienceSpace: func(a string) bool { return a == "Castor" }}
-		d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
-
-		record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","team":"Castor","acknowledgerName":"Jane Doe"}}`)}
-
-		if err := d.Handle(context.Background(), record); err != nil {
-			t.Fatalf("Handle() error = %v", err)
-		}
-		if len(chat.caseAcknowledgedCalls) != 1 || chat.caseAcknowledgedCalls[0].product != "Castor" {
-			t.Fatalf("expected exactly 1 chat alert routed to audience %q, got %+v", "Castor", chat.caseAcknowledgedCalls)
-		}
-	})
-
-	t.Run("no team falls back to Incident Monitor, not skipped", func(t *testing.T) {
-		chat := &mockGoogleChatSender{}
-		d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
-
-		record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","acknowledgerName":"Jane Doe"}}`)}
-
-		if err := d.Handle(context.Background(), record); err != nil {
-			t.Fatalf("Handle() error = %v", err)
-		}
-		if len(chat.caseAcknowledgedCalls) != 1 || chat.caseAcknowledgedCalls[0].product != chatAudienceIncidentMonitor {
-			t.Fatalf("expected exactly 1 chat alert routed to %q, got %+v", chatAudienceIncidentMonitor, chat.caseAcknowledgedCalls)
-		}
-	})
-}
-
 // TestDispatcher_Handle_CaseAcknowledged_ForgetsAfterFullSuccess mirrors
 // TestDispatcher_Handle_CaseCreated_ForgetsAfterFullSuccess: once
 // case.acknowledged's one and only reaction (the Chat alert) succeeds, its
@@ -996,7 +733,7 @@ func TestDispatcher_Handle_CaseAcknowledged_ForgetsAfterFullSuccess(t *testing.T
 	chat := &mockGoogleChatSender{}
 	d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
 
-	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","acknowledgerName":"Jane Doe"}}`)}
+	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","product":"api-manager","acknowledgerName":"Jane Doe"}}`)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -1007,18 +744,17 @@ func TestDispatcher_Handle_CaseAcknowledged_ForgetsAfterFullSuccess(t *testing.T
 }
 
 // TestDispatcher_Handle_CaseAcknowledged_RetryAfterChatFailureResends
-// verifies the actual retry contract: a Chat send that fails releases its
-// audience claim (via sendChatPerAudience's own failure path, then
-// confirmed safe to fully release once endRecord reports this was the last
-// in-flight call for the record — see handleCaseAcknowledged's own doc
-// comment), so a subsequent retry of the exact same record content
-// genuinely re-attempts it, and eventually succeeds once the failure
-// clears.
+// verifies the actual retry contract for this single-channel handler: a
+// Chat send that fails releases its claim (via claim's own failure path,
+// not record.NoMoreRetries — see handleCaseAcknowledged's own doc comment
+// for why there's no cross-call release race to guard against here), so a
+// subsequent retry of the exact same record content genuinely re-attempts
+// it, and eventually succeeds once the failure clears.
 func TestDispatcher_Handle_CaseAcknowledged_RetryAfterChatFailureResends(t *testing.T) {
 	chat := &mockGoogleChatSender{err: errors.New("webhook unreachable")}
 	d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","acknowledgerName":"Jane Doe"}}`)}
+	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","product":"api-manager","acknowledgerName":"Jane Doe"}}`)}
 
 	if err := d.Handle(context.Background(), record); err == nil {
 		t.Fatal("expected the chat error to propagate on the first attempt")
@@ -1028,10 +764,9 @@ func TestDispatcher_Handle_CaseAcknowledged_RetryAfterChatFailureResends(t *test
 		t.Fatalf("retry: Handle() error = %v, want nil once the failure clears", err)
 	}
 	// Both the failed first attempt and the succeeding retry actually
-	// invoked SendCaseAcknowledgedAlert — the failed attempt's release
-	// path frees the audience's key precisely so the retry genuinely
-	// re-attempts it, rather than silently treating the record as already
-	// handled.
+	// invoked SendCaseAcknowledgedAlert — claim's failure path releases the
+	// key precisely so the retry genuinely re-attempts it, rather than
+	// silently treating the record as already handled.
 	if len(chat.caseAcknowledgedCalls) != 2 {
 		t.Errorf("expected 2 send attempts (1 failed, 1 succeeded), got %d", len(chat.caseAcknowledgedCalls))
 	}
@@ -1042,7 +777,7 @@ func TestDispatcher_Handle_SeverityChanged(t *testing.T) {
 	chat := &mockGoogleChatSender{}
 	d := newTestDispatcher(mock, chat, &mockCallSender{})
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","caseNumber":"CS0001001","wso2CaseId":"WSO2-1000","caseTitle":"Something broke","oldSeverity":"HIGH","newSeverity":"LOW","recipients":["test-recipient@example.com"]}}`)}
+	record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","caseNumber":"CS0001001","wso2CaseId":"WSO2-1000","caseTitle":"Something broke","oldSeverity":"HIGH","newSeverity":"LOW","product":"api-manager","recipients":["test-recipient@example.com"]}}`)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -1063,49 +798,9 @@ func TestDispatcher_Handle_SeverityChanged(t *testing.T) {
 		t.Fatalf("expected 1 Google Chat alert sent, got %d", len(chat.severityChangedCalls))
 	}
 	gotChat := chat.severityChangedCalls[0]
-	if gotChat.oldSeverityLabel != "High (P2)" || gotChat.newSeverityLabel != "Low (P4)" || gotChat.caseLink != "https://csm.example/cases/CASE-1" {
+	if gotChat.audience != chataudience.IncidentMonitor || gotChat.oldSeverityLabel != "High (P2)" || gotChat.newSeverityLabel != "Low (P4)" || gotChat.caseLink != "https://csm.example/cases/CASE-1" {
 		t.Errorf("unexpected SendSeverityChangedAlert args: %+v", gotChat)
 	}
-}
-
-// TestDispatcher_Handle_SeverityChanged_ChatRoutesToTeamOrIncidentMonitor
-// mirrors TestDispatcher_Handle_CaseCreated_ChatRoutesToTeamOrIncidentMonitor
-// for case.severity_changed: audience-routed the same way, not
-// product-routed, so a resolved audience always exists (there is no "no
-// product configured" skip any more — Incident Monitor is the
-// unconditional fallback).
-func TestDispatcher_Handle_SeverityChanged_ChatRoutesToTeamOrIncidentMonitor(t *testing.T) {
-	t.Run("configured team gets its own alert", func(t *testing.T) {
-		chat := &mockGoogleChatSender{hasAudienceSpace: func(a string) bool { return a == "Castor" }}
-		d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
-
-		record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","team":"Castor","recipients":["test-recipient@example.com"]}}`)}
-
-		if err := d.Handle(context.Background(), record); err != nil {
-			t.Fatalf("Handle() error = %v", err)
-		}
-		if len(chat.severityChangedCalls) != 1 || chat.severityChangedCalls[0].product != "Castor" {
-			t.Fatalf("expected exactly 1 chat alert routed to audience %q, got %+v", "Castor", chat.severityChangedCalls)
-		}
-	})
-
-	t.Run("no team falls back to Incident Monitor, not skipped", func(t *testing.T) {
-		mock := &mockEmailSender{}
-		chat := &mockGoogleChatSender{}
-		d := newTestDispatcher(mock, chat, &mockCallSender{})
-
-		record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","recipients":["test-recipient@example.com"]}}`)}
-
-		if err := d.Handle(context.Background(), record); err != nil {
-			t.Fatalf("Handle() error = %v", err)
-		}
-		if len(chat.severityChangedCalls) != 1 || chat.severityChangedCalls[0].product != chatAudienceIncidentMonitor {
-			t.Fatalf("expected exactly 1 chat alert routed to %q, got %+v", chatAudienceIncidentMonitor, chat.severityChangedCalls)
-		}
-		if len(mock.calls) != 1 {
-			t.Errorf("expected the email to still be sent independently, got %d calls", len(mock.calls))
-		}
-	})
 }
 
 // TestDispatcher_Handle_SeverityChanged_ChatFailureStillSendsEmail verifies
@@ -1116,7 +811,7 @@ func TestDispatcher_Handle_SeverityChanged_ChatFailureStillSendsEmail(t *testing
 	chat := &mockGoogleChatSender{err: errors.New("webhook unreachable")}
 	d := newTestDispatcher(mock, chat, &mockCallSender{})
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","recipients":["test-recipient@example.com"]}}`)}
+	record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","product":"api-manager","recipients":["test-recipient@example.com"]}}`)}
 
 	if err := d.Handle(context.Background(), record); err == nil {
 		t.Fatal("expected the chat error to propagate")
@@ -1134,9 +829,9 @@ func TestDispatcher_Handle_SeverityChanged_ChatFailureStillSendsEmail(t *testing
 func TestDispatcher_Handle_SeverityChanged_EmailFailureStillSendsChat(t *testing.T) {
 	chat := &mockGoogleChatSender{}
 	links := &mockLinkResolver{err: errors.New("entity-service unreachable")}
-	d := NewDispatcher(&mockEmailSender{}, chat, &mockCallSender{}, links, true, false, nil, true, "", "")
+	d := NewDispatcher(&mockEmailSender{}, chat, &mockCallSender{}, links, true, false, nil, true, "", nil)
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","recipients":["test-recipient@example.com"]}}`)}
+	record := eventbus.Record{Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","product":"api-manager","recipients":["test-recipient@example.com"]}}`)}
 
 	if err := d.Handle(context.Background(), record); err == nil {
 		t.Fatal("expected the link-resolution error to propagate")
@@ -1153,7 +848,7 @@ func TestDispatcher_Handle_SeverityChanged_ForgetsAfterFullSuccess(t *testing.T)
 	chat := &mockGoogleChatSender{}
 	d := newTestDispatcher(mock, chat, &mockCallSender{})
 
-	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","recipients":["test-recipient@example.com"]}}`)}
+	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(`{"type":"case.severity_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","oldSeverity":"HIGH","newSeverity":"LOW","product":"api-manager","recipients":["test-recipient@example.com"]}}`)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -1177,7 +872,7 @@ func TestDispatcher_Handle_TwoRecipientsTwoLinks_SendsTwoEmails(t *testing.T) {
 		}
 		return "https://csm.example.com/cases/CASE-1"
 	}}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","recipients":["customer@acme.com","agent@wso2.com"]}}`)}
 
@@ -1210,6 +905,75 @@ func TestDispatcher_Handle_TwoRecipientsTwoLinks_SendsTwoEmails(t *testing.T) {
 	}
 }
 
+// TestDispatcher_Handle_DefaultCSMEmailCC_OnlyOnCSMGroup is the regression
+// test for Dispatcher.defaultCSMEmailCC: a comment-added event with
+// recipients spanning both the customer-portal and CSM-portal groups must
+// CC the configured default only on the CSM-portal group's own SendEmail
+// call — the customer-portal group's call must carry no cc at all.
+func TestDispatcher_Handle_DefaultCSMEmailCC_OnlyOnCSMGroup(t *testing.T) {
+	mock := &mockEmailSender{}
+	links := &mockLinkResolver{linkFor: func(email string) string {
+		if email == "customer@acme.com" {
+			return "https://customer.example.com/projects/PROJ-1/support/cases/CASE-1"
+		}
+		// Must match (&mockLinkResolver{}).CSMLink("CASE-1") exactly --
+		// that's the value sendPerGroup compares caseLink against to
+		// decide which group is the CSM one.
+		return "https://csm.example/cases/CASE-1"
+	}}
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", []string{"cc@wso2.com"})
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","recipients":["customer@acme.com","agent@wso2.com"]}}`)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(mock.calls) != 2 {
+		t.Fatalf("expected 2 emails sent, got %d", len(mock.calls))
+	}
+	byRecipient := make(map[string]sentEmail)
+	for _, call := range mock.calls {
+		byRecipient[call.to[0]] = call
+	}
+	csmEmail, ok := byRecipient["agent@wso2.com"]
+	if !ok {
+		t.Fatal("no email sent to agent@wso2.com")
+	}
+	if !slices.Equal(csmEmail.cc, []string{"cc@wso2.com"}) {
+		t.Errorf("CSM group cc = %v, want [cc@wso2.com]", csmEmail.cc)
+	}
+	customerEmail, ok := byRecipient["customer@acme.com"]
+	if !ok {
+		t.Fatal("no email sent to customer@acme.com")
+	}
+	if customerEmail.cc != nil {
+		t.Errorf("customer group cc = %v, want nil -- the default CC must never reach the customer-portal group", customerEmail.cc)
+	}
+}
+
+// TestDispatcher_Handle_DefaultCSMEmailCC_SuppressedInDebugMode: even for
+// the CSM-portal group, EMAIL_DEBUG_MODE must suppress the default CC
+// entirely rather than redirect it — a debug run must never leak to the
+// real, shared default inbox just because `to` is being redirected to a
+// safe test list.
+func TestDispatcher_Handle_DefaultCSMEmailCC_SuppressedInDebugMode(t *testing.T) {
+	mock := &mockEmailSender{}
+	links := &mockLinkResolver{linkFor: func(string) string { return "https://csm.example/cases/CASE-1" }}
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, true, []string{"debug@wso2.com"}, true, "", []string{"cc@wso2.com"})
+
+	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","recipients":["agent@wso2.com"]}}`)}
+
+	if err := d.Handle(context.Background(), record); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("expected 1 email sent, got %d", len(mock.calls))
+	}
+	if mock.calls[0].cc != nil {
+		t.Errorf("cc = %v, want nil -- EMAIL_DEBUG_MODE must suppress the default CC, not redirect it", mock.calls[0].cc)
+	}
+}
+
 // TestDispatcher_Handle_CommentAdded_RetryDoesNotResendSucceededGroup is a
 // regression test: eventbus.Consumer retries the whole Handle call on any
 // error. When one recipient group's SendEmail persistently fails while
@@ -1233,7 +997,7 @@ func TestDispatcher_Handle_CommentAdded_RetryDoesNotResendSucceededGroup(t *test
 		}
 		return "https://csm.example.com/cases/CASE-1"
 	}}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","recipients":["customer@acme.com","agent@wso2.com"]}}`)}
 
@@ -1291,7 +1055,7 @@ func TestDispatcher_Handle_TwoRecipientsSameLink_SendsOneEmail(t *testing.T) {
 func TestDispatcher_Handle_ResolveLinksFails_NoEmailSent(t *testing.T) {
 	mock := &mockEmailSender{}
 	links := &mockLinkResolver{err: errors.New("entity-service unreachable")}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, links, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.status_changed","entityId":"CASE-1","payload":{"projectId":"PROJ-1","caseId":"CASE-1","newStatus":"Open","recipients":["test-recipient@example.com"]}}`)}
 
@@ -1385,22 +1149,13 @@ func TestDispatcher_Handle_SendFailurePropagates(t *testing.T) {
 const validIncidentRecord = `{"type":"incident.created","entityId":"INC-1","payload":{"product":"api-manager","title":"P1 outage","shortDescription":"Everything is down","callTo":"+15551234567"}}`
 
 func TestDispatcher_Handle_IncidentCreated(t *testing.T) {
-	chat := &mockGoogleChatSender{}
 	call := &mockCallSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(validIncidentRecord)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
-	}
-	if len(chat.calls) != 1 {
-		t.Fatalf("expected 1 Google Chat alert sent, got %d", len(chat.calls))
-	}
-	gotChat := chat.calls[0]
-	if gotChat.product != "api-manager" || gotChat.title != "P1 outage" ||
-		gotChat.shortDescription != "Everything is down" || gotChat.portalURL != "https://csm.example/operations/incidents/INC-1" {
-		t.Errorf("unexpected SendIncidentAlert args: %+v", gotChat)
 	}
 	if len(call.calls) != 1 {
 		t.Fatalf("expected 1 call placed, got %d", len(call.calls))
@@ -1414,50 +1169,16 @@ func TestDispatcher_Handle_IncidentCreated(t *testing.T) {
 	}
 }
 
-func TestDispatcher_Handle_IncidentCreated_ChatFailureStillPlacesCall(t *testing.T) {
-	chat := &mockGoogleChatSender{err: errors.New("webhook unreachable")}
-	call := &mockCallSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
-
-	record := eventbus.Record{Value: []byte(validIncidentRecord)}
-
-	if err := d.Handle(context.Background(), record); err == nil {
-		t.Fatal("expected the chat error to propagate")
-	}
-	if len(call.calls) != 1 {
-		t.Fatal("expected the call to still be placed despite the chat failure")
-	}
-}
-
-func TestDispatcher_Handle_IncidentCreated_CallFailureStillSendsChat(t *testing.T) {
-	chat := &mockGoogleChatSender{}
+// TestDispatcher_Handle_IncidentCreated_RetryDoesNotResendSucceededCall is a
+// regression test: eventbus.Consumer retries the whole Handle call on any
+// error. A call that fails releases its claim (via claim's own failure
+// path), so a retry genuinely re-attempts it, and once there's truly no
+// further retry coming, record.NoMoreRetries (not IsFinalAttempt — see
+// NoMoreRetries' own doc comment for why) releases its tracking entry so it
+// doesn't stay in d.done forever.
+func TestDispatcher_Handle_IncidentCreated_RetryDoesNotResendSucceededCall(t *testing.T) {
 	call := &mockCallSender{err: errors.New("twilio unreachable")}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
-
-	record := eventbus.Record{Value: []byte(validIncidentRecord)}
-
-	if err := d.Handle(context.Background(), record); err == nil {
-		t.Fatal("expected the call error to propagate")
-	}
-	if len(chat.calls) != 1 {
-		t.Fatal("expected the chat alert to still be sent despite the call failure")
-	}
-}
-
-// TestDispatcher_Handle_IncidentCreated_RetryDoesNotResendSucceededChannel is
-// a regression test: eventbus.Consumer retries the whole Handle call on any
-// error. Before the per-channel done-tracking existed, a persistently
-// failing call would cause the chat alert to be resent on every retry too.
-// It also covers the done-map cleanup once there's truly no further retry
-// coming: the call channel here never succeeds, so record.NoMoreRetries
-// (not IsFinalAttempt — see NoMoreRetries' own doc comment for why) is what
-// releases its and chat's tracking entries once nothing will ever attempt
-// this record's content again — without that, they'd stay in d.done
-// forever.
-func TestDispatcher_Handle_IncidentCreated_RetryDoesNotResendSucceededChannel(t *testing.T) {
-	chat := &mockGoogleChatSender{}
-	call := &mockCallSender{err: errors.New("twilio unreachable")}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(validIncidentRecord)}
 
@@ -1468,9 +1189,6 @@ func TestDispatcher_Handle_IncidentCreated_RetryDoesNotResendSucceededChannel(t 
 		}
 	}
 
-	if len(chat.calls) != 1 {
-		t.Errorf("chat sent %d times across 3 retries, want exactly 1 (call kept failing, chat should not be resent)", len(chat.calls))
-	}
 	if len(call.calls) != 3 {
 		t.Errorf("call attempted %d times across 3 retries, want 3 (the genuinely failing channel should keep retrying)", len(call.calls))
 	}
@@ -1480,14 +1198,11 @@ func TestDispatcher_Handle_IncidentCreated_RetryDoesNotResendSucceededChannel(t 
 }
 
 // TestDispatcher_Handle_IncidentCreated_ForgetsAfterFullSuccess is a
-// regression test for the other direction: once both channels succeed
-// (possibly across separate Handle calls), a later, unrelated record must
-// not be affected by stale tracking, and re-processing the *same* record key
-// again (e.g. after a restart-triggered redelivery) starts fresh.
+// regression test for the other direction: once the call succeeds, its
+// tracking entry must not leak in d.done forever.
 func TestDispatcher_Handle_IncidentCreated_ForgetsAfterFullSuccess(t *testing.T) {
-	chat := &mockGoogleChatSender{}
 	call := &mockCallSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(validIncidentRecord)}
 
@@ -1499,84 +1214,36 @@ func TestDispatcher_Handle_IncidentCreated_ForgetsAfterFullSuccess(t *testing.T)
 	}
 }
 
-func TestDispatcher_Handle_IncidentCreated_BothFail(t *testing.T) {
-	chat := &mockGoogleChatSender{err: errors.New("webhook unreachable")}
-	call := &mockCallSender{err: errors.New("twilio unreachable")}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
-
-	record := eventbus.Record{Value: []byte(validIncidentRecord)}
-
-	err := d.Handle(context.Background(), record)
-	if err == nil {
-		t.Fatal("expected a combined error")
-	}
-	if !strings.Contains(err.Error(), "webhook unreachable") || !strings.Contains(err.Error(), "twilio unreachable") {
-		t.Errorf("error = %q, want it to mention both underlying failures", err.Error())
-	}
-}
-
-// TestDispatcher_Handle_IncidentCreated_UsesDefaultsWhenOmitted verifies a
-// publisher that can't determine which Chat space or on-call number applies
-// (e.g. entity-service) can omit product/callTo, and the Dispatcher's own
-// configured defaults are used instead.
-func TestDispatcher_Handle_IncidentCreated_UsesDefaultsWhenOmitted(t *testing.T) {
-	chat := &mockGoogleChatSender{}
+// TestDispatcher_Handle_IncidentCreated_UsesDefaultWhenCallToOmitted
+// verifies a publisher that can't determine the on-call number itself
+// (e.g. entity-service) can omit callTo, and Dispatcher's own configured
+// default is used instead.
+func TestDispatcher_Handle_IncidentCreated_UsesDefaultWhenCallToOmitted(t *testing.T) {
 	call := &mockCallSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "api-manager", "+15559998888")
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, true, "+15559998888", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"incident.created","entityId":"INC-1","payload":{"title":"P1 outage","shortDescription":"Everything is down"}}`)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
 	}
-	if len(chat.calls) != 1 || chat.calls[0].product != "api-manager" {
-		t.Fatalf("expected the chat alert to use the default product, got %+v", chat.calls)
-	}
 	if len(call.calls) != 1 || call.calls[0].to != "+15559998888" {
 		t.Fatalf("expected the call to use the default callTo, got %+v", call.calls)
 	}
 }
 
-// TestDispatcher_Handle_IncidentCreated_SkipsChatWhenNoProduct verifies that
-// when both the payload's product and DEFAULT_CHAT_PRODUCT are empty, the
-// Google Chat alert is skipped (not attempted with an empty product, which
-// would just return a real "no space configured" error and burn retries)
-// while the call still goes through independently.
-func TestDispatcher_Handle_IncidentCreated_SkipsChatWhenNoProduct(t *testing.T) {
-	chat := &mockGoogleChatSender{}
-	call := &mockCallSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
-
-	record := eventbus.Record{Value: []byte(`{"type":"incident.created","entityId":"INC-1","payload":{"title":"P1 outage","shortDescription":"Everything is down","callTo":"+15551234567"}}`)}
-
-	if err := d.Handle(context.Background(), record); err != nil {
-		t.Fatalf("Handle() error = %v", err)
-	}
-	if len(chat.calls) != 0 {
-		t.Errorf("expected no Google Chat alert with no product resolved, got %d calls", len(chat.calls))
-	}
-	if len(call.calls) != 1 {
-		t.Errorf("expected the call to still be placed independently, got %d calls", len(call.calls))
-	}
-}
-
-// TestDispatcher_Handle_IncidentCreated_SkipsCallWhenNoCallTo verifies the
-// mirror image: when both the payload's callTo and INCIDENT_DEFAULT_CALL_TO
-// are empty (and calling is otherwise enabled), the call is skipped instead
-// of being attempted with an empty destination, while the Chat alert still
-// sends independently.
+// TestDispatcher_Handle_IncidentCreated_SkipsCallWhenNoCallTo verifies that
+// when both the payload's callTo and INCIDENT_DEFAULT_CALL_TO are empty (and
+// calling is otherwise enabled), the call is skipped instead of being
+// attempted with an empty destination, and Handle still succeeds.
 func TestDispatcher_Handle_IncidentCreated_SkipsCallWhenNoCallTo(t *testing.T) {
-	chat := &mockGoogleChatSender{}
 	call := &mockCallSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, true, "", "")
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"incident.created","entityId":"INC-1","payload":{"product":"api-manager","title":"P1 outage","shortDescription":"Everything is down"}}`)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
-	}
-	if len(chat.calls) != 1 {
-		t.Errorf("expected the chat alert to still be sent independently, got %d calls", len(chat.calls))
 	}
 	if len(call.calls) != 0 {
 		t.Errorf("expected no call with no callTo resolved, got %d calls", len(call.calls))
@@ -1584,20 +1251,16 @@ func TestDispatcher_Handle_IncidentCreated_SkipsCallWhenNoCallTo(t *testing.T) {
 }
 
 // TestDispatcher_Handle_IncidentCreated_CallSendingDisabled verifies the
-// CALL_SENDING_ENABLED killswitch: Handle still succeeds and the Google Chat
-// alert still sends, but MakeCall is never invoked.
+// CALL_SENDING_ENABLED killswitch: Handle still succeeds, but MakeCall is
+// never invoked.
 func TestDispatcher_Handle_IncidentCreated_CallSendingDisabled(t *testing.T) {
-	chat := &mockGoogleChatSender{}
 	call := &mockCallSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, call, &mockLinkResolver{}, true, false, nil, false, "", "")
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, false, "", nil)
 
 	record := eventbus.Record{Value: []byte(validIncidentRecord)}
 
 	if err := d.Handle(context.Background(), record); err != nil {
 		t.Fatalf("Handle() error = %v", err)
-	}
-	if len(chat.calls) != 1 {
-		t.Errorf("expected the chat alert to still be sent, got %d calls", len(chat.calls))
 	}
 	if len(call.calls) != 0 {
 		t.Errorf("expected MakeCall to never be invoked while disabled, got %d calls", len(call.calls))
@@ -1613,7 +1276,7 @@ func TestDispatcher_Handle_IncidentCreated_CallSendingDisabled(t *testing.T) {
 func TestDispatcher_Handle_CaseCreated_EmailSendingDisabled(t *testing.T) {
 	mock := &mockEmailSender{}
 	chat := &mockGoogleChatSender{}
-	d := NewDispatcher(mock, chat, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "api-manager", "")
+	d := NewDispatcher(mock, chat, &mockCallSender{}, &mockLinkResolver{}, false, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"Incident","priority":"P3","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
 
@@ -1643,8 +1306,9 @@ func TestDispatcher_Handle_IgnoresSLATierReached(t *testing.T) {
 	if err := d.Handle(context.Background(), eventbus.Record{Value: []byte(record)}); err != nil {
 		t.Errorf("Handle(%s) error = %v, want nil", record, err)
 	}
-	if len(mock.calls) != 0 || len(chat.calls) != 0 || len(call.calls) != 0 {
-		t.Errorf("expected no notification sent, got email=%d chat=%d call=%d", len(mock.calls), len(chat.calls), len(call.calls))
+	chatCalls := len(chat.caseCreatedCalls) + len(chat.caseAcknowledgedCalls) + len(chat.severityChangedCalls) + len(chat.securityReportAnalysisCalls)
+	if len(mock.calls) != 0 || chatCalls != 0 || len(call.calls) != 0 {
+		t.Errorf("expected no notification sent, got email=%d chat=%d call=%d", len(mock.calls), chatCalls, len(call.calls))
 	}
 }
 
@@ -1668,24 +1332,24 @@ func TestMaskPhone(t *testing.T) {
 	}
 }
 
-// concurrencyProbeChatSender is a googleChatSender that records the highest
-// number of SendIncidentAlert calls it ever had in flight at once — the
-// invariant TestDispatcher_Handle_ConcurrentClaimNeverOverlaps checks — by
-// sleeping briefly inside the "critical section" to widen the window a race
-// would need to land in. It deliberately does NOT check the total call
-// count: once a call completes and Dispatcher.forget releases its claim
-// (the same eager-cleanup-on-full-success behavior
-// TestDispatcher_Handle_IncidentCreated_ForgetsAfterFullSuccess already
-// pins as intentional), a later, independent Handle call legitimately
-// reclaims and resends — that is not the race being tested here.
-type concurrencyProbeChatSender struct {
+// concurrencyProbeCallSender is a callSender that records the highest number
+// of MakeCall calls it ever had in flight at once — the invariant
+// TestDispatcher_Handle_ConcurrentClaimNeverOverlaps checks — by sleeping
+// briefly inside the "critical section" to widen the window a race would
+// need to land in. It deliberately does NOT check the total call count: once
+// a call completes and Dispatcher.forget releases its claim (the same
+// eager-cleanup-on-full-success behavior
+// TestDispatcher_Handle_IncidentCreated_ForgetsAfterFullSuccess already pins
+// as intentional), a later, independent Handle call legitimately reclaims
+// and re-places the call — that is not the race being tested here.
+type concurrencyProbeCallSender struct {
 	mu        sync.Mutex
 	active    int
 	maxActive int
 	sends     int
 }
 
-func (s *concurrencyProbeChatSender) SendIncidentAlert(ctx context.Context, product, title, shortDescription, portalURL string) error {
+func (s *concurrencyProbeCallSender) MakeCall(ctx context.Context, to, message string) error {
 	s.mu.Lock()
 	s.active++
 	s.sends++
@@ -1702,29 +1366,6 @@ func (s *concurrencyProbeChatSender) SendIncidentAlert(ctx context.Context, prod
 	return nil
 }
 
-// SendCaseCreatedAlert/SendCaseAcknowledgedAlert are unused by this probe
-// (it only exercises handleIncidentCreated's SendIncidentAlert path) — stub
-// implementations exist solely to satisfy googleChatSender.
-func (s *concurrencyProbeChatSender) SendCaseCreatedAlert(ctx context.Context, product, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string) error {
-	return nil
-}
-
-func (s *concurrencyProbeChatSender) SendSecurityReportAnalysisAlert(ctx context.Context, product, caseNumber, wso2CaseID, productName, title, team, caseLink string) error {
-	return nil
-}
-
-func (s *concurrencyProbeChatSender) SendCaseAcknowledgedAlert(ctx context.Context, product, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string) error {
-	return nil
-}
-
-func (s *concurrencyProbeChatSender) SendSeverityChangedAlert(ctx context.Context, product, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string) error {
-	return nil
-}
-
-func (s *concurrencyProbeChatSender) HasAudienceSpace(audience string) bool {
-	return false
-}
-
 // TestDispatcher_Handle_ConcurrentClaimNeverOverlaps is a regression test
 // for a real race in the old alreadyDone/markDone pattern: checking "not
 // done yet" and marking "done" were two separate lock acquisitions, so two
@@ -1734,12 +1375,12 @@ func (s *concurrencyProbeChatSender) HasAudienceSpace(audience string) bool {
 // and both attempt the same outbound call before either one recorded it as
 // claimed. claim() closes this by checking-and-setting in one lock
 // acquisition, so at most one caller is ever inside the send at once —
-// concurrencyProbeChatSender's maxActive is what this test actually
+// concurrencyProbeCallSender's maxActive is what this test actually
 // verifies, deliberately not the total send count (see its own doc
 // comment for why that's a separate, already-accepted behavior).
 func TestDispatcher_Handle_ConcurrentClaimNeverOverlaps(t *testing.T) {
-	chat := &concurrencyProbeChatSender{}
-	d := NewDispatcher(&mockEmailSender{}, chat, &mockCallSender{}, &mockLinkResolver{}, true, false, nil, true, "", "")
+	call := &concurrencyProbeCallSender{}
+	d := NewDispatcher(&mockEmailSender{}, &mockGoogleChatSender{}, call, &mockLinkResolver{}, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Topic: "case-events", Partition: 1, Offset: 42, Value: []byte(validIncidentRecord)}
 
@@ -1754,13 +1395,13 @@ func TestDispatcher_Handle_ConcurrentClaimNeverOverlaps(t *testing.T) {
 	}
 	wg.Wait()
 
-	chat.mu.Lock()
-	defer chat.mu.Unlock()
-	if chat.maxActive > 1 {
-		t.Errorf("maxActive = %d, want at most 1 (two Handle calls were inside SendIncidentAlert at the same time — claim() failed to serialize them)", chat.maxActive)
+	call.mu.Lock()
+	defer call.mu.Unlock()
+	if call.maxActive > 1 {
+		t.Errorf("maxActive = %d, want at most 1 (two Handle calls were inside MakeCall at the same time — claim() failed to serialize them)", call.maxActive)
 	}
-	if chat.sends < 1 {
-		t.Error("expected at least one Chat alert to have been sent")
+	if call.sends < 1 {
+		t.Error("expected at least one call to have been placed")
 	}
 }
 
@@ -1770,10 +1411,6 @@ func TestDispatcher_Handle_ConcurrentClaimNeverOverlaps(t *testing.T) {
 type blockingCaseAcknowledgedChatSender struct {
 	proceed chan struct{}
 	calls   int32
-}
-
-func (s *blockingCaseAcknowledgedChatSender) SendIncidentAlert(ctx context.Context, product, title, shortDescription, portalURL string) error {
-	return nil
 }
 
 func (s *blockingCaseAcknowledgedChatSender) SendCaseCreatedAlert(ctx context.Context, product, severityLabel, severityColor, caseNumber, wso2CaseID, productName, title, team, caseLink string) error {
@@ -1794,28 +1431,20 @@ func (s *blockingCaseAcknowledgedChatSender) SendSeverityChangedAlert(ctx contex
 	return nil
 }
 
-func (s *blockingCaseAcknowledgedChatSender) HasAudienceSpace(audience string) bool {
-	return false
-}
-
-// TestDispatcher_Handle_CaseAcknowledged_ConcurrentLoserDoesNotReleaseWinnersClaim
-// mirrors TestDispatcher_Handle_CaseCreated_ConcurrentBlockedEmailDoesNotDuplicateChat's
-// shape now that handleCaseAcknowledged uses the same beginRecord/endRecord
-// refcounting (see that function's own doc comment for why multi-audience
-// Chat needs it even with no second channel): a losing concurrent call for
-// the exact same record must not release the audience key a still in-flight
-// winner holds. Unlike this test's own predecessor, the loser here does NOT
-// set record.NoMoreRetries — beginRecord/endRecord's NoMoreRetries branch
-// releases unconditionally by design (see beginRecord's own doc comment),
-// the same accepted trade-off handleCaseCreated/handleIncidentCreated
-// already carry; this test isolates the ordinary concurrent-claim-race
-// guarantee (refcount-gated safeToRelease), which is the guarantee this
-// handler actually provides.
-func TestDispatcher_Handle_CaseAcknowledged_ConcurrentLoserDoesNotReleaseWinnersClaim(t *testing.T) {
+// TestDispatcher_Handle_CaseAcknowledged_LosingConcurrentCallDoesNotReleaseWinnersClaim
+// is a regression test for the case.acknowledged analogue of
+// TestDispatcher_Handle_LosingConcurrentCallDoesNotReleaseWinnersClaim below:
+// handleCaseAcknowledged's release condition used to be
+// "record.NoMoreRetries || chatOwned", so a losing concurrent call (one that
+// never won the claim, chatOwned false) with NoMoreRetries true would force
+// -release the key anyway — right out from under a different, still
+// in-flight call genuinely blocked inside SendCaseAcknowledgedAlert. A third
+// attempt could then reclaim and send a duplicate acknowledgement alert.
+func TestDispatcher_Handle_CaseAcknowledged_LosingConcurrentCallDoesNotReleaseWinnersClaim(t *testing.T) {
 	chat := &blockingCaseAcknowledgedChatSender{proceed: make(chan struct{})}
 	d := newTestDispatcher(&mockEmailSender{}, chat, &mockCallSender{})
 
-	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","acknowledgerName":"Jane Doe"}}`)}
+	record := eventbus.Record{Value: []byte(`{"type":"case.acknowledged","entityId":"CASE-1","payload":{"caseId":"CASE-1","caseNumber":"CS0001001","severity":"HIGH","product":"api-manager","acknowledgerName":"Jane Doe"}}`)}
 	baseKey := recordBaseKey(record)
 
 	winnerDone := make(chan struct{})
@@ -1831,17 +1460,21 @@ func TestDispatcher_Handle_CaseAcknowledged_ConcurrentLoserDoesNotReleaseWinners
 	}
 
 	// The loser: a second, concurrent Handle call for the exact same
-	// record. It loses the audience claim (the winner already holds it) and
-	// so attempts nothing.
-	if err := d.Handle(context.Background(), record); err != nil {
+	// record, with NoMoreRetries set — simulating a DLQ-exhausted delivery
+	// racing the still in-flight main-topic winner. It must lose the claim
+	// and, per the fix, must not force-release chatKey just because
+	// NoMoreRetries is true.
+	loserRecord := record
+	loserRecord.NoMoreRetries = true
+	if err := d.Handle(context.Background(), loserRecord); err != nil {
 		t.Fatalf("loser: Handle() error = %v, want nil", err)
 	}
 
 	d.doneMu.Lock()
-	chatStillClaimed := d.done[baseKey+"/chat/"+chatAudienceIncidentMonitor]
+	chatStillClaimed := d.done[baseKey+"/chat"]
 	d.doneMu.Unlock()
 	if !chatStillClaimed {
-		t.Fatal("chat audience key was released by the losing call while the winner was still mid-SendCaseAcknowledgedAlert")
+		t.Fatal("chatKey was released by the losing call while the winner was still mid-SendCaseAcknowledgedAlert")
 	}
 
 	close(chat.proceed)
@@ -1888,7 +1521,7 @@ func (s *blockingEmailSender) SendEmail(ctx context.Context, to, cc, bcc, replyT
 // branch, so the losing call here must leave the winner's claim untouched.
 func TestDispatcher_Handle_LosingConcurrentCallDoesNotReleaseWinnersClaim(t *testing.T) {
 	mock := &blockingEmailSender{proceed: make(chan struct{})}
-	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, false, nil, true, "", "")
+	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{}, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.comment_added","entityId":"CASE-1","payload":{"name":"Commenter","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseComment":"fixed it","commentId":"C-1","recipients":["agent@wso2.com"]}}`)}
 	key := recordBaseKey(record) + "/email/https://csm.example/cases/CASE-1"
@@ -1945,7 +1578,7 @@ func TestDispatcher_Handle_LosingConcurrentCallDoesNotReleaseWinnersClaim(t *tes
 func TestDispatcher_Handle_CaseCreated_ConcurrentBlockedEmailDoesNotDuplicateChat(t *testing.T) {
 	email := &blockingEmailSender{proceed: make(chan struct{})}
 	chat := &mockGoogleChatSender{}
-	d := NewDispatcher(email, chat, &mockCallSender{}, &mockLinkResolver{}, true, false, nil, true, "", "")
+	d := NewDispatcher(email, chat, &mockCallSender{}, &mockLinkResolver{}, true, false, nil, true, "", nil)
 
 	record := eventbus.Record{Value: []byte(`{"type":"case.created","entityId":"CASE-1","payload":{"reporterName":"Reporter","projectName":"Proj","projectId":"PROJ-1","caseId":"CASE-1","caseTitle":"Something broke","caseType":"Incident","priority":"P3","product":"api-manager","createdAt":"2026-01-01","description":"desc","recipients":["test-recipient@example.com"]}}`)}
 	baseKey := recordBaseKey(record)
@@ -1978,16 +1611,14 @@ func TestDispatcher_Handle_CaseCreated_ConcurrentBlockedEmailDoesNotDuplicateCha
 		t.Fatalf("chat sent %d times before the winner finished, want exactly 1", sentSoFar)
 	}
 
-	// The bug this guards against: the loser releasing the chat key here
-	// (having seen a "clean" record with no errors of its own) would let a
-	// later attempt reclaim and resend it while the winner is still
-	// working. With no team on this payload, the sole resolved audience is
-	// "Incident Monitor" (see resolveChatAudiences' own fallback).
+	// The bug this guards against: the loser releasing chatKey here (having
+	// seen a "clean" record with no errors of its own) would let a later
+	// attempt reclaim and resend it while the winner is still working.
 	d.doneMu.Lock()
-	chatStillClaimed := d.done[baseKey+"/chat/"+chatAudienceIncidentMonitor]
+	chatStillClaimed := d.done[baseKey+"/chat"]
 	d.doneMu.Unlock()
 	if !chatStillClaimed {
-		t.Fatal("chat audience key was released while the winner was still mid-SendEmail")
+		t.Fatal("chatKey was released while the winner was still mid-SendEmail")
 	}
 
 	close(email.proceed)
@@ -2126,7 +1757,7 @@ func TestDispatcher_Handle_CRApprovalRequested_LinksByAudience(t *testing.T) {
 func TestDispatcher_Handle_CRApprovalRequested_Killswitch(t *testing.T) {
 	mock := &mockEmailSender{}
 	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{},
-		false, false, nil, true, "", "")
+		false, false, nil, true, "", nil)
 
 	if err := d.Handle(context.Background(), crRecord("internal", "")); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -2141,7 +1772,7 @@ func TestDispatcher_Handle_CRApprovalRequested_Killswitch(t *testing.T) {
 func TestDispatcher_Handle_CRApprovalRequested_DebugMode(t *testing.T) {
 	mock := &mockEmailSender{}
 	d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{},
-		true, true, []string{"debug@wso2.com"}, true, "", "")
+		true, true, []string{"debug@wso2.com"}, true, "", nil)
 
 	if err := d.Handle(context.Background(), crRecord("internal", "")); err != nil {
 		t.Fatalf("Handle() error = %v", err)
@@ -2152,6 +1783,54 @@ func TestDispatcher_Handle_CRApprovalRequested_DebugMode(t *testing.T) {
 	if got := mock.calls[0].to; len(got) != 1 || got[0] != "debug@wso2.com" {
 		t.Errorf("to = %v, want the debug list to replace the real audience", got)
 	}
+}
+
+// TestDispatcher_Handle_CRPlanDateNotice_DebugMode verifies the debug
+// redirect applies here too, for both the internal (visible To) and
+// customer (BCC) branches — only the configured debug recipients ever see
+// either send, never the real audience, in either branch.
+func TestDispatcher_Handle_CRPlanDateNotice_DebugMode(t *testing.T) {
+	t.Run("internal audience — To is redirected", func(t *testing.T) {
+		mock := &mockEmailSender{}
+		d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{},
+			true, true, []string{"debug@wso2.com"}, true, "", nil)
+
+		if err := d.Handle(context.Background(), planDateRecord("customer_proposed", "internal", "")); err != nil {
+			t.Fatalf("Handle() error = %v", err)
+		}
+		if len(mock.calls) != 1 {
+			t.Fatalf("sent %d emails, want 1", len(mock.calls))
+		}
+		sent := mock.calls[0]
+		if len(sent.to) != 1 || sent.to[0] != "debug@wso2.com" {
+			t.Errorf("to = %v, want only the debug recipient", sent.to)
+		}
+		if len(sent.bcc) != 0 {
+			t.Errorf("bcc = %v, want none — the real recipient must not appear anywhere in this send", sent.bcc)
+		}
+	})
+
+	t.Run("customer audience — BCC is redirected, not the real recipient", func(t *testing.T) {
+		mock := &mockEmailSender{}
+		d := NewDispatcher(mock, &mockGoogleChatSender{}, &mockCallSender{}, &mockLinkResolver{},
+			true, true, []string{"debug@wso2.com"}, true, "", nil)
+
+		if err := d.Handle(context.Background(), planDateRecord("accepted", "customer", "PROJ-1")); err != nil {
+			t.Fatalf("Handle() error = %v", err)
+		}
+		if len(mock.calls) != 1 {
+			t.Fatalf("sent %d emails, want 1", len(mock.calls))
+		}
+		sent := mock.calls[0]
+		if len(sent.bcc) != 1 || sent.bcc[0] != "debug@wso2.com" {
+			t.Errorf("bcc = %v, want only the debug recipient, not the real customer audience", sent.bcc)
+		}
+		for _, addr := range append([]string{}, sent.to...) {
+			if addr == testRecipient {
+				t.Errorf("real recipient %q leaked into To during debug mode", testRecipient)
+			}
+		}
+	})
 }
 
 // TestDispatcher_Handle_CRApprovalRequested_CustomerAudienceIsBCC guards a real

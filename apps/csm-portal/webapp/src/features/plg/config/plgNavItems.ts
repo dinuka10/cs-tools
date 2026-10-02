@@ -47,19 +47,34 @@ export const PLG_NAV_SECTION: CsmNavSection = {
   label: "PLG",
   href: `${PLG_BASE}/dashboard`,
   icon: Rocket,
+  // CS engineer and admin only, mirroring the backend's PermUsePlg. Set on the
+  // section so every page inherits it — `requirements()` walks down from here,
+  // so a page added later is covered without being listed.
+  //
+  // Narrower than canWrite/canUseOperations elsewhere in the portal by intent:
+  // a view-only role holds PermView and could open PLG's pages, but every PLG
+  // route would answer 403. A section that cannot be used is worse offered than
+  // withheld. Manage Playbooks is the one page with a second, narrower rule —
+  // it stays visible here and renders read-only; see PlaybooksPage.
+  requires: "canUsePlg",
   children: [
     {
+      // Labelled Overview, but this is the leadership view — see
+      // LeadershipDashboardPage. The label is what leadership calls the page;
+      // the component name is what it shows.
       id: "plg.overview",
       tab: "overview",
-      label: "Leadership Dashboard",
+      label: "Overview",
       href: `${PLG_BASE}/overview`,
       routes: [`${PLG_BASE}/overview`],
       icon: Gauge,
     },
     {
       // Standalone this was Workspace > Dashboard, and PLG's landing page. It
-      // shares a component with the leadership view above and differs by two
-      // tiles — the queue counts, which belong to whoever works the queue.
+      // carries two tiles the leadership view above does not — the queue
+      // counts, which belong to whoever works the queue. The two were one
+      // component until the variant flag proved too fragile; they now share
+      // only their charts.
       id: "plg.dashboard",
       tab: "dashboard",
       label: "Dashboard",

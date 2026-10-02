@@ -14,7 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// SplUsageMetricsPage's data layer is a heavily imperative, debounced,
+// UsageMetricsPage's data layer is a heavily imperative, debounced,
 // infinite-scroll, multi-parallel-fetch state machine (project search
 // dropdown, deployment tabs, per-product metrics fetched only once
 // expanded) — the source app's own usePostApi/useParallelPostApi
@@ -29,7 +29,7 @@
 // keep the source's own useSplApi.ts (a second, incompatible fetch
 // abstraction this app's CLAUDE.md says not to have), these two hooks
 // reproduce the ORIGINAL hooks' exact call signatures 1:1, so
-// SplUsageMetricsPage needed zero changes to its calling code — only its
+// UsageMetricsPage needed zero changes to its calling code — only its
 // import line — while the actual HTTP work underneath is this app's real
 // authenticated useBackendApi(), not a bespoke fetch. Every usage-metrics
 // backend endpoint is raw JSON passthrough (see internal/servicenow/
@@ -59,8 +59,8 @@ function toApiError(err: unknown): UsageMetricsApiError {
 
 /**
  * Imperative POST, matching the source app's usePostApi call shape exactly:
- * `postApiData(payload, path)` — path is `/spl/...`, forwarded straight to
- * useBackendApi().post.
+ * `postApiData(payload, path)` — path is relative to CSM_PORTAL_BACKEND_BASE_URL,
+ * forwarded straight to useBackendApi().post.
  */
 export function usePostApi<T>(): PostApiResponse<T> {
   const api = useBackendApi();
@@ -68,7 +68,7 @@ export function usePostApi<T>(): PostApiResponse<T> {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<UsageMetricsApiError>();
   // Guards against an older in-flight call's response landing after a newer
-  // one and clobbering it — e.g. SplUsageMetricsPage's project-search effect
+  // one and clobbering it — e.g. UsageMetricsPage's project-search effect
   // re-invokes postApiData per keystroke, and a slow response for an earlier
   // query arriving last must not overwrite the current query's results.
   const requestIdRef = useRef(0);
@@ -111,7 +111,7 @@ export function useParallelPostApi<T>(): ParallelPostApiResponse<T> {
   const [loading, setLoading] = useState(false);
   // Bumped only by a replace call (merge=false) or clearAll — these
   // invalidate any earlier in-flight call outright. A merge call must NOT
-  // bump it: SplUsageMetricsPage fires one merge call per expanded product,
+  // bump it: UsageMetricsPage fires one merge call per expanded product,
   // and an unrelated product's call landing while another is still in
   // flight must not cause that other call's own results to be discarded.
   const generationRef = useRef(0);

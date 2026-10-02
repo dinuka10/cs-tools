@@ -518,7 +518,16 @@ func (s *snChangeRequestService) AggregateChangeRequests(ctx context.Context, re
 	return resp, nil
 }
 
-// snCreateChangeRequestPayload is the Choreo POST /change-requests request body.
+// snCreateChangeRequestPayload is the Choreo POST /change-requests request
+// body. Deliberately has no stateKey field: the org's own Change Management
+// process flow confirms every change request begins at New unconditionally
+// (no branch at creation decides otherwise), and ServiceNow already defaults
+// a fresh record to New on its own. An earlier revision of this payload
+// accepted and forwarded a caller-chosen create-time state (New/Assess/
+// Authorize) -- a real reported bug: the CSM Portal's own create form let a
+// user pick Assess or Authorize directly, skipping the workflow's own
+// assess/authorize gates entirely. CreateChangeRequest below now rejects any
+// req.State other than New before this payload is even built.
 type snCreateChangeRequestPayload struct {
 	Subject             string  `json:"subject"`
 	CategoryKey         *string `json:"categoryKey,omitempty"`
@@ -528,7 +537,6 @@ type snCreateChangeRequestPayload struct {
 	PriorityKey         *string `json:"priorityKey,omitempty"`
 	ImpactKey           *string `json:"impactKey,omitempty"`
 	TypeKey             *string `json:"typeKey,omitempty"`
-	StateKey            *string `json:"stateKey,omitempty"`
 	GroupID             *string `json:"groupId,omitempty"`
 	AssignedEngineerID  *string `json:"assignedEngineerId,omitempty"`
 	RiskKey             *string `json:"riskKey,omitempty"`
@@ -563,21 +571,6 @@ type snCreateChangeRequestResponse struct {
 		CreatedOn string `json:"createdOn"`
 		CreatedBy string `json:"createdBy"`
 	} `json:"changeRequest"`
-}
-
-// snCRCreateStateIDMap maps domain ChangeRequestState enums to SN string state IDs for create.
-var snCRCreateStateIDMap = map[domain.ChangeRequestState]string{
-	domain.ChangeRequestStateNew:              "-5",
-	domain.ChangeRequestStateAssess:           "-4",
-	domain.ChangeRequestStateAuthorize:        "-3",
-	domain.ChangeRequestStateCustomerApproval: "5",
-	domain.ChangeRequestStateScheduled:        "-2",
-	domain.ChangeRequestStateImplement:        "-1",
-	domain.ChangeRequestStateReview:           "0",
-	domain.ChangeRequestStateCustomerReview:   "1",
-	domain.ChangeRequestStateRollback:         "2",
-	domain.ChangeRequestStateClosed:           "3",
-	domain.ChangeRequestStateCanceled:         "4",
 }
 
 // snCRCreateTypeIDMap maps domain ChangeRequestType enums to SN string type IDs for create.
@@ -734,10 +727,15 @@ func (s *snChangeRequestService) CreateChangeRequest(ctx context.Context, req do
 			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid type %q", *req.Type)}
 		}
 	}
-	if req.State != nil {
-		if _, ok := snCRCreateStateIDMap[*req.State]; !ok {
-			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid state %q", *req.State)}
-		}
+	// A change request can only ever be created at New -- see
+	// snCreateChangeRequestPayload's own doc comment for why. req.State is
+	// still accepted (rather than removed from CreateChangeRequestRequest
+	// entirely) so a caller that explicitly asks for New gets the same 200 it
+	// always has; anything else is rejected outright rather than silently
+	// downgraded to New, since silently ignoring a caller's explicit request
+	// would look like success while doing something else.
+	if req.State != nil && *req.State != domain.ChangeRequestStateNew {
+		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("a change request can only be created in the New state, not %q", *req.State)}
 	}
 	if req.Risk != nil {
 		if _, ok := snCRRiskIDMap[*req.Risk]; !ok {
@@ -848,10 +846,8 @@ func (s *snChangeRequestService) CreateChangeRequest(ctx context.Context, req do
 		v := snCRCreateTypeIDMap[*req.Type]
 		payload.TypeKey = &v
 	}
-	if req.State != nil {
-		v := snCRCreateStateIDMap[*req.State]
-		payload.StateKey = &v
-	}
+	// req.State is validated above but never forwarded -- payload has no
+	// stateKey field at all, see snCreateChangeRequestPayload's own comment.
 	if req.Risk != nil {
 		v := snCRRiskIDMap[*req.Risk]
 		payload.RiskKey = &v

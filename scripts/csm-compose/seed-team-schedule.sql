@@ -142,6 +142,35 @@ WHERE NOT EXISTS (SELECT 1 FROM user_role ur
                      AND ur.role_id = '00000000-0000-0000-0000-000000000101'::uuid)
 ON CONFLICT (id) DO NOTHING;
 
+-- ── time-card approvers ──────────────────────────────────────────────────
+-- The Log time dialog only offers approvers who hold the `timecard_approver`
+-- role, and a submitter cannot approve their own card. Nothing else seeds that
+-- role, so without this the dialog says "No matching engineers" for every
+-- search and no time card can ever be submitted locally. Granted to the
+-- manager and to each team lead (the "Approver (team lead)" the dialog asks
+-- for); resolved by name so it also works if the sync created the role.
+INSERT INTO role (id, created_on, updated_on, name, description)
+SELECT md5('seed-role-timecard-approver')::uuid, now(), now(), 'timecard_approver',
+       'Approves or rejects engineers time cards'
+WHERE NOT EXISTS (SELECT 1 FROM role WHERE name = 'timecard_approver')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO user_role (id, created_on, updated_on, created_by, updated_by, user_id, role_id)
+SELECT md5('seed-ur-tca-'||u.id::text)::uuid, now(), now(), 'seed', 'seed', u.id, r.id
+FROM (SELECT id FROM _eng WHERE is_lead UNION ALL SELECT md5('seed-manager-1')::uuid) u
+JOIN role r ON r.name = 'timecard_approver'
+WHERE NOT EXISTS (SELECT 1 FROM user_role ur WHERE ur.user_id = u.id AND ur.role_id = r.id)
+ON CONFLICT (id) DO NOTHING;
+
+-- The fixed SUBMITTED sample card (seed-entity-service.sql) needs an approver too,
+-- or it is invisible in every approval queue. Resolved here because the manager
+-- and the approver role only exist from this file on.
+INSERT INTO time_card_approver (id, created_on, updated_on, created_by, updated_by, time_card_id, approver_id)
+SELECT md5('seed-tca-sample-801')::uuid, now(), now(), 'seed', 'seed',
+       '00000000-0000-0000-0000-000000000801'::uuid, md5('seed-manager-1')::uuid
+WHERE EXISTS (SELECT 1 FROM time_card WHERE id = '00000000-0000-0000-0000-000000000801'::uuid)
+ON CONFLICT DO NOTHING;
+
 -- ── a rota admin for each family ──────────────────────────────────────────
 -- One person who may edit any CRE rota, one who may edit any SRE rota, so the
 -- family scoping can actually be exercised: each should be refused the other

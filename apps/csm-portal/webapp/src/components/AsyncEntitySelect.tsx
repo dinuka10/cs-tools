@@ -36,6 +36,9 @@ export interface AsyncEntitySelectProps<T> {
    * `knownLabel` rather than a live search result. */
   onChange: (next: string, item?: T) => void;
   disabled?: boolean;
+  /** Marks the field required (asterisk + `aria-required`). Display only: the
+   * caller still owns validation. */
+  required?: boolean;
   helperText?: string;
   /** Type-ahead search hook — disabled externally while the dropdown is
    * closed or nothing has been typed yet. Must be passed as a stable
@@ -80,6 +83,7 @@ export default function AsyncEntitySelect<T>({
   value,
   onChange,
   disabled,
+  required,
   helperText,
   useSearch,
   getId,
@@ -162,6 +166,7 @@ export default function AsyncEntitySelect<T>({
         <TextField
           {...params}
           label={label}
+          required={required}
           placeholder={value ? undefined : placeholder}
           error={isError}
           helperText={isError ? "Search failed." : helperText}

@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"golang.org/x/sync/singleflight"
 
 	"alert-core-service/internal/apierror"
 	"alert-core-service/internal/csm"
@@ -42,15 +43,19 @@ import (
 
 // Notifier targets CSM first, falling back to Google Chat webhooks when CSM does not confirm.
 type Notifier struct {
-	logger                  *slog.Logger
-	client                  *http.Client
-	csm                     *csm.Client
-	callerID                string
-	unknownServiceID        string
-	services                *serviceCache
+	logger           *slog.Logger
+	client           *http.Client
+	csm              *csm.Client
+	callerID         string
+	unknownServiceID string
+	services         *serviceCache
+	// serviceResolveGroup collapses concurrent cache misses for the same unresolved label into one CSM search.
+	serviceResolveGroup     singleflight.Group
 	fallbackChatWebhookURLs []string
 	maxAttempts             int
 	retryBaseDelay          time.Duration
+	// chatThreadingEnabled threads every Chat fallback message for the same incident's fingerprint into one Google Chat thread, instead of a new top-level message each time.
+	chatThreadingEnabled bool
 }
 
 // Config groups New's dependencies to avoid a growing positional-argument list.
@@ -63,6 +68,8 @@ type Config struct {
 	MaxAttempts     int
 	RetryBaseDelay  time.Duration
 	HTTPTimeout     time.Duration
+	// ChatThreadingEnabled threads Chat fallback messages by incident fingerprint; see Notifier.chatThreadingEnabled.
+	ChatThreadingEnabled bool
 }
 
 func New(logger *slog.Logger, csm *csm.Client, cfg Config) *Notifier {
@@ -76,6 +83,7 @@ func New(logger *slog.Logger, csm *csm.Client, cfg Config) *Notifier {
 		fallbackChatWebhookURLs: splitURLs(os.Getenv("FALLBACK_CHAT_WEBHOOK_URLS")),
 		maxAttempts:             cfg.MaxAttempts,
 		retryBaseDelay:          cfg.RetryBaseDelay,
+		chatThreadingEnabled:    cfg.ChatThreadingEnabled,
 	}
 	if len(n.fallbackChatWebhookURLs) == 0 {
 		logger.Warn("FALLBACK_CHAT_WEBHOOK_URLS not set; incidents will not reach Chat if CSM fails")
@@ -131,10 +139,6 @@ func (n *Notifier) NotifyCSM(ctx context.Context, inc model.Incident) (incidentI
 	}
 	if inc.Description != "" {
 		req.WorkNotes = &inc.Description
-	}
-	if inc.Environment != "" {
-		env := truncateRunes(inc.Environment, maxEnvironmentLen)
-		req.Environment = &env
 	}
 
 	res, err := n.createIncidentWithRetry(ctx, tag, req)
@@ -209,28 +213,30 @@ func (n *Notifier) resolveServiceID(ctx context.Context, label string) (string, 
 	if id, ok := n.services.get(label, time.Now()); ok {
 		return id, nil
 	}
-	id, err := n.csm.SearchServiceID(ctx, label)
-	if err != nil {
-		return "", err
+	// Collapses concurrent same-label lookups into one CSM search on its own context (not any single caller's), so one caller's cancellation can't fail it for the others still waiting.
+	resultCh := n.serviceResolveGroup.DoChan(label, func() (any, error) {
+		id, err := n.csm.SearchServiceID(context.WithoutCancel(ctx), label)
+		if err != nil {
+			return "", err
+		}
+		if id != "" {
+			n.services.set(label, id, time.Now())
+		}
+		return id, nil
+	})
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case res := <-resultCh:
+		if res.Err != nil {
+			return "", res.Err
+		}
+		id := res.Val.(string)
+		if id == "" {
+			return n.unknownServiceID, nil
+		}
+		return id, nil
 	}
-	if id == "" {
-		return n.unknownServiceID, nil
-	}
-	n.services.set(label, id, time.Now())
-	return id, nil
-}
-
-// maxEnvironmentLen matches ServiceNow's custom incident.u_enviroment field's max_length.
-const maxEnvironmentLen = 40
-
-// truncateRunes bounds s to at most n runes, so a caller-supplied value never
-// overflows a downstream fixed-width field like ServiceNow's u_enviroment.
-func truncateRunes(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
-	}
-	return string(r[:n])
 }
 
 var csmCategoryMap = map[string]string{
@@ -261,11 +267,20 @@ func incidentSubject(inc model.Incident) string {
 
 // NotifyChat returns true only if every configured target confirms, or if none are configured.
 func (n *Notifier) NotifyChat(ctx context.Context, inc model.Incident) (ok bool) {
+	return n.postCardToChat(ctx, inc.IncidentNumber, fallbackGoogleChatCard(inc, n.chatThreadingEnabled))
+}
+
+// NotifyChatAnnotation threads a Duplicate/OK annotation into the incident's existing Chat thread, rendering kind and note so it reads as an update rather than a repeat of the original "Priority Incident Reported" card.
+func (n *Notifier) NotifyChatAnnotation(ctx context.Context, inc model.Incident, kind, note string) (ok bool) {
+	return n.postCardToChat(ctx, inc.IncidentNumber, annotationGoogleChatCard(inc, kind, note, n.chatThreadingEnabled))
+}
+
+// postCardToChat posts card to every configured webhook, threading it when enabled, and returns true only if every target confirms, or if none are configured.
+func (n *Notifier) postCardToChat(ctx context.Context, incidentNumber string, card map[string]any) (ok bool) {
 	if len(n.fallbackChatWebhookURLs) == 0 {
-		n.logger.Warn("no chat target for incident: FALLBACK_CHAT_WEBHOOK_URLS not configured", "incident_number", inc.IncidentNumber)
+		n.logger.Warn("no chat target for incident: FALLBACK_CHAT_WEBHOOK_URLS not configured", "incident_number", incidentNumber)
 		return true
 	}
-	card := fallbackGoogleChatCard(inc)
 	var wg sync.WaitGroup
 	var failures atomic.Int32
 	for _, chatURL := range n.fallbackChatWebhookURLs {
@@ -273,12 +288,16 @@ func (n *Notifier) NotifyChat(ctx context.Context, inc model.Incident) (ok bool)
 		go func(chatURL string) {
 			defer wg.Done()
 			spaceID := chatSpaceID(chatURL)
-			if _, err := n.postWithRetry(ctx, chatURL, card); err != nil {
-				n.logger.Error("notify failed after retries", "target", "google_chat", "chat_space_id", spaceID, "incident_number", inc.IncidentNumber, "error", err)
+			target := chatURL
+			if n.chatThreadingEnabled {
+				target = withThreadReplyOption(chatURL)
+			}
+			if _, err := n.postWithRetry(ctx, target, card); err != nil {
+				n.logger.Error("notify failed after retries", "target", "google_chat", "chat_space_id", spaceID, "incident_number", incidentNumber, "error", err)
 				failures.Add(1)
 				return
 			}
-			n.logger.Info("notified", "target", "google_chat", "chat_space_id", spaceID, "incident_number", inc.IncidentNumber)
+			n.logger.Info("notified", "target", "google_chat", "chat_space_id", spaceID, "incident_number", incidentNumber)
 		}(chatURL)
 	}
 	wg.Wait()
@@ -295,6 +314,18 @@ func chatSpaceID(webhookURL string) string {
 		return id
 	}
 	return "unknown"
+}
+
+// withThreadReplyOption appends messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD so Chat replies into the thread named by the card's thread.threadKey instead of always starting a new one; falls back to the original URL if it won't parse.
+func withThreadReplyOption(webhookURL string) string {
+	u, err := url.Parse(webhookURL)
+	if err != nil {
+		return webhookURL
+	}
+	q := u.Query()
+	q.Set("messageReplyOption", "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD")
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // postWithRetry keeps 429 retryable since Chat webhooks rate-limit bursty concurrent incidents.
@@ -376,8 +407,8 @@ func priorityLabel(severity int) string {
 	return fmt.Sprintf("P%d - %s", severity, severityLabel(severity))
 }
 
-// fallbackGoogleChatCard is titled FALLBACK since this path has no team-specific routing info.
-func fallbackGoogleChatCard(inc model.Incident) map[string]any {
+// fallbackGoogleChatCard is titled FALLBACK since this path has no team-specific routing info. When threaded is true, the card carries inc.Fingerprint as the Chat thread key, so every message for this alert (across incident generations, and Duplicate/OK annotations) lands in one thread instead of a new top-level message each time.
+func fallbackGoogleChatCard(inc model.Incident, threaded bool) map[string]any {
 	word := severityLabel(inc.Severity)
 	subtitle := "#" + inc.IncidentNumber + " | " + inc.Service
 	if inc.Environment != "" {
@@ -391,7 +422,7 @@ func fallbackGoogleChatCard(inc model.Incident) map[string]any {
 	if category == "" {
 		category = "Uncategorized"
 	}
-	return map[string]any{
+	card := map[string]any{
 		"cardsV2": []map[string]any{
 			{
 				"cardId": inc.IncidentNumber,
@@ -421,4 +452,32 @@ func fallbackGoogleChatCard(inc model.Incident) map[string]any {
 			},
 		},
 	}
+	if threaded {
+		card["thread"] = map[string]any{"threadKey": inc.Fingerprint}
+	}
+	return card
+}
+
+// annotationGoogleChatCard renders a Duplicate/OK annotation as a reply distinct from fallbackGoogleChatCard's "Priority Incident Reported" header, so a threaded Duplicate or OK doesn't look like a brand new page. note is model.BuildChatAnnotationText's HTML output, already naming the kind in bold.
+func annotationGoogleChatCard(inc model.Incident, _, note string, threaded bool) map[string]any {
+	card := map[string]any{
+		"cardsV2": []map[string]any{
+			{
+				"cardId": inc.IncidentNumber,
+				"card": map[string]any{
+					"sections": []map[string]any{
+						{
+							"widgets": []map[string]any{
+								{"textParagraph": map[string]any{"text": note}},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if threaded {
+		card["thread"] = map[string]any{"threadKey": inc.Fingerprint}
+	}
+	return card
 }

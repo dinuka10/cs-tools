@@ -16,17 +16,14 @@
 
 -- approval_stage / approval_stage_approver mirror ServiceNow's generic
 -- sysapproval_group / sysapproval_approver approval-workflow tables (see
--- digiops-cs/operations/csm-sync-service/configs/mappings/
--- sysapproval_group.yaml / sysapproval_approver.yaml -- content-synced with
--- that repo's migrations/0089_approval_stage_tables.sql, same convention as
--- "group"/000073_group_table.up.sql). Generic, not change-request-specific:
--- work_item_id can point at any approvable work_item type, same as
--- sysapproval_group.parent / sysapproval_approver.sysapproval can
--- reference any approvable SN task. Nullable FKs throughout (unlike
--- work_item_watcher's NOT NULL pattern): both mappings use
--- on_overflow: null_and_warn, since a row whose parent isn't a
--- currently-synced work_item type (e.g. a catalog request) is expected,
--- not an error.
+-- configs/mappings/sysapproval_group.yaml / sysapproval_approver.yaml).
+-- Generic, not change-request-specific: work_item_id can point at any
+-- approvable work_item type, same as sysapproval_group.parent /
+-- sysapproval_approver.sysapproval can reference any approvable SN task.
+-- Nullable FKs throughout (unlike work_item_watcher's NOT NULL pattern):
+-- both mappings use on_overflow: null_and_warn, since a row whose parent
+-- isn't a currently-synced work_item type (e.g. a catalog request) is
+-- expected, not an error.
 CREATE TABLE IF NOT EXISTS approval_stage (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,
@@ -40,7 +37,8 @@ CREATE TABLE IF NOT EXISTS approval_stage (
     -- domain-facing per-stage status served to the CSM webapp, which is
     -- derived at read time from this stage's approval_stage_approver rows
     -- (first-responder-wins), mirroring ChangeRequestUtils._deriveStageStatus
-    -- in apps/csm-portal/backend's SN adapter.
+    -- in cs-tools/apps/csm-portal/backend's SN adapter. VARCHAR by default
+    -- per this repo's enum-column convention (CLAUDE.md), not a native ENUM.
     raw_status VARCHAR(50)
 );
 

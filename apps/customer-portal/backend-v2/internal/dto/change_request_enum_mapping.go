@@ -108,6 +108,30 @@ func crImpactRef(impact *string) *IDLabelRef {
 	return &IDLabelRef{ID: crImpactIDs[*impact], Label: label}
 }
 
+// normalizeChangeRequestStateChoices is normalizeCaseSeverityChoices for
+// change-request states (see that function's own doc comment for the shape).
+//
+// GET /projects/{id}/filters' changeRequestStates never went through this at
+// all -- unlike CaseStates/Severities/IssueTypes/EngagementTypes on the same
+// response, which are all normalized a few lines above. On the Postgres data
+// source, ReferenceDataRepository.EnumLabels (entity-service) returns the
+// raw enum label as both id and label (e.g. {"id":"ROLLBACK","label":"ROLLBACK"}),
+// since Postgres enums have no separate numeric id -- so
+// filters.stateIds?.map(Number) on the frontend converted every selection to
+// NaN, which Array.prototype.includes still matched via SameValueZero
+// against crStateIDs's own reverse-mapped set of also-NaN entries, so the
+// value silently reached the request as null instead of a real state key.
+// Every state selection was equally broken, not just Rollback.
+func normalizeChangeRequestStateChoices(items []ReferenceItem) []ReferenceItem {
+	return normalizeChoices(items, nil, crStateIDs, crStateLabels)
+}
+
+// normalizeChangeRequestImpactChoices is normalizeChangeRequestStateChoices
+// for change-request impact.
+func normalizeChangeRequestImpactChoices(items []ReferenceItem) []ReferenceItem {
+	return normalizeChoices(items, nil, crImpactIDs, crImpactLabels)
+}
+
 // crTypeRef builds a label-only {label} ref (no id) for entity-service's
 // Type field: unlike State/Impact, entity-service's change-request search
 // response passes ServiceNow's raw type label straight through unnormalized

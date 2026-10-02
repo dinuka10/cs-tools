@@ -64,18 +64,26 @@ export function isRawBase64ImageSrc(src: string): boolean {
 }
 
 /**
- * A styled inline placeholder for a `.iix` reference (or denied raw base64
- * image) that couldn't be resolved into an image, explaining why in place of
- * a blank/broken `<img>`. Built via DOM APIs (`textContent`, `setAttribute`)
- * rather than an HTML-string template: `reason`/its derived label are always
- * one of two fixed literals this module controls, never attacker-influenced,
- * but constructing the replacement as a real element — never parsed from a
+ * A styled placeholder, in the same visual space the real image would have
+ * occupied, for a `.iix` reference (or denied raw base64 image) that
+ * couldn't be resolved into an image — explaining why in place of a
+ * blank/broken `<img>`. Renders as its own block (`display:flex`, not
+ * `inline-flex`) rather than sitting mid-line with surrounding text, and
+ * styled as a warning alert (amber tint, warning icon) rather than a plain
+ * dashed chip — reported live as reading poorly squeezed inline between two
+ * sentences, unlike a real inline image, which naturally takes its own line.
+ *
+ * Built via DOM APIs (`textContent`, `setAttribute`) rather than an
+ * HTML-string template: `reason`/its derived label are always one of two
+ * fixed literals this module controls, never attacker-influenced, but
+ * constructing the replacement as a real element — never parsed from a
  * string — means that stays true structurally, not just by the values
  * happening to be safe today. Plain inline styles (no CSS class) since this
  * is spliced into HTML with no app stylesheet guaranteed to apply to it;
- * `color:inherit` and a `currentColor` border piggyback on the surrounding
- * text color so it reads correctly in both light and dark mode without
- * hardcoding either.
+ * the amber tones are semi-transparent (not a solid fill) so they read as a
+ * warning tint over either a light or dark surrounding background without
+ * hardcoding either, and `color:inherit` keeps the label itself the
+ * surrounding text's own (already theme-correct) color.
  */
 function createUnresolvedImagePlaceholder(
   doc: Document,
@@ -88,11 +96,13 @@ function createUnresolvedImagePlaceholder(
   const span = doc.createElement("span");
   span.setAttribute("data-unresolved-reason", reason);
   span.title = label;
-  span.textContent = label;
+  span.textContent = `⚠️ ${label}`;
   span.setAttribute(
     "style",
-    "display:inline-flex;align-items:center;gap:6px;padding:3px 10px;" +
-      "border:1px dashed currentColor;border-radius:4px;opacity:0.7;" +
+    "display:flex;align-items:center;gap:8px;width:fit-content;max-width:100%;" +
+      "margin:6px 0;padding:6px 12px;box-sizing:border-box;" +
+      "border:1px solid rgba(237,108,2,0.5);border-radius:6px;" +
+      "background:rgba(237,108,2,0.12);" +
       "font-size:0.85em;color:inherit;",
   );
   return span;

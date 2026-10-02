@@ -19,7 +19,7 @@ import { Box, CircularProgress, List, ListItemButton, ListItemText, Paper, TextF
 import { SearchIcon } from "@wso2/oxygen-ui-icons-react";
 import { useNavigate } from "react-router";
 import { useIdTokenClaims } from "@hooks/useIdTokenClaims";
-import { useSearchAccounts } from "../api/useSplAccountsApi";
+import { useSearchSplAccounts } from "../api/useAccountsApi";
 
 export default function AccountSearch({
   searchOption,
@@ -33,7 +33,7 @@ export default function AccountSearch({
   const [inputValue, setInputValue] = useState("");
 
   const enabled = inputValue.length >= 4 && (searchOption !== "myAccount" || Boolean(email));
-  const { data, isLoading } = useSearchAccounts({
+  const { data, isLoading } = useSearchSplAccounts({
     email: searchOption === "myAccount" ? email : undefined,
     phrase: inputValue,
     offset: 0,

@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -33,6 +32,14 @@ import (
 
 // EscalationRepository defines the persistence operations for case_escalation
 // and case_escalation_notification_list (migration 0054).
+//
+// Both tables are project-membership-scoped by row-level security
+// (migration 0141, updated by a later migration once CreateEscalation
+// below turned out to be a genuine customer-facing write, not
+// internal-only as first assumed), keyed on the caller identity Scoped
+// forwards as session GUCs -- this repository does no project filtering of
+// its own at all; a caller sees and writes exactly the rows Postgres
+// decides to hand back.
 type EscalationRepository interface {
 	// SearchEscalations returns a filtered, sorted, paginated slice of
 	// escalations together with the total count of matching rows before
@@ -194,14 +201,16 @@ func (r *dbGroupMemberResolver) GroupMemberUserIDs(ctx context.Context, q rowsQu
 }
 
 type escalationRepo struct {
-	db        *pgxpool.Pool
+	db        *Scoped
 	notifyCfg EscalationNotificationConfig
 	groups    groupMemberResolver
 }
 
 // NewEscalationRepository constructs an EscalationRepository backed by the
-// given connection pool.
-func NewEscalationRepository(db *pgxpool.Pool, notifyCfg EscalationNotificationConfig) EscalationRepository {
+// given Scoped connection -- never a raw *pgxpool.Pool, so every query this
+// repository issues carries the caller's identity for case_escalation's RLS
+// policy to read.
+func NewEscalationRepository(db *Scoped, notifyCfg EscalationNotificationConfig) EscalationRepository {
 	return &escalationRepo{db: db, notifyCfg: notifyCfg, groups: &dbGroupMemberResolver{}}
 }
 
@@ -559,17 +568,20 @@ func (r *escalationRepo) resolveEscalationRecipients(ctx context.Context, q rows
 
 // CreateEscalation implements EscalationRepository.
 func (r *escalationRepo) CreateEscalation(ctx context.Context, caseID string, action domain.EscalationAction, reason *string, actorEmail string) (domain.CreatedEscalation, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.CreatedEscalation{}, fmt.Errorf("create escalation: begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (domain.CreatedEscalation, error) {
+		return r.createEscalationTx(ctx, tx, caseID, action, reason, actorEmail)
+	})
+}
 
+// createEscalationTx is CreateEscalation's body, extracted so it can run
+// inside r.db.InTx's closure (Scoped.InTx pulls caller identity from ctx
+// and sets it once for the whole transaction).
+func (r *escalationRepo) createEscalationTx(ctx context.Context, tx pgx.Tx, caseID string, action domain.EscalationAction, reason *string, actorEmail string) (domain.CreatedEscalation, error) {
 	var (
 		currentLevel *string
 		cc           escalationCaseContext
 	)
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT c.current_escalation_level::TEXT,
 		       wi.number, wi.subject, wi.wso2_id,
 		       a.technical_owner_id, a.customer_success_manager_id, g.manager_id,
@@ -661,10 +673,6 @@ func (r *escalationRepo) CreateEscalation(ctx context.Context, caseID string, ac
 	notified := notifiedByEscalation[escalationID]
 	if notified == nil {
 		notified = []domain.EscalationNotifiedUser{}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return domain.CreatedEscalation{}, fmt.Errorf("create escalation: commit tx: %w", err)
 	}
 
 	return domain.CreatedEscalation{

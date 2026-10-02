@@ -110,6 +110,36 @@ type Config struct {
 	// ServiceNow sync still owns the account table and both writing it would
 	// fight over the same rows.
 	CSMMigrationSalesforceAccountIngestEnabled bool
+	// CSMMigrationSalesforceOpportunityIngestEnabled turns on the Opportunity
+	// branch of POST /salesforce/events (sf_opportunity plus its
+	// sf_opportunity_product line items), from
+	// CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED=true. Defaults to
+	// false: Opportunity envelopes are then acknowledged and ignored, because
+	// csm-sync-service still copies these tables from ServiceNow and the two
+	// writers would create duplicate rows (different row ids, non-unique sf_id).
+	CSMMigrationSalesforceOpportunityIngestEnabled bool
+	// CSMMigrationSalesforceProjectIngestEnabled turns on the Project__c
+	// branch of POST /salesforce/events, from
+	// CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED=true. Defaults to false:
+	// Project__c envelopes are acknowledged and ignored. On, it updates the
+	// ten Salesforce-owned project columns of rows CSM already has.
+	CSMMigrationSalesforceProjectIngestEnabled bool
+	// CSMMigrationSalesforceProjectInsertEnabled lets the Project ingest (and
+	// EnsureProject, for memberships and linked opportunities) insert
+	// projects CSM does not have, from
+	// CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED=true. Defaults to false,
+	// the update-only mode: while csm-sync-service still inserts project rows
+	// from ServiceNow, an ingest-created row would make its insert fail on
+	// project.key forever. Turn on at cutover, when csm-sync-service stops.
+	CSMMigrationSalesforceProjectInsertEnabled bool
+	// CSMMigrationSalesforcePartnerIngestEnabled turns on the partner-link
+	// refresh (account_relationship "Is Partner Of" / "Is Customer Of") that
+	// runs after Account events, after partner-contact membership events and
+	// from POST /salesforce/accounts/{sfId}/refresh-partners, from
+	// CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED=true. Defaults to false:
+	// nothing refreshes partners and the route is not registered, because
+	// csm-sync-service still copies account_relationship from ServiceNow.
+	CSMMigrationSalesforcePartnerIngestEnabled bool
 	// CSMMigrationMembershipRegistrationEnabled turns on POST /users/me/memberships/register,
 	// which marks the signed-in user's still-INVITED memberships as
 	// REGISTERED in Salesforce (see membership_registration_service.go). Defaults to
@@ -138,10 +168,6 @@ type Config struct {
 	GithubBaseURL string
 	// GithubToken authenticates our calls out to GitHub.
 	GithubToken string
-	// GithubWebhookSecret is the HMAC key GitHub signs deliveries with. This
-	// IS the authentication on the webhook endpoint, so an empty value makes
-	// VerifySignature refuse everything rather than accept everything.
-	GithubWebhookSecret string
 	// GithubIntegrationLogin is our own GitHub account. Events it sent are our
 	// own writes coming back, and are dropped by identity rather than by
 	// pattern-matching the comment body.
@@ -202,16 +228,22 @@ type Config struct {
 	// nothing to do with case state) — the two are read by separate
 	// processes/environments and don't interact.
 	CustomerRoles []string
-	// CSEngineerRole is the ServiceNow role name (e.g. an org-specific
-	// "sn_*" role) whose presence on a case comment's resolved author marks
-	// that comment as a qualifying CS-engineer response — see
-	// sn_case_service.go's applyResponseSLAOnComment, which the CSM-native
-	// SLA engine (internal/service/sla_engine_service.go) uses to complete
-	// a case's "response" SLA clock. Deliberately no committed default:
-	// this is organisation-specific vocabulary, same reasoning
-	// CustomerRoles' own doc comment gives. Left unset, that function
-	// simply can't confirm engineer-authorship and skips (logged) — not
-	// fatal, not required by Validate.
+	// CSEngineerRole is the role name (e.g. an org-specific "sn_*" role)
+	// whose presence on a case comment's resolved author marks that comment
+	// as a qualifying CS-engineer/support-engineer response — see
+	// sn_case_service.go's applyResponseSLAOnComment and
+	// case_service.go's completeResponseSLAOnComment, both of which the
+	// CSM-native SLA engine (internal/service/sla_engine_service.go) uses
+	// to complete a case's "response" SLA clock. Deliberately no committed
+	// default: this is organisation-specific vocabulary, same reasoning
+	// CustomerRoles' own doc comment gives. Left unset, those functions
+	// simply can't confirm engineer-authorship and skip (logged) — not
+	// fatal, not required by Validate. Shared by both `snCaseService` (checked
+	// via `SNUserService`'s own role lookup) and `caseService` (checked
+	// against `repository.UserRepository.GetUserRoles`' own user_role
+	// vocabulary) — the same role name is meaningful in both, since
+	// "CS engineer" and "support engineer" are the same real-world role,
+	// not two different configs.
 	CSEngineerRole string
 	// SLARecomputeInterval is how often SLAEngineRecomputeWorker
 	// recomputes every CSM-native "sla" row's elapsed percentage/breach
@@ -219,6 +251,18 @@ type Config struct {
 	// envDuration convention as CRNoticePollInterval/GithubOutboundInterval
 	// above.
 	SLARecomputeInterval time.Duration
+	// SalesforceIngestRetryInterval is how often SalesforceIngestRetryWorker
+	// re-runs Salesforce ingests that FAILED because the record's parent
+	// (project, account) was not in CSM yet
+	// (internal/service/salesforce_ingest_retry_worker.go), and also how
+	// old a failure must be before it is re-run. From
+	// SALESFORCE_INGEST_RETRY_INTERVAL; defaults to 5m, the ServiceNow
+	// sync's own cadence. Unlike the other intervals, an explicit "0"
+	// disables the job (envDurationOrOff), because it makes outbound Sales
+	// Entity calls on its own initiative and an operator must be able to
+	// stop that without turning the ingest off. An invalid or negative value
+	// disables it too (with a warning) rather than falling back to 5m.
+	SalesforceIngestRetryInterval time.Duration
 	// Auth* configure token validation (internal/auth), always on -- there is
 	// no config flag to disable it. AuthIssuer/AuthJWKSURL/
 	// AuthUserTokenAudiences are required (Validate rejects startup without
@@ -231,6 +275,44 @@ type Config struct {
 	// token in Authorization: Bearer. AuthUserTokenAudiences are the client ids
 	// (Asgardeo SPA/application ids) an ID token's aud must contain to be
 	// accepted as a user token.
+	// CloudStatusServiceIDs are the business services whose outages are
+	// published to the public cloud status dashboard, as a comma-separated
+	// list of UUIDs (CLOUD_STATUS_SERVICE_IDS).
+	//
+	// These are `service` rows, NOT service offerings. The ServiceNow flow
+	// this ports dot-walked an outage's configuration item AS a service
+	// offering and compared that offering's PARENT against a list of 14 ids.
+	// Setting offering ids here instead would match nothing and the sweep
+	// would silently never fire.
+	//
+	// Empty means the sweep is a no-op, which it logs. That is the safe
+	// default: an unconfigured deployment posts nothing to a public status
+	// page rather than guessing a scope.
+	CloudStatusServiceIDs []string
+
+	// CloudStatusDrainerEnabled turns on the background drainer that records
+	// outage transitions AND rewrites cloud_monitor.status
+	// (CLOUD_STATUS_DRAINER_ENABLED, default false).
+	//
+	// *** OFF BY DEFAULT BECAUSE OF THE STATUS WRITE. *** While
+	// csm-sync-service's one-time bulk migration is still running, both it and
+	// this drainer can write cloud_monitor.status. Clearing
+	// CLOUD_STATUS_SERVICE_IDS would stop the drainer but also disable the
+	// sweep endpoint and the dashboard reads, so the write needs a switch of
+	// its own.
+	CloudStatusDrainerEnabled bool
+
+	// CloudStatusPollInterval is how often CloudStatusDrainer claims
+	// event_outbox rows for `outage` and `outage_affected_ci`
+	// (CLOUD_STATUS_POLL_INTERVAL). Same envDuration convention as
+	// CRNoticePollInterval.
+	//
+	// This is the FAST path. The reconciliation sweep in
+	// csm-scheduled-tasks reaches the same conclusions on its own schedule
+	// and is what makes a missed drain harmless, so this interval governs
+	// promptness, not correctness.
+	CloudStatusPollInterval time.Duration
+
 	AuthIssuer             string
 	AuthJWKSURL            string
 	AuthUserTokenAudiences []string
@@ -333,7 +415,6 @@ func Load() *Config {
 		GithubIntegrationEnabled:                 os.Getenv("GITHUB_INTEGRATION_ENABLED") == "true",
 		GithubBaseURL:                            getEnvOrDefault("GITHUB_API_BASE_URL", "https://api.github.com"),
 		GithubToken:                              os.Getenv("GITHUB_TOKEN"),
-		GithubWebhookSecret:                      os.Getenv("GITHUB_WEBHOOK_SECRET"),
 		GithubIntegrationLogin:                   os.Getenv("GITHUB_INTEGRATION_LOGIN"),
 		GithubOutboundInterval:                   envDuration("GITHUB_OUTBOUND_INTERVAL", 15*time.Second),
 		CSMPortalBaseURL:                         os.Getenv("CSM_PORTAL_BASE_URL"),
@@ -356,6 +437,10 @@ func Load() *Config {
 		CustomerRoles:                                 splitComma(os.Getenv("CUSTOMER_ROLES")),
 		CSEngineerRole:                                os.Getenv("CS_ENGINEER_ROLE"),
 		SLARecomputeInterval:                          envDuration("SLA_RECOMPUTE_INTERVAL", 45*time.Second),
+		CloudStatusServiceIDs:                         splitComma(os.Getenv("CLOUD_STATUS_SERVICE_IDS")),
+		CloudStatusDrainerEnabled:                     os.Getenv("CLOUD_STATUS_DRAINER_ENABLED") == "true",
+		CloudStatusPollInterval:                       envDuration("CLOUD_STATUS_POLL_INTERVAL", 10*time.Second),
+		SalesforceIngestRetryInterval:                 envDurationOrOff("SALESFORCE_INGEST_RETRY_INTERVAL", 5*time.Minute),
 		SalesEntityBaseURL:                            os.Getenv("SALES_ENTITY_BASE_URL"),
 		SalesEntityTokenURL:                           os.Getenv("SALES_ENTITY_TOKEN_URL"),
 		SalesEntityClientID:                           os.Getenv("SALES_ENTITY_CLIENT_ID"),
@@ -374,6 +459,11 @@ func Load() *Config {
 		EscalationEL5CEOGroupID:                       os.Getenv("ESCALATION_EL5_CEO_GROUP_ID"),
 	}
 	cfg.AuthInternalClientIDs = ParseInternalClientIDs(cfg.AuthInternalClientIDsRaw)
+	// Set outside the literal so its longer key does not realign every field above.
+	cfg.CSMMigrationSalesforceOpportunityIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_OPPORTUNITY_INGEST_ENABLED") == "true"
+	cfg.CSMMigrationSalesforceProjectIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PROJECT_INGEST_ENABLED") == "true"
+	cfg.CSMMigrationSalesforceProjectInsertEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PROJECT_INSERT_ENABLED") == "true"
+	cfg.CSMMigrationSalesforcePartnerIngestEnabled = os.Getenv("CSM_MIGRATION_SALESFORCE_PARTNER_INGEST_ENABLED") == "true"
 	return cfg
 }
 
@@ -647,12 +737,16 @@ func (c *Config) DSN() string {
 }
 
 // HasGithubIntegration reports whether the GitHub sync is both switched on and
-// configured well enough to run. The webhook secret is required rather than
-// optional: without it the endpoint could not authenticate a caller, and an
-// endpoint that mutates change requests must never be reachable unverified.
+// configured well enough to run.
+//
+// *** GITHUB_WEBHOOK_SECRET IS NO LONGER PART OF THIS, AND ITS ABSENCE HERE
+// IS NOT AN OVERSIGHT. *** The HMAC check moved to
+// operations/csm-webhooks along with the public endpoint, so this
+// service never sees a signature and holding the secret would only imply it
+// did. What still gates the integration is the outbound half: a token to
+// call GitHub with, and the login whose own events must be ignored as ours.
 func (c *Config) HasGithubIntegration() bool {
 	return c.GithubIntegrationEnabled &&
-		c.GithubWebhookSecret != "" &&
 		c.GithubToken != "" &&
 		c.GithubIntegrationLogin != ""
 }
@@ -668,6 +762,26 @@ func envDuration(key string, def time.Duration) time.Duration {
 	d, err := time.ParseDuration(v)
 	if err != nil || d <= 0 {
 		return def
+	}
+	return d
+}
+
+// envDurationOrOff is envDuration for an interval that can be switched off:
+// unset returns def, and an explicit zero ("0", "0s", "0m") returns 0, which
+// the caller reads as "disabled". An unparseable or negative value also
+// returns 0, with a warning: it fails closed, because an operator who wrote
+// "off" or "-1" meant to stop the job, and falling back to def would start a
+// worker that makes outbound calls they tried to turn off.
+func envDurationOrOff(key string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		slog.Warn("invalid duration configuration value, treating it as disabled",
+			"key", key, "value", v)
+		return 0
 	}
 	return d
 }

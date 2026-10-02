@@ -22,6 +22,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
 func TestGetAccount(t *testing.T) {
@@ -405,4 +408,107 @@ func TestUpdateAccountTeams(t *testing.T) {
 			})
 		}
 	})
+}
+
+type mockViewerAccountClient struct {
+	getEscalationsByAccountFn func(ctx context.Context, accountNumber string, offset, limit int) ([]servicenow.EscalationDetail, error)
+	escalateCaseFn            func(ctx context.Context, accountNumber, caseNumber string, request servicenow.EscalationRequest, submittedByEmail string) (servicenow.EscalationResponse, error)
+}
+
+func (m *mockViewerAccountClient) GetEscalationsByAccount(ctx context.Context, accountNumber string, offset, limit int) ([]servicenow.EscalationDetail, error) {
+	return m.getEscalationsByAccountFn(ctx, accountNumber, offset, limit)
+}
+func (m *mockViewerAccountClient) EscalateCase(ctx context.Context, accountNumber, caseNumber string, request servicenow.EscalationRequest, submittedByEmail string) (servicenow.EscalationResponse, error) {
+	return m.escalateCaseFn(ctx, accountNumber, caseNumber, request, submittedByEmail)
+}
+
+func TestSplEscalateCase_RequiresEscalationPermission(t *testing.T) {
+	h := NewViewerAccountHandler(&mockViewerAccountClient{}, viewerAccessGuard)
+
+	body := `{"justification":"urgent","requestSource":"Customer","reason":"Inactivity","severity":"High Severity"}`
+	r := httptest.NewRequest(http.MethodPost, "/spl/accounts/ACC1/cases/CS1/escalate", strings.NewReader(body))
+	// SPL access (sales_solutions) but no escalator/cs_engineer/admin — passes
+	// PermViewerAccess, fails the additional PermEscalate check.
+	r = r.WithContext(middleware.WithUserInfo(r.Context(), &middleware.UserInfo{
+		Email: "sales@example.com", UserID: "u-sales", Roles: []string{"test-sales-solutions"},
+	}))
+	r.SetPathValue("accountId", "ACC1")
+	r.SetPathValue("caseId", "CS1")
+	w := httptest.NewRecorder()
+	h.EscalateCase(w, r)
+	assertStatus(t, w, http.StatusForbidden)
+}
+
+func TestSplEscalateCase_RejectsInvalidPayload(t *testing.T) {
+	h := NewViewerAccountHandler(&mockViewerAccountClient{}, viewerAccessGuard)
+
+	tests := []string{
+		`{"justification":"","requestSource":"Customer","reason":"Inactivity","severity":"High Severity"}`,
+		`{"justification":"x","requestSource":"Bogus","reason":"Inactivity","severity":"High Severity"}`,
+		`{"justification":"x","requestSource":"Customer","reason":"Bogus","severity":"High Severity"}`,
+		`{"justification":"x","requestSource":"Customer","reason":"Inactivity","severity":"Bogus"}`,
+		`not-json`,
+	}
+	for _, body := range tests {
+		r := withUser(httptest.NewRequest(http.MethodPost, "/spl/accounts/ACC1/cases/CS1/escalate", strings.NewReader(body)))
+		r.SetPathValue("accountId", "ACC1")
+		r.SetPathValue("caseId", "CS1")
+		w := httptest.NewRecorder()
+		h.EscalateCase(w, r)
+		assertStatus(t, w, http.StatusBadRequest)
+	}
+}
+
+func TestSplEscalateCase_Conflict(t *testing.T) {
+	client := &mockViewerAccountClient{
+		escalateCaseFn: func(_ context.Context, _, _ string, _ servicenow.EscalationRequest, _ string) (servicenow.EscalationResponse, error) {
+			return servicenow.EscalationResponse{}, servicenow.ErrEscalationConflict
+		},
+	}
+	h := NewViewerAccountHandler(client, viewerAccessGuard)
+
+	body := `{"justification":"urgent","requestSource":"Customer","reason":"Inactivity","severity":"High Severity"}`
+	r := withUser(httptest.NewRequest(http.MethodPost, "/spl/accounts/ACC1/cases/CS1/escalate", strings.NewReader(body)))
+	r.SetPathValue("accountId", "ACC1")
+	r.SetPathValue("caseId", "CS1")
+	w := httptest.NewRecorder()
+	h.EscalateCase(w, r)
+	assertStatus(t, w, http.StatusConflict)
+}
+
+func TestParsePaginationParams(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantOK     bool
+		wantOffset int
+		wantLimit  int
+	}{
+		{"valid", "offset=5&limit=20", true, 5, 20},
+		{"missing offset", "limit=20", false, 0, 0},
+		{"negative offset", "offset=-1&limit=20", false, 0, 0},
+		{"non-numeric offset", "offset=abc&limit=20", false, 0, 0},
+		{"missing limit", "offset=0", false, 0, 0},
+		{"zero limit", "offset=0&limit=0", false, 0, 0},
+		{"limit at the maximum", "offset=0&limit=100", true, 0, 100},
+		{"limit over the maximum", "offset=0&limit=101", false, 0, 0},
+		{"limit far over the maximum", "offset=0&limit=10000000", false, 0, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/x?"+tc.query, nil)
+			w := httptest.NewRecorder()
+			offset, limit, ok := parsePaginationParams(w, r)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				assertStatus(t, w, http.StatusBadRequest)
+				return
+			}
+			if offset != tc.wantOffset || limit != tc.wantLimit {
+				t.Errorf("offset/limit = %d/%d, want %d/%d", offset, limit, tc.wantOffset, tc.wantLimit)
+			}
+		})
+	}
 }

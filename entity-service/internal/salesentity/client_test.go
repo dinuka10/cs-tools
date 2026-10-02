@@ -75,6 +75,51 @@ func TestGetCustomer_PostsRealtimeSearch(t *testing.T) {
 	}
 }
 
+// TestGetCustomer_DecodesAccountIngestFields pins the JSON names the Account
+// ingest reads, including the SE-1 fields Sales Entity does not send yet.
+func TestGetCustomer_DecodesAccountIngestFields(t *testing.T) {
+	client := newTestClient(t, http.StatusOK, []map[string]any{{
+		"id": "001xx", "name": "Acme",
+		"address": map[string]any{
+			"billingStreet": "1 Main St", "billingCity": "Colombo", "billingState": "Western",
+			"billingPostalCode": "00300", "billingCountry": "Sri Lanka", "country": "ignored",
+		},
+		"owner":                   map[string]any{"id": "005xx", "email": "owner@example.com"},
+		"activationDate":          "2024-01-15",
+		"lostDate":                "2025-02-01",
+		"lostReason":              "Budget",
+		"lastModifiedDate":        "2026-09-29T10:00:00.000+0000",
+		"csmEmail":                "csm@example.com",
+		"secondaryTechnicalOwner": "tech2@example.com",
+		"renewalManager":          map[string]any{"email": "renewal@example.com"},
+		"accountVertical":         "Banking",
+		"lostReasonCategory":      "Commercial",
+		"deactivationDate":        "2027-01-31",
+		"isPartner":               true,
+	}})
+	got, err := client.GetCustomer(context.Background(), "001xx")
+	if err != nil {
+		t.Fatalf("GetCustomer: %v", err)
+	}
+	if got.Address == nil || deref(got.Address.BillingStreet) != "1 Main St" || deref(got.Address.BillingCity) != "Colombo" ||
+		deref(got.Address.BillingState) != "Western" || deref(got.Address.BillingPostalCode) != "00300" || deref(got.Address.BillingCountry) != "Sri Lanka" {
+		t.Errorf("address = %+v", got.Address)
+	}
+	if got.Owner == nil || deref(got.Owner.Email) != "owner@example.com" {
+		t.Errorf("owner = %+v", got.Owner)
+	}
+	if deref(got.ActivationDate) != "2024-01-15" || deref(got.LostDate) != "2025-02-01" || deref(got.LostReason) != "Budget" ||
+		deref(got.LastModifiedDate) != "2026-09-29T10:00:00.000+0000" {
+		t.Errorf("dates = %v %v %v %v", deref(got.ActivationDate), deref(got.LostDate), deref(got.LostReason), deref(got.LastModifiedDate))
+	}
+	if deref(got.CsmEmail) != "csm@example.com" || deref(got.SecondaryTechnicalOwner) != "tech2@example.com" ||
+		got.RenewalManager == nil || deref(got.RenewalManager.Email) != "renewal@example.com" ||
+		deref(got.AccountVertical) != "Banking" || deref(got.LostReasonCategory) != "Commercial" ||
+		deref(got.DeactivationDate) != "2027-01-31" || got.IsPartner == nil || !*got.IsPartner {
+		t.Errorf("SE-1 fields = %+v", got)
+	}
+}
+
 func TestGetCustomer_EmptyArrayIs503(t *testing.T) {
 	client := newTestClient(t, http.StatusOK, []any{})
 	_, err := client.GetCustomer(context.Background(), "001xx")

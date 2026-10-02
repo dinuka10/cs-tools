@@ -71,18 +71,9 @@ func NewSLAStatusService(repo repository.SLAStatusRepository, access AccessServi
 }
 
 // requireInternalCaller rejects anyone whose AccessScope is not Unrestricted
-// -- mirrors onboarding_step_service.go's own helper of the same name and
-// same reasoning; kept as its own unexported copy rather than a shared one
-// since AccessService itself has no natural home for a helper this small.
+// -- delegates to the shared RequireInternalCaller (require_internal.go).
 func (s *slaStatusService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.access.ResolveScope(ctx)
-	if err != nil {
-		return err
-	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "sla status is only available to internal services"}
-	}
-	return nil
+	return RequireInternalCaller(ctx, s.access, "sla status is only available to internal services")
 }
 
 // SearchActiveSLAStatuses implements SLAStatusService.

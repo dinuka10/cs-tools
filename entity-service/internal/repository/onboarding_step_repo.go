@@ -19,6 +19,8 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -40,6 +42,21 @@ type OnboardingStepRepository interface {
 	// Search returns a filtered, paginated slice of steps plus the total match
 	// count, newest first.
 	Search(ctx context.Context, req domain.SearchOnboardingStepsRequest) ([]domain.OnboardingStep, int, error)
+	// ListMissingParentFailures returns DATABASE steps that FAILED because the
+	// membership's project or account was not in CSM yet, were last written
+	// more than olderThan ago and have had fewer than maxAttempts delayed-retry
+	// re-runs (retry_count), oldest first, at most limit of them. It is the
+	// delayed-retry job's read.
+	ListMissingParentFailures(ctx context.Context, olderThan time.Duration, maxAttempts, limit int) ([]domain.OnboardingStep, error)
+	// RecordRetryAttempt counts one failed delayed-retry re-run: retry_count
+	// + 1 and updated_on = now(), last_error kept, while the step is still
+	// FAILED. Only the job calls it, so Service Bus redeliveries and new
+	// events never use up the job's cap. Reports whether a row was updated.
+	RecordRetryAttempt(ctx context.Context, stepID string) (bool, error)
+	// RequeueMissingParentFailures resets retry_count on the FAILED DATABASE
+	// steps whose missing-parent error names parent, so the job retries them
+	// again now that it is in CSM. Returns how many steps it reset.
+	RequeueMissingParentFailures(ctx context.Context, parent MissingParent) (int64, error)
 }
 
 type onboardingStepRepo struct {
@@ -54,7 +71,7 @@ func NewOnboardingStepRepository(db *pgxpool.Pool) OnboardingStepRepository {
 const onboardingStepColumns = `
 	id, membership_sf_id, contact_sf_id, email, project_id, project_contact_id,
 	step::TEXT, status::TEXT, attempt_count, last_error, event_type, event_modified_on,
-	created_on, updated_on`
+	created_on, updated_on, retry_count`
 
 func scanOnboardingStep(row pgx.Row) (domain.OnboardingStep, error) {
 	var s domain.OnboardingStep
@@ -62,7 +79,7 @@ func scanOnboardingStep(row pgx.Row) (domain.OnboardingStep, error) {
 	if err := row.Scan(
 		&s.ID, &s.MembershipSfID, &s.ContactSfID, &s.Email, &s.ProjectID, &s.ProjectContactID,
 		&step, &status, &s.AttemptCount, &s.LastError, &s.EventType, &s.EventModifiedOn,
-		&s.CreatedOn, &s.UpdatedOn,
+		&s.CreatedOn, &s.UpdatedOn, &s.RetryCount,
 	); err != nil {
 		return domain.OnboardingStep{}, err
 	}
@@ -84,7 +101,8 @@ func (r *onboardingStepRepo) Upsert(ctx context.Context, req domain.UpsertOnboar
 // the recorded one, or when the recorded row was stamped by a DELETED event
 // (an undelete keeps the Salesforce LastModifiedDate, and the row must be
 // allowed to leave that state). attempt_count and the audit columns advance
-// on every write so a stale retry is still visible.
+// on every write so a stale retry is still visible. retry_count is the job's
+// own counter: kept while the step stays FAILED, back to 0 otherwise.
 func upsertOnboardingStep(ctx context.Context, q querier, req domain.UpsertOnboardingStepRequest) (domain.OnboardingStep, error) {
 	row, err := scanOnboardingStep(q.QueryRow(ctx, `
 		INSERT INTO onboarding_step (
@@ -104,6 +122,10 @@ func upsertOnboardingStep(ctx context.Context, q querier, req domain.UpsertOnboa
 			project_id         = COALESCE(EXCLUDED.project_id, onboarding_step.project_id),
 			project_contact_id = COALESCE(EXCLUDED.project_contact_id, onboarding_step.project_contact_id),
 			attempt_count      = onboarding_step.attempt_count + 1,
+			retry_count        = CASE WHEN onboarding_step.status = 'FAILED'
+			                           AND (NOT (EXCLUDED.event_modified_on >= onboarding_step.event_modified_on OR onboarding_step.event_type = 'DELETED')
+			                                OR EXCLUDED.status = 'FAILED')
+			                          THEN onboarding_step.retry_count ELSE 0 END,
 			updated_on         = NOW(),
 			updated_by         = EXCLUDED.updated_by
 		RETURNING `+onboardingStepColumns,
@@ -205,10 +227,129 @@ func (r *onboardingStepRepo) Search(ctx context.Context, req domain.SearchOnboar
 	return out, total, nil
 }
 
+// missingParentErrorPatterns are the last_error prefixes the membership upsert
+// writes when the project or the account the membership references is not in
+// CSM yet (project_membership_repo.go's two NotFoundErrors). They are the one
+// class of DATABASE failure that fixes itself with time — the parent arrives
+// through its own sync — so they are the only ones worth retrying blind.
+var missingParentErrorPatterns = []string{"project not found%", "account not found%"}
+
+// MissingParent names a project or account that just reached CSM, so the
+// FAILED rows whose missing-parent error names it can be retried again.
+type MissingParent struct {
+	Kind string // MissingParentProject or MissingParentAccount
+	SfID string
+	// Key is the project key; memberships may name their project by key.
+	Key string
+}
+
+// The MissingParent kinds, each the noun its NotFoundError starts with.
+const (
+	MissingParentProject = "project"
+	MissingParentAccount = "account"
+)
+
+// match returns the last_error prefix pattern for p's kind and the exact
+// parent references to look for. Every missing-parent error quotes its ids
+// with %q (`sfId "a0p1"`, `key "ACME"`), so a quoted id never matches a
+// longer one; the 15-character form of an 18-character id is included
+// because a child may reference either.
+func (p MissingParent) match() (string, []string) {
+	if p.Kind != MissingParentProject && p.Kind != MissingParentAccount {
+		return "", nil
+	}
+	var needles []string
+	if id := strings.TrimSpace(p.SfID); id != "" {
+		needles = append(needles, fmt.Sprintf("sfId %q", id))
+		if len(id) == 18 {
+			needles = append(needles, fmt.Sprintf("sfId %q", id[:15]))
+		}
+	}
+	if key := strings.TrimSpace(p.Key); key != "" && p.Kind == MissingParentProject {
+		needles = append(needles, fmt.Sprintf("key %q", key))
+	}
+	return p.Kind + " not found%", needles
+}
+
+// IsMissingParentError is missingParentErrorPatterns as a Go predicate, for
+// the salesforce_ingest_state rows the retry job filters in memory; keep the
+// two in step.
+func IsMissingParentError(lastError string) bool {
+	msg := strings.ToLower(strings.TrimSpace(lastError))
+	return strings.HasPrefix(msg, "project not found") || strings.HasPrefix(msg, "account not found")
+}
+
+// ListMissingParentFailures implements OnboardingStepRepository. The FAILED
+// partial index (idx_onboarding_step_failed) narrows the scan; the rest of
+// the predicate is cheap on what remains.
+func (r *onboardingStepRepo) ListMissingParentFailures(ctx context.Context, olderThan time.Duration, maxAttempts, limit int) ([]domain.OnboardingStep, error) {
+	rows, err := r.db.Query(ctx, `SELECT `+onboardingStepColumns+`
+		FROM onboarding_step
+		WHERE step = $1::onboarding_step_enum
+		  AND status = $2::onboarding_step_status_enum
+		  AND last_error ILIKE ANY($3::text[])
+		  AND updated_on < NOW() - make_interval(secs => $4::int)
+		  AND retry_count < $5
+		ORDER BY updated_on, id
+		LIMIT $6`,
+		string(domain.OnboardingStepDatabase), string(domain.OnboardingStepFailed), missingParentErrorPatterns,
+		int(olderThan.Seconds()), maxAttempts, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query missing-parent onboarding step failures: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.OnboardingStep{}
+	for rows.Next() {
+		s, err := scanOnboardingStep(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan onboarding step: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate onboarding steps: %w", err)
+	}
+	return out, nil
+}
+
 // querier is the subset of pgx shared by a pool and a transaction, so the
 // step upsert can run standalone or inside the membership transaction.
 type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// RecordRetryAttempt implements OnboardingStepRepository.
+func (r *onboardingStepRepo) RecordRetryAttempt(ctx context.Context, stepID string) (bool, error) {
+	tag, err := r.db.Exec(ctx, `
+		UPDATE onboarding_step
+		   SET retry_count = retry_count + 1, updated_on = NOW()
+		 WHERE id = $1::uuid AND status = $2::onboarding_step_status_enum`,
+		stepID, string(domain.OnboardingStepFailed))
+	if err != nil {
+		return false, fmt.Errorf("record onboarding step retry attempt: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// RequeueMissingParentFailures implements OnboardingStepRepository.
+func (r *onboardingStepRepo) RequeueMissingParentFailures(ctx context.Context, parent MissingParent) (int64, error) {
+	prefix, needles := parent.match()
+	if len(needles) == 0 {
+		return 0, nil
+	}
+	tag, err := r.db.Exec(ctx, `
+		UPDATE onboarding_step
+		   SET retry_count = 0
+		 WHERE step = $1::onboarding_step_enum
+		   AND status = $2::onboarding_step_status_enum
+		   AND retry_count > 0
+		   AND last_error ILIKE $3
+		   AND EXISTS (SELECT 1 FROM unnest($4::text[]) AS n WHERE strpos(last_error, n) > 0)`,
+		string(domain.OnboardingStepDatabase), string(domain.OnboardingStepFailed), prefix, needles)
+	if err != nil {
+		return 0, fmt.Errorf("requeue onboarding steps for missing parent: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

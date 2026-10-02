@@ -70,7 +70,7 @@ func seed(t *testing.T, pool *pgxpool.Pool) {
 func TestIntegration_RepoMappingIsCaseInsensitive(t *testing.T) {
 	pool := testPool(t)
 	seed(t, pool)
-	repo := repository.NewGithubSyncRepository(pool)
+	repo := repository.NewGithubSyncRepository(repository.NewScoped(pool))
 	ctx := context.Background()
 
 	for _, tc := range [][2]string{
@@ -94,7 +94,7 @@ func TestIntegration_RepoMappingIsCaseInsensitive(t *testing.T) {
 func TestIntegration_UnmappedRepoIsNilNotError(t *testing.T) {
 	pool := testPool(t)
 	seed(t, pool)
-	got, err := repository.NewGithubSyncRepository(pool).
+	got, err := repository.NewGithubSyncRepository(repository.NewScoped(pool)).
 		RepoMapping(context.Background(), "someone", "unmapped")
 	if err != nil {
 		t.Fatalf("RepoMapping: %v", err)
@@ -109,7 +109,7 @@ func TestIntegration_UnmappedRepoIsNilNotError(t *testing.T) {
 func TestIntegration_DeliveryClaim(t *testing.T) {
 	pool := testPool(t)
 	seed(t, pool)
-	repo := repository.NewGithubSyncRepository(pool)
+	repo := repository.NewGithubSyncRepository(repository.NewScoped(pool))
 	ctx := context.Background()
 
 	if err := repo.ClaimDelivery(ctx, "delivery-1", "issues", "labeled"); err != nil {
@@ -133,7 +133,7 @@ func TestIntegration_DeliveryClaim(t *testing.T) {
 func TestIntegration_DeliveryWithoutAction(t *testing.T) {
 	pool := testPool(t)
 	seed(t, pool)
-	repo := repository.NewGithubSyncRepository(pool)
+	repo := repository.NewGithubSyncRepository(repository.NewScoped(pool))
 	ctx := context.Background()
 
 	if err := repo.ClaimDelivery(ctx, "delivery-2", "ping", ""); err != nil {

@@ -14,8 +14,8 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Reuses case_escalation_level_enum from 000018_case_table.up.sql: this table
--- shares the identical value set for current_level/previous_level.
+-- Enum constants are the SN choice Label text (EL0-EL5), not the underlying
+-- numeric Value - same convention as sla_stage_enum (see 0048).
 DO $$ BEGIN
     CREATE TYPE case_escalation_level_enum AS ENUM (
         'EL0', 'EL1', 'EL2', 'EL3', 'EL4', 'EL5'
@@ -37,8 +37,7 @@ CREATE TABLE IF NOT EXISTS case_escalation (
 CREATE INDEX IF NOT EXISTS idx_case_escalation_work_item_id ON case_escalation (work_item_id);
 
 -- Junction table fanned out from u_notification_list via expand_list, same shape
--- as work_item_watcher (see 000040_work_item_watcher_table.up.sql): one row per
--- (escalation, notified user) pair.
+-- as work_item_watcher (see 0042): one row per (escalation, notified user) pair.
 CREATE TABLE IF NOT EXISTS case_escalation_notification_list (
     id UUID PRIMARY KEY,
     case_escalation_id UUID NOT NULL REFERENCES case_escalation(id) ON DELETE CASCADE,

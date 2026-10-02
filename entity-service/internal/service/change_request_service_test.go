@@ -540,3 +540,36 @@ func TestChangeRequestService_DecideChangeRequestApproval_RepoNotFoundPropagates
 		t.Fatalf("expected *apierror.NotFoundError, got %T: %v", err, err)
 	}
 }
+
+// TestChangeRequestService_PatchChangeRequest_AcceptsFieldParityFieldsAlone
+// proves a request carrying only one of the field-parity fields (previously
+// rejected with "at least one field must be provided") reaches the
+// repository, and that fields with no Postgres backing are rejected rather
+// than silently dropped.
+func TestChangeRequestService_PatchChangeRequest_AcceptsFieldParityFieldsAlone(t *testing.T) {
+	text := "2 hours"
+	ptr := &text
+	var got domain.PatchChangeRequestRequest
+	repo := &stubChangeRequestRepo{
+		patchChangeRequest: func(_ context.Context, id string, req domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+			got = req
+			return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+		},
+	}
+	svc := NewChangeRequestService(repo, stubUserRepo{})
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{RollbackDurationText: &ptr}); err != nil {
+		t.Fatalf("rollbackDurationText alone: unexpected error: %v", err)
+	}
+	if got.RollbackDurationText == nil {
+		t.Fatal("repository never saw RollbackDurationText")
+	}
+
+	comment := "hello"
+	_, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{Comment: &comment})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("comment: expected ValidationError, got %T: %v", err, err)
+	}
+}

@@ -61,6 +61,8 @@ csm_retry_base_delay = "30s"
 csm_retry_multiplier = 3
 # Caps how long the exponential CSM retry wait can grow to.
 csm_retry_max_delay = "1h"
+# Threads every Chat fallback message for the same alert fingerprint into one Google Chat thread, instead of a new top-level message each time the incident recurs.
+chat_threading_enabled = true
 
 [server]
 # Bounds how long SIGTERM/SIGINT waits for in-flight work before forcing exit.

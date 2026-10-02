@@ -24,7 +24,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // NewChangeRequestFromIssue is what a GitHub issue contributes to a new
@@ -109,12 +108,31 @@ type GithubMutationRepository interface {
 }
 
 type githubMutationRepository struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewGithubMutationRepository constructs the writer.
-func NewGithubMutationRepository(db *pgxpool.Pool) GithubMutationRepository {
+func NewGithubMutationRepository(db *Scoped) GithubMutationRepository {
 	return &githubMutationRepository{db: db}
+}
+
+// withGithubSystemIdentity stamps ctx as an internal caller before every
+// call this file's and github_sync_repo.go's repositories make through
+// Scoped. Both are the GitHub webhook sync -- a system-to-system integration
+// authenticated by HMAC, not a customer's own request -- so there is no real
+// "viewer" identity to forward here, and treating it as internal is correct
+// by construction, the same reasoning already applied to
+// CreateChangeRequestFromServiceNow and to the SLA engine's own background
+// worker (see NewSLAEngineRepository's doc comment).
+//
+// This is not optional only for the tables migration 0145 protects: EVERY
+// Scoped method requires SOME identity on ctx regardless of whether the
+// target table has RLS at all (Scoped.Query/QueryRow/Exec return
+// ErrNoCallerIdentity outright otherwise) -- so every method on
+// githubMutationRepository/githubSyncRepository needs this stamp, not just
+// the ones touching change_request/approval_stage.
+func withGithubSystemIdentity(ctx context.Context) context.Context {
+	return WithSystemIdentity(ctx)
 }
 
 // nullable turns "" into a SQL NULL so an absent value is absent rather than
@@ -127,120 +145,113 @@ func nullable(v string) any {
 }
 
 func (r *githubMutationRepository) CreateFromIssue(ctx context.Context, in NewChangeRequestFromIssue) (string, string, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return "", "", fmt.Errorf("github: begin create: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// The work item and its change_request extension are one record split
-	// across two tables; a half-written one is worse than none.
-	const insertWorkItem = `
-		INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by,
-		                       number, subject, type, description, project_id)
-		VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1,
-		        next_github_change_request_number(), $2, 'CHANGE_REQUEST', $3, $4::uuid)
-		RETURNING id::text, number`
-
+	ctx = withGithubSystemIdentity(ctx)
 	var id, number string
-	err = tx.QueryRow(ctx, insertWorkItem,
-		in.CreatedBy, in.Subject, nullable(in.Description), nullable(in.ProjectID),
-	).Scan(&id, &number)
-	if err != nil {
-		return "", "", fmt.Errorf("github: insert work item: %w", err)
-	}
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		// The work item and its change_request extension are one record split
+		// across two tables; a half-written one is worse than none.
+		const insertWorkItem = `
+			INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by,
+			                       number, subject, type, description, project_id)
+			VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1,
+			        next_github_change_request_number(), $2, 'CHANGE_REQUEST', $3, $4::uuid)
+			RETURNING id::text, number`
 
-	const insertCR = `
-		INSERT INTO change_request (id, state, git_reference, impact, likelihood, change_request_type)
-		VALUES ($1::uuid, 'NEW', $2,
-		        $3::change_request_impact_enum,
-		        $4::change_request_likelihood_enum,
-		        $5::change_request_type_enum)`
-	_, err = tx.Exec(ctx, insertCR, id, in.GitReference,
-		nullable(in.Impact), nullable(in.Likelihood), nullable(in.Type))
-	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return "", "", ErrChangeRequestExists
+		if err := tx.QueryRow(ctx, insertWorkItem,
+			in.CreatedBy, in.Subject, nullable(in.Description), nullable(in.ProjectID),
+		).Scan(&id, &number); err != nil {
+			return fmt.Errorf("github: insert work item: %w", err)
 		}
-		return "", "", fmt.Errorf("github: insert change request: %w", err)
-	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return "", "", fmt.Errorf("github: commit create: %w", err)
+		const insertCR = `
+			INSERT INTO change_request (id, state, git_reference, impact, likelihood, change_request_type)
+			VALUES ($1::uuid, 'NEW', $2,
+			        $3::change_request_impact_enum,
+			        $4::change_request_likelihood_enum,
+			        $5::change_request_type_enum)`
+		if _, err := tx.Exec(ctx, insertCR, id, in.GitReference,
+			nullable(in.Impact), nullable(in.Likelihood), nullable(in.Type)); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return ErrChangeRequestExists
+			}
+			return fmt.Errorf("github: insert change request: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", "", err
 	}
 	return id, number, nil
 }
 
 func (r *githubMutationRepository) UpdateFromIssue(ctx context.Context, id string, in NewChangeRequestFromIssue) error {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("github: begin update: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// COALESCE so a field the issue no longer states keeps its current value
-	// rather than being cleared. An edit that drops a label should not wipe
-	// what someone set in the portal.
-	const updateWorkItem = `
-		UPDATE work_item
-		SET subject     = $2,
-		    description = COALESCE($3, description),
-		    updated_on  = NOW(),
-		    updated_by  = $4
-		WHERE id = $1::uuid`
-	if _, err := tx.Exec(ctx, updateWorkItem, id, in.Subject, nullable(in.Description), in.CreatedBy); err != nil {
-		return fmt.Errorf("github: update work item: %w", err)
-	}
-
-	// WHICH EXTENSION TABLE THIS RECORD LIVES IN DECIDES WHAT ELSE UPDATES.
-	// An issue creates a service request, not a change request, so this used to
-	// run an UPDATE against change_request that matched no row -- reporting
-	// success while service_request.json_data kept whatever the issue said when
-	// it was first seen. Editing the issue moved the subject and description and
-	// silently left every captured field stale.
-	ct, err := tx.Exec(ctx, `
-		UPDATE change_request
-		SET impact              = COALESCE($2::change_request_impact_enum, impact),
-		    likelihood          = COALESCE($3::change_request_likelihood_enum, likelihood),
-		    change_request_type = COALESCE($4::change_request_type_enum, change_request_type)
-		WHERE id = $1::uuid`, id,
-		nullable(in.Impact), nullable(in.Likelihood), nullable(in.Type))
-	if err != nil {
-		return fmt.Errorf("github: update change request: %w", err)
-	}
-
-	if ct.RowsAffected() == 0 {
-		// Re-extract from the issue body rather than patching key by key: the
-		// body is the source of truth, and a field removed from the template
-		// should stop being reported. The two derived keys are not in the body
-		// and are re-applied so they survive the rewrite.
-		fields := in.Fields
-		if fields == nil {
-			fields = map[string]string{}
+	ctx = withGithubSystemIdentity(ctx)
+	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+		// COALESCE so a field the issue no longer states keeps its current value
+		// rather than being cleared. An edit that drops a label should not wipe
+		// what someone set in the portal.
+		const updateWorkItem = `
+			UPDATE work_item
+			SET subject     = $2,
+			    description = COALESCE($3, description),
+			    updated_on  = NOW(),
+			    updated_by  = $4
+			WHERE id = $1::uuid`
+		if _, err := tx.Exec(ctx, updateWorkItem, id, in.Subject, nullable(in.Description), in.CreatedBy); err != nil {
+			return fmt.Errorf("github: update work item: %w", err)
 		}
-		if in.SRType != "" {
-			fields["u_sr_type"] = in.SRType
-		}
-		if in.GitReference != "" {
-			fields["u_github_issue_url"] = in.GitReference
-		}
-		payload, err := json.Marshal(fields)
+
+		// WHICH EXTENSION TABLE THIS RECORD LIVES IN DECIDES WHAT ELSE UPDATES.
+		// An issue creates a service request, not a change request, so this used to
+		// run an UPDATE against change_request that matched no row -- reporting
+		// success while service_request.json_data kept whatever the issue said when
+		// it was first seen. Editing the issue moved the subject and description and
+		// silently left every captured field stale.
+		ct, err := tx.Exec(ctx, `
+			UPDATE change_request
+			SET impact              = COALESCE($2::change_request_impact_enum, impact),
+			    likelihood          = COALESCE($3::change_request_likelihood_enum, likelihood),
+			    change_request_type = COALESCE($4::change_request_type_enum, change_request_type)
+			WHERE id = $1::uuid`, id,
+			nullable(in.Impact), nullable(in.Likelihood), nullable(in.Type))
 		if err != nil {
-			return fmt.Errorf("github: encode service request fields: %w", err)
+			return fmt.Errorf("github: update change request: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE service_request
-			SET category  = COALESCE(NULLIF($2, ''), category),
-			    json_data = $3::jsonb
-			WHERE id = $1::uuid`, id, in.Catalog, payload); err != nil {
-			return fmt.Errorf("github: update service request: %w", err)
+
+		if ct.RowsAffected() == 0 {
+			// Re-extract from the issue body rather than patching key by key: the
+			// body is the source of truth, and a field removed from the template
+			// should stop being reported. The two derived keys are not in the body
+			// and are re-applied so they survive the rewrite.
+			fields := in.Fields
+			if fields == nil {
+				fields = map[string]string{}
+			}
+			if in.SRType != "" {
+				fields["u_sr_type"] = in.SRType
+			}
+			if in.GitReference != "" {
+				fields["u_github_issue_url"] = in.GitReference
+			}
+			payload, err := json.Marshal(fields)
+			if err != nil {
+				return fmt.Errorf("github: encode service request fields: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE service_request
+				SET category  = COALESCE(NULLIF($2, ''), category),
+				    json_data = $3::jsonb
+				WHERE id = $1::uuid`, id, in.Catalog, payload); err != nil {
+				return fmt.Errorf("github: update service request: %w", err)
+			}
 		}
-	}
-	return tx.Commit(ctx)
+		return nil
+	})
 }
 
 func (r *githubMutationRepository) SetState(ctx context.Context, id, state string) (bool, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	// IS DISTINCT FROM so a move to the state it already holds writes nothing:
 	// the outbound trigger would otherwise enqueue a push announcing a change
 	// that did not happen.
@@ -256,6 +267,7 @@ func (r *githubMutationRepository) SetState(ctx context.Context, id, state strin
 }
 
 func (r *githubMutationRepository) AddComment(ctx context.Context, changeRequestID, content, createdBy string) error {
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `
 		INSERT INTO comment (id, created_on, created_by, type, work_item_id, content)
 		VALUES (gen_random_uuid(), NOW(), $1, 'COMMENT', $2::uuid, $3)`
@@ -270,6 +282,7 @@ func (r *githubMutationRepository) SetAssignee(ctx context.Context, id, userID s
 		// Nobody to assign to. A routing gap worth seeing, not a write.
 		return false, nil
 	}
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `
 		UPDATE work_item
 		SET assigned_to_id = $2::uuid, updated_on = NOW()
@@ -295,6 +308,7 @@ func (r *githubMutationRepository) UserIDForGithubLogin(ctx context.Context, log
 	if login == "" {
 		return "", nil
 	}
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `
 		SELECT id::text FROM "user"
 		WHERE lower(split_part(email, '@', 1)) = lower($1)
@@ -342,6 +356,7 @@ func isUniqueViolation(err error) bool {
 
 // workItemByIssue returns the id of the work item already holding this issue.
 func (r *githubMutationRepository) workItemByIssue(ctx context.Context, accountID string, issue int) (string, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	const q = `SELECT id::text FROM work_item
 	           WHERE account_id = NULLIF($1, '')::uuid AND github_issue_number = $2`
 	var id string
@@ -354,70 +369,71 @@ func (r *githubMutationRepository) workItemByIssue(ctx context.Context, accountI
 
 // CreateServiceRequestFromIssue implements GithubMutationRepository.
 func (r *githubMutationRepository) CreateServiceRequestFromIssue(ctx context.Context, in NewServiceRequestFromIssue) (string, string, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return "", "", fmt.Errorf("github: begin create service request: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	// github_issue_number is set in the same statement that creates the row.
-	// Writing it afterwards would leave a window where the record exists and
-	// nothing about it syncs -- and the trigger fires on the INSERT, so the
-	// link has to be there by then or the first event is lost.
-	const insertWorkItem = `
-		INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by,
-		                       number, wso2_id, subject, type, description,
-		                       account_id, github_issue_number)
-		VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1,
-		        next_github_service_request_number(),
-		        -- Required for SERVICE_REQUEST by work_item_wso2_id_required_by_type.
-		        next_github_service_request_wso2_id(),
-		        $2, 'SERVICE_REQUEST', $3,
-		        NULLIF($4, '')::uuid, $5)
-		RETURNING id::text, number`
-
+	ctx = withGithubSystemIdentity(ctx)
 	var id, number string
-	if err := tx.QueryRow(ctx, insertWorkItem,
-		in.CreatedBy, in.Subject, nullable(in.Description), in.AccountID, in.IssueNumber,
-	).Scan(&id, &number); err != nil {
-		// A concurrent delivery for the same issue got here first. GitHub sends
-		// an issue as several events (opened, then labeled), so this is the
-		// ordinary case rather than an exotic one: report the record that won
-		// instead of failing, and let the caller treat it as already existing.
-		if isUniqueViolation(err) {
-			existing, lookupErr := r.workItemByIssue(ctx, in.AccountID, in.IssueNumber)
-			if lookupErr != nil {
-				return "", "", lookupErr
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		// github_issue_number is set in the same statement that creates the row.
+		// Writing it afterwards would leave a window where the record exists and
+		// nothing about it syncs -- and the trigger fires on the INSERT, so the
+		// link has to be there by then or the first event is lost.
+		const insertWorkItem = `
+			INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by,
+			                       number, wso2_id, subject, type, description,
+			                       account_id, github_issue_number)
+			VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1,
+			        next_github_service_request_number(),
+			        -- Required for SERVICE_REQUEST by work_item_wso2_id_required_by_type.
+			        next_github_service_request_wso2_id(),
+			        $2, 'SERVICE_REQUEST', $3,
+			        NULLIF($4, '')::uuid, $5)
+			RETURNING id::text, number`
+
+		if err := tx.QueryRow(ctx, insertWorkItem,
+			in.CreatedBy, in.Subject, nullable(in.Description), in.AccountID, in.IssueNumber,
+		).Scan(&id, &number); err != nil {
+			// A concurrent delivery for the same issue got here first. GitHub sends
+			// an issue as several events (opened, then labeled), so this is the
+			// ordinary case rather than an exotic one: report the record that won
+			// instead of failing, and let the caller treat it as already existing.
+			if isUniqueViolation(err) {
+				existing, lookupErr := r.workItemByIssue(ctx, in.AccountID, in.IssueNumber)
+				if lookupErr != nil {
+					return lookupErr
+				}
+				id, number = existing, ""
+				return errAlreadyExists
 			}
-			return existing, "", errAlreadyExists
+			return fmt.Errorf("github: insert service request work item: %w", err)
 		}
-		return "", "", fmt.Errorf("github: insert service request work item: %w", err)
-	}
 
-	fields := in.Fields
-	if fields == nil {
-		fields = map[string]string{}
-	}
-	if in.SRType != "" {
-		fields["u_sr_type"] = in.SRType
-	}
-	if in.GitReference != "" {
-		fields["u_github_issue_url"] = in.GitReference
-	}
-	payload, err := json.Marshal(fields)
-	if err != nil {
-		return "", "", fmt.Errorf("github: encode service request fields: %w", err)
-	}
+		fields := in.Fields
+		if fields == nil {
+			fields = map[string]string{}
+		}
+		if in.SRType != "" {
+			fields["u_sr_type"] = in.SRType
+		}
+		if in.GitReference != "" {
+			fields["u_github_issue_url"] = in.GitReference
+		}
+		payload, err := json.Marshal(fields)
+		if err != nil {
+			return fmt.Errorf("github: encode service request fields: %w", err)
+		}
 
-	const insertSR = `
-		INSERT INTO service_request (id, state, category, json_data)
-		VALUES ($1::uuid, 'OPEN', NULLIF($2, ''), $3::jsonb)`
-	if _, err := tx.Exec(ctx, insertSR, id, in.Catalog, payload); err != nil {
-		return "", "", fmt.Errorf("github: insert service request: %w", err)
+		const insertSR = `
+			INSERT INTO service_request (id, state, category, json_data)
+			VALUES ($1::uuid, 'OPEN', NULLIF($2, ''), $3::jsonb)`
+		if _, err := tx.Exec(ctx, insertSR, id, in.Catalog, payload); err != nil {
+			return fmt.Errorf("github: insert service request: %w", err)
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errAlreadyExists) {
+		return "", "", err
 	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return "", "", fmt.Errorf("github: commit service request: %w", err)
+	if errors.Is(err, errAlreadyExists) {
+		return id, "", errAlreadyExists
 	}
 	return id, number, nil
 }

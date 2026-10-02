@@ -23,7 +23,6 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // OutboxChange is one row change observed through event_outbox.
@@ -65,11 +64,11 @@ type CRNoticeRepository interface {
 }
 
 type crNoticeRepository struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewCRNoticeRepository constructs the change-request notice reader.
-func NewCRNoticeRepository(db *pgxpool.Pool) CRNoticeRepository {
+func NewCRNoticeRepository(db *Scoped) CRNoticeRepository {
 	return &crNoticeRepository{db: db}
 }
 
@@ -87,6 +86,12 @@ func NewCRNoticeRepository(db *pgxpool.Pool) CRNoticeRepository {
 // the same mail after a restart, which is the worse failure for a human
 // recipient.
 func (r *crNoticeRepository) ClaimChanges(ctx context.Context, entityTypes []string, limit int) ([]OutboxChange, error) {
+	// WithSystemIdentity: every Scoped call requires SOME identity on ctx
+	// regardless of whether the target table has RLS (event_outbox does
+	// not) -- this repository is the CR-notice drainer's own background
+	// process, with no customer viewer to speak for, same reasoning as
+	// Details' own stamp below.
+	ctx = WithSystemIdentity(ctx)
 	const query = `
 		WITH claimed AS (
 			SELECT id FROM event_outbox
@@ -138,6 +143,16 @@ func (r *crNoticeRepository) ClaimChanges(ctx context.Context, entityTypes []str
 // row can be deleted between the outbox row being written and this running,
 // and a notice about a deleted record is a silent no-op, not a fault to retry.
 func (r *crNoticeRepository) Details(ctx context.Context, id string) (CRNoticeDetails, error) {
+	// WithSystemIdentity: change_request's RLS policies (migration 0145)
+	// would otherwise silently filter this read to zero rows -- this
+	// repository is the CR-notice drainer's own reader, an internal
+	// background process with no customer viewer to speak for (same
+	// reasoning as githubMutationRepository.withGithubSystemIdentity), and
+	// this method's own doc comment already treats a missing row as a
+	// legitimate silent no-op, which is exactly the failure mode a
+	// forgotten identity stamp here would produce for every change request,
+	// not just deleted ones.
+	ctx = WithSystemIdentity(ctx)
 	const query = `
 		SELECT wi.number,
 		       COALESCE(cr.git_reference, ''),
@@ -214,16 +229,25 @@ func (r *crNoticeRepository) ProjectContactEmails(ctx context.Context, projectID
 		// not an error: the caller treats "nobody to tell" as a silent no-op.
 		return nil, nil
 	}
-	const query = `
+	return r.emails(ctx, projectContactEmailsQuery, projectID)
+}
+
+// projectContactEmailsQuery reads a project's contact addresses, leaving out
+// DEACTIVATED memberships: the Salesforce ingest keeps a removed contact as a
+// DEACTIVATED row (ServiceNow hard-deleted it), and a person removed from the
+// project must not keep receiving its change-request notices.
+const projectContactEmailsQuery = `
 		SELECT pc.email
 		FROM project_contact pc
 		WHERE pc.project_id = $1::uuid
 		  AND COALESCE(pc.email, '') <> ''
+		  AND (pc.state IS NULL OR pc.state <> 'DEACTIVATED'::project_contact_state_enum)
 		ORDER BY pc.email`
-	return r.emails(ctx, query, projectID)
-}
 
 func (r *crNoticeRepository) emails(ctx context.Context, query string, arg any) ([]string, error) {
+	// WithSystemIdentity: shared by GroupMemberEmails/ProjectContactEmails --
+	// same reasoning as ClaimChanges' own stamp above.
+	ctx = WithSystemIdentity(ctx)
 	rows, err := r.db.Query(ctx, query, arg)
 	if err != nil {
 		return nil, fmt.Errorf("crnotice: query emails: %w", err)

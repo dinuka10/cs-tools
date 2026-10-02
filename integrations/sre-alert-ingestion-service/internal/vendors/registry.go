@@ -32,11 +32,12 @@ import (
 	"sre-alert-ingestion-service/internal/vendors/openobserve"
 	"sre-alert-ingestion-service/internal/vendors/opensearch"
 	"sre-alert-ingestion-service/internal/vendors/prometheus"
+	"sre-alert-ingestion-service/internal/vendors/servicenow"
 	"sre-alert-ingestion-service/internal/vendors/site24x7"
 )
 
-// Transform turns one webhook body into canonical alerts. Every vendor but Prometheus returns
-// exactly one; an error means the payload is rejected with 400.
+// Transform turns one webhook body into canonical alerts. Every vendor but Prometheus and the
+// ServiceNow forward returns exactly one; an error means the payload is rejected with 400.
 type Transform func(raw []byte) ([]model.Alert, error)
 
 // Registry holds every vendor's transform, bound to the config it loaded at startup.
@@ -132,6 +133,8 @@ func New() (*Registry, error) {
 			}
 			return out, nil
 		},
+		// Temporary: alerts ServiceNow forwards already in canonical form, during the parallel run.
+		"servicenow": servicenow.Transform,
 		"site24x7": func(raw []byte) ([]model.Alert, error) {
 			a, err := site24x7.Transform(raw, s247Cfg)
 			return one(err, model.Alert(a))

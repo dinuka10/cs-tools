@@ -25,7 +25,7 @@ export interface CsReportDetailsParams {
   enabled: boolean;
 }
 
-/** `GET /spl/report-details` — see internal/servicenow/reports.go. */
+/** `GET /report-details` — see internal/servicenow/reports.go. */
 export function useGetCsReportDetails(
   params: CsReportDetailsParams,
 ): UseQueryResult<CSReportDetailsResponse, Error> {
@@ -37,7 +37,7 @@ export function useGetCsReportDetails(
     queryFn: () => {
       const query = new URLSearchParams({ projectSysId, from, to });
       return api.get<CSReportDetailsResponse>(
-        `/spl/report-details?${query.toString()}`,
+        `/report-details?${query.toString()}`,
       ) as Promise<CSReportDetailsResponse>;
     },
     enabled,

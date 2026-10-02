@@ -58,11 +58,15 @@ const (
 // combination went unexercised until this bug was reported.
 func seedTimeCardWithNullDurations(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	ctx := context.Background()
+	// WithSystemIdentity: time_card's RLS policies (migration 0144)
+	// require an identity on every statement now, including this seed's own
+	// writes. scoped, not just pool, backs mustExec below.
+	ctx := repository.WithSystemIdentity(context.Background())
+	scoped := repository.NewScoped(pool)
 
 	cleanup := func() {
-		_, _ = pool.Exec(ctx, `DELETE FROM time_card WHERE created_by = 'time-card-null-test'`)
-		_, _ = pool.Exec(ctx, `DELETE FROM work_item WHERE created_by = 'time-card-null-test'`)
+		_, _ = scoped.Exec(ctx, `DELETE FROM time_card WHERE created_by = 'time-card-null-test'`)
+		_, _ = scoped.Exec(ctx, `DELETE FROM work_item WHERE created_by = 'time-card-null-test'`)
 		_, _ = pool.Exec(ctx, `DELETE FROM "user" WHERE user_name = 'time-card-null-test@example.com'`)
 		_, _ = pool.Exec(ctx, `DELETE FROM project WHERE id = $1`, timeCardTestProjectID)
 	}
@@ -77,7 +81,7 @@ func seedTimeCardWithNullDurations(t *testing.T, pool *pgxpool.Pool) {
 	// package, a different package from this one).
 	mustExec := func(sql string, args ...any) {
 		t.Helper()
-		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+		if _, err := scoped.Exec(ctx, sql, args...); err != nil {
 			t.Fatalf("seed (%.60s): %v", sql, err)
 		}
 	}
@@ -114,8 +118,13 @@ func TestTimeCardIntegration_SearchTimeCardsToleratesNullDurationColumns(t *test
 	pool := caseStatsPool(t)
 	seedTimeCardWithNullDurations(t, pool)
 
-	repo := repository.NewTimeCardRepository(pool)
-	views, total, err := repo.SearchTimeCards(context.Background(), domain.SearchTimeCardsRequest{
+	repo := repository.NewTimeCardRepository(repository.NewScoped(pool))
+	// WithSystemIdentity: this test is about NULL-duration scanning, not
+	// authorization -- it never seeds a project_contact for
+	// timeCardTestProjectID, so an internal/unrestricted identity is what
+	// makes the row visible under time_card's RLS policy (migration 0144).
+	ctx := repository.WithSystemIdentity(context.Background())
+	views, total, err := repo.SearchTimeCards(ctx, domain.SearchTimeCardsRequest{
 		Filters:    &domain.SearchTimeCardsFilters{CaseID: ptrTo(timeCardTestCaseID)},
 		Pagination: domain.Pagination{Limit: 10, Offset: 0},
 	}, "")

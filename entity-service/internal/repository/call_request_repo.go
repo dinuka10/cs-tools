@@ -27,7 +27,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -205,11 +204,17 @@ type CallRequestRepository interface {
 }
 
 type callRequestRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewCallRequestRepository constructs a CallRequestRepository backed by the given connection pool.
-func NewCallRequestRepository(db *pgxpool.Pool) CallRequestRepository {
+// NewCallRequestRepository constructs a CallRequestRepository backed by the
+// given Scoped connection. customer_call's project-membership visibility
+// (migration 0143) is enforced entirely by Postgres RLS now -- this
+// repository applies no project filtering of its own, closing what was
+// previously an acknowledged, unfixed gap (see this file's git history):
+// neither SearchCallRequests nor SearchAllCallRequests ever did any
+// caller-scoped authorization at all.
+func NewCallRequestRepository(db *Scoped) CallRequestRepository {
 	return &callRequestRepo{db: db}
 }
 
@@ -286,8 +291,21 @@ func scanCallRequest(row pgx.Row) (domain.CallRequestView, error) {
 }
 
 // runCallRequestSearch executes the count and page queries concurrently for
-// the given WHERE/ORDER BY and their bound args.
+// the given WHERE/ORDER BY and their bound args, each through Scoped so the
+// caller's identity (pulled from ctx) is set for both customer_call's own
+// RLS policy (migration 0143) and, through callRequestFrom's caseLikeJoins,
+// the RLS-protected `announcement` table's (migration 000085) -- both must
+// see the SAME transaction's identity, which Scoped guarantees per call.
 func (r *callRequestRepo) runCallRequestSearch(ctx context.Context, where, orderBy string, args []any, pagination domain.Pagination) ([]domain.CallRequestView, int, error) {
+	// Hide a call request whose parent is an ANNOUNCEMENT the caller cannot
+	// see: work_item RLS alone passes any project member, and the LEFT JOINed
+	// case fields (subject/number) would otherwise come back for it. The
+	// wi.id IS NULL branch keeps a call request with no parent work item.
+	// Added to the shared WHERE so the count and page queries stay in step.
+	// Skipped for an Unrestricted caller (announcementLeakGuardFor); a ctx with
+	// no identity at all keeps the guard.
+	callerScope, _ := CallerIdentityFromContext(ctx)
+	where += " AND (wi.id IS NULL OR " + announcementLeakGuardFor(callerScope) + ")"
 	countQuery := `SELECT COUNT(*) ` + callRequestFrom + ` ` + where
 	dataQuery := fmt.Sprintf(`%s %s %s %s LIMIT $%d OFFSET $%d`,
 		callRequestSelect, callRequestFrom, where, orderBy, len(args)+1, len(args)+2)
@@ -404,6 +422,10 @@ func (r *callRequestRepo) CreateCallRequest(ctx context.Context, req domain.Crea
 		return domain.CreateCallRequestResponse{}, fmt.Errorf("encode utcTimes: %w", err)
 	}
 
+	// The announcementVisibilityLeakGuard (case_repo.go) keeps a caller from
+	// raising a call request against an ANNOUNCEMENT whose extension row RLS
+	// hides from them: work_item RLS alone would let it through.
+	//
 	// INSERT ... SELECT ... FROM work_item so a nonexistent (or non-case)
 	// work item yields zero rows -> NotFoundError, instead of a bare
 	// foreign-key violation.
@@ -418,6 +440,7 @@ func (r *callRequestRepo) CreateCallRequest(ctx context.Context, req domain.Crea
 		       make_interval(mins => $3::int), $4::text, $5::text::jsonb
 		FROM work_item wi
 		WHERE wi.id = $6::text::uuid AND wi.type = ANY(` + caseLikeWorkItemTypes + `)
+		  AND ` + announcementVisibilityLeakGuard + `
 		RETURNING id, created_on`
 
 	var id string
@@ -425,7 +448,7 @@ func (r *callRequestRepo) CreateCallRequest(ctx context.Context, req domain.Crea
 	err = r.db.QueryRow(ctx, query,
 		callerEmail, callerID, req.DurationMinutes, req.Reason, string(times), req.CaseID,
 	).Scan(&id, &createdOn)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || IsRLSPolicyViolation(err) {
 		return domain.CreateCallRequestResponse{}, &apierror.NotFoundError{Msg: "case not found"}
 	}
 	if err != nil {
@@ -501,7 +524,7 @@ func (r *callRequestRepo) UpdateCallRequest(ctx context.Context, req domain.Upda
 		finalTimes, req.DurationMinutes, scheduledOn, assigneeID,
 		req.Notes, req.Plan, req.Attendees, req.ActionItems, actual, caseID,
 	).Scan(&id, &updatedOn)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) || IsRLSPolicyViolation(err) {
 		if caseID != nil {
 			return domain.UpdateCallRequestResponse{}, &apierror.NotFoundError{Msg: "call request not found for this case"}
 		}

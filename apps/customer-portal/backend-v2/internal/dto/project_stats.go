@@ -16,7 +16,11 @@
 
 package dto
 
-import "github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/entity"
+import (
+	"strings"
+
+	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/entity"
+)
 
 // ReferenceItem is a flattened {id, label, count?} view of entity-service's
 // ChoiceListItem/ReferenceTableItem — this API collapses both into one
@@ -57,9 +61,29 @@ func mapReferenceTableItems(items []entity.ReferenceTableItem) []ReferenceItem {
 }
 
 // restrictedChangeRequestStateIDs are excluded from ProjectFilterOptions'
-// changeRequestStates — internal ServiceNow workflow states never meant to
-// be offered as a customer-facing filter option.
+// changeRequestStates — ServiceNow's own numeric ids for the three internal
+// pre-approval workflow states (New, Assess, Authorize).
 var restrictedChangeRequestStateIDs = map[string]bool{"-3": true, "-4": true, "-5": true}
+
+// restrictedChangeRequestStateLabels is the Postgres-mode equivalent: on
+// that data source ReferenceDataRepository.EnumLabels (entity-service)
+// returns the raw enum label as id, e.g. {"id":"NEW"}, never a ServiceNow
+// number, so the id check above never matches there and these three would
+// leak into the response unfiltered without this. crStateIDs (see
+// change_request_enum_mapping.go) also has no entries for them, by the same
+// "internal, never customer-facing" design, so they pass normalizeChoices
+// unchanged and keep their raw label -- matched here before that happens.
+//
+// Checked case-insensitively and kept alongside the id check above, not in
+// place of it: a Postgres-mode label is reliably UPPER_SNAKE, but this
+// endpoint also serves the ServiceNow data source, whose own raw label
+// casing isn't guaranteed to match — dropping the id check here would trade
+// one data source's gap for the other's.
+var restrictedChangeRequestStateLabels = map[string]bool{"NEW": true, "ASSESS": true, "AUTHORIZE": true}
+
+func isRestrictedChangeRequestState(s ReferenceItem) bool {
+	return restrictedChangeRequestStateIDs[s.ID] || restrictedChangeRequestStateLabels[strings.ToUpper(s.Label)]
+}
 
 // ProjectFilterOptions is the portal's response for GET /projects/{id}/filters
 // — a flattened, filter-dropdown-ready view of entity-service's project
@@ -88,7 +112,7 @@ type ProjectFilterOptions struct {
 func MapProjectFilterOptions(m entity.ProjectMetadataResponse) ProjectFilterOptions {
 	changeRequestStates := make([]ReferenceItem, 0, len(m.ChangeRequestStates))
 	for _, s := range mapChoiceListItems(m.ChangeRequestStates) {
-		if !restrictedChangeRequestStateIDs[s.ID] {
+		if !isRestrictedChangeRequestState(s) {
 			changeRequestStates = append(changeRequestStates, s)
 		}
 	}
@@ -99,8 +123,8 @@ func MapProjectFilterOptions(m entity.ProjectMetadataResponse) ProjectFilterOpti
 		IssueTypes:                  normalizeCaseIssueTypeChoices(mapChoiceListItems(m.IssueTypes)),
 		DeploymentTypes:             normalizeDeploymentTypeChoices(mapChoiceListItems(m.DeploymentTypes)),
 		CallRequestStates:           mapChoiceListItems(m.CallRequestStates),
-		ChangeRequestStates:         changeRequestStates,
-		ChangeRequestImpacts:        mapChoiceListItems(m.ChangeRequestImpacts),
+		ChangeRequestStates:         normalizeChangeRequestStateChoices(changeRequestStates),
+		ChangeRequestImpacts:        normalizeChangeRequestImpactChoices(mapChoiceListItems(m.ChangeRequestImpacts)),
 		ConversationStates:          mapChoiceListItems(m.ConversationStates),
 		CaseTypes:                   mapReferenceTableItems(m.CaseTypes),
 		TimeCardStates:              mapChoiceListItems(m.TimeCardStates),
@@ -317,8 +341,8 @@ func MapProjectCaseStats(r entity.ProjectCaseStatsResponse) ProjectCaseStats {
 		OutstandingSeverityCount:       normalizeCaseSeverityChoices(mapChoiceListItems(r.OutstandingSeverityCount)),
 		CaseTypeCount:                  mapReferenceTableItems(r.CaseTypeCount),
 		CasesTrend:                     mapCasesTrend(r.CasesTrend),
-		EngagementTypeCount:            mapChoiceListItems(r.EngagementTypeCount),
-		OutstandingEngagementTypeCount: mapChoiceListItems(r.OutstandingEngagementTypeCount),
+		EngagementTypeCount:            normalizeCaseEngagementTypeChoices(mapChoiceListItems(r.EngagementTypeCount)),
+		OutstandingEngagementTypeCount: normalizeCaseEngagementTypeChoices(mapChoiceListItems(r.OutstandingEngagementTypeCount)),
 	}
 }
 
@@ -408,13 +432,22 @@ type ProjectChangeRequestStats struct {
 
 // MapProjectChangeRequestStats builds the portal response from
 // entity-service's ProjectChangeRequestStatsResponse.
+//
+// StateCount is normalized the same way GET /projects/{id}/filters'
+// changeRequestStates is (see normalizeChangeRequestStateChoices): on the
+// Postgres data source entity-service returns the raw enum as both id and
+// label (e.g. {"id":"SCHEDULED","label":"SCHEDULED"}), but the Operations page
+// finds its Scheduled / Customer Approval / Customer Review counts by the
+// display label, so an un-normalized "SCHEDULED" never matched and the
+// Upcoming Changes card fell back to "--" while the list beside it showed
+// Scheduled changes.
 func MapProjectChangeRequestStats(r entity.ProjectChangeRequestStatsResponse) ProjectChangeRequestStats {
 	return ProjectChangeRequestStats{
 		TotalCount:          r.TotalCount,
 		ActiveCount:         r.ActiveCount,
 		OutstandingCount:    r.OutstandingCount,
 		ActionRequiredCount: r.ActionRequiredCount,
-		StateCount:          mapChoiceListItems(r.StateCount),
+		StateCount:          normalizeChangeRequestStateChoices(mapChoiceListItems(r.StateCount)),
 		ResolvedCount:       mapResolvedCountBreakdown(r.ResolvedCount),
 	}
 }

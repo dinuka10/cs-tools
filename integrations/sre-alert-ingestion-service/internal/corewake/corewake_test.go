@@ -18,10 +18,12 @@ package corewake
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,7 +41,7 @@ func TestWake_PostsToAlertsCore(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(discard(), srv.URL+"/alert", time.Second)
+	c := New(discard(), srv.URL+"/alertz", "", "", time.Second)
 	c.Wake()
 	c.Wait(context.Background())
 	if calls.Load() != 1 || method != http.MethodPost {
@@ -64,7 +66,7 @@ func TestWake_OneInFlightAndCoalescesTheRest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := New(discard(), srv.URL, 5*time.Second)
+	c := New(discard(), srv.URL, "", "", 5*time.Second)
 	c.Wake()
 	<-entered // first call is in flight
 	for range 5 {
@@ -82,7 +84,7 @@ func TestWake_OneInFlightAndCoalescesTheRest(t *testing.T) {
 }
 
 func TestWake_EmptyURLIsNoOp(t *testing.T) {
-	c := New(discard(), "", time.Second)
+	c := New(discard(), "", "", "", time.Second)
 	c.Wake()
 	c.Wait(context.Background()) // must not hang
 }
@@ -92,11 +94,84 @@ func TestWake_ErrorsAreOnlyLogged(t *testing.T) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	c := New(discard(), srv.URL, time.Second)
+	c := New(discard(), srv.URL, "", "", time.Second)
 	c.Wake()
 	c.Wait(context.Background())
 
-	unreachable := New(discard(), "http://127.0.0.1:1", 200*time.Millisecond)
+	unreachable := New(discard(), "http://127.0.0.1:1", "", "", 200*time.Millisecond)
 	unreachable.Wake()
 	unreachable.Wait(context.Background())
+}
+
+// authHeader records the Authorization header of the one wake call made to srv.
+func authHeader(t *testing.T, tlsServer bool, username, secret string) (string, bool) {
+	t.Helper()
+	var got string
+	var seen bool
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, seen = r.Header.Get("Authorization"), r.Header.Get("Authorization") != ""
+		w.WriteHeader(http.StatusAccepted)
+	})
+	srv := httptest.NewServer(h)
+	if tlsServer {
+		srv.Close()
+		srv = httptest.NewTLSServer(h)
+	}
+	defer srv.Close()
+
+	c := New(discard(), srv.URL, username, secret, time.Second)
+	c.http.Transport = srv.Client().Transport // trust the test cert, keep the redirect policy
+	c.Wake()
+	c.Wait(context.Background())
+	return got, seen
+}
+
+func TestWake_SendsCredentialOverHTTPS(t *testing.T) {
+	got, _ := authHeader(t, true, "alert-ingestion", "s3cr3t")
+	want := "Bearer " + base64.StdEncoding.EncodeToString([]byte("alert-ingestion:s3cr3t"))
+	if got != want {
+		t.Errorf("Authorization = %q, want %q", got, want)
+	}
+}
+
+// Over plain http the secret would cross the network in cleartext, so it is withheld.
+func TestWake_WithholdsCredentialOverHTTP(t *testing.T) {
+	if _, seen := authHeader(t, false, "alert-ingestion", "s3cr3t"); seen {
+		t.Error("credential sent over plain http")
+	}
+}
+
+func TestWake_NoCredentialSendsNoHeader(t *testing.T) {
+	if _, seen := authHeader(t, true, "", ""); seen {
+		t.Error("no credential configured, but an Authorization header was sent")
+	}
+}
+
+// CodeRabbit: an https endpoint redirecting to http on the same host must not get the
+// credential replayed in cleartext. Go would forward Authorization on that redirect.
+func TestWake_DoesNotFollowRedirectsWithCredential(t *testing.T) {
+	var leaked atomic.Bool
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked.Store(true)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer plain.Close()
+
+	var logs strings.Builder
+	secure := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, plain.URL+"/alertz", http.StatusFound)
+	}))
+	defer secure.Close()
+
+	c := New(slog.New(slog.NewTextHandler(&logs, nil)), secure.URL+"/alertz", "alert-ingestion", "s3cr3t", time.Second)
+	c.http.Transport = secure.Client().Transport
+	c.Wake()
+	c.Wait(context.Background())
+
+	if leaked.Load() {
+		t.Fatal("redirect was followed to plain http, so the credential could cross in cleartext")
+	}
+	if !strings.Contains(logs.String(), "status=302") {
+		t.Errorf("the 3xx should be logged as an unexpected status, logs: %s", logs.String())
+	}
 }

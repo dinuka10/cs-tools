@@ -166,6 +166,10 @@ check whether the underlying entity-service operation is ServiceNow-backed
 Postgres-only (works fine over M2M unconditionally) before documenting a new
 endpoint one way or the other.
 
+## Contacts and opportunity reads on `DATA_SOURCE=postgres`
+
+Contacts search and opportunity/invoice/link reads work over M2M only if this service's client id is in entity-service's `AUTH_INTERNAL_CLIENT_IDS`; otherwise 401/403.
+
 ## Middleware chain
 
 `SecurityHeaders → CorrelationID → Logger → Mux`

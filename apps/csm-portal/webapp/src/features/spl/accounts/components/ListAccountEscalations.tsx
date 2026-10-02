@@ -15,7 +15,7 @@
 // under the License.
 
 import { useState } from "react";
-import { useGetAccountEscalations } from "../api/useSplAccountsApi";
+import { useGetAccountEscalations } from "../api/useAccountsApi";
 import AccountsDataTable from "./AccountsDataTable";
 
 export default function ListAccountEscalations({ id }: { id: string }) {

@@ -88,3 +88,27 @@ func TestProjectContactRowToDomain_AccountRoles(t *testing.T) {
 		})
 	}
 }
+
+// TestProjectContactRowToDomain_EmailAndCaseAccess pins the v1.0 email fallback and that
+// grantsCaseAccess follows the real access check (matching email and REGISTERED).
+func TestProjectContactRowToDomain_EmailAndCaseAccess(t *testing.T) {
+	cases := []struct {
+		name       string
+		row        repository.ProjectContactRow
+		wantEmail  string
+		wantAccess bool
+	}{
+		{"registered, matching email", repository.ProjectContactRow{Email: "Jane@acme.com", RegistrationState: "REGISTERED", ResolvedUserID: sampleStr("u1"), ResolvedEmail: sampleStr("jane@acme.com")}, "jane@acme.com", true},
+		{"invited, matching email", repository.ProjectContactRow{Email: "jane@acme.com", RegistrationState: "INVITED", ResolvedUserID: sampleStr("u1"), ResolvedEmail: sampleStr("jane@acme.com")}, "jane@acme.com", false},
+		{"registered, different email", repository.ProjectContactRow{Email: "old@acme.com", RegistrationState: "REGISTERED", ResolvedUserID: sampleStr("u1"), ResolvedEmail: sampleStr("new@acme.com")}, "new@acme.com", false},
+		{"no linked user", repository.ProjectContactRow{Email: "ghost@acme.com", RegistrationState: "REGISTERED"}, "ghost@acme.com", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := projectContactRowToDomain(tc.row)
+			if got.Email != tc.wantEmail || got.GrantsCaseAccess != tc.wantAccess {
+				t.Fatalf("email/grantsCaseAccess = %q/%v, want %q/%v", got.Email, got.GrantsCaseAccess, tc.wantEmail, tc.wantAccess)
+			}
+		})
+	}
+}

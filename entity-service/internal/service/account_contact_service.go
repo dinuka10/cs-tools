@@ -44,13 +44,30 @@ func resolveCallerEmail(ctx context.Context) (string, error) {
 	return email, nil
 }
 
+// resolveContactCaller is resolveCallerEmail, except an unrestricted caller with no
+// user token (an allow-listed internal client, e.g. csm-integration-service) passes with "".
+func resolveContactCaller(ctx context.Context, access AccessService) (string, error) {
+	if access == nil || middleware.UserIDTokenFromContext(ctx) != "" {
+		return resolveCallerEmail(ctx)
+	}
+	scope, err := access.ResolveScope(ctx)
+	if err != nil {
+		return "", err
+	}
+	if !scope.Unrestricted {
+		return "", &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	return "", nil
+}
+
 type accountContactService struct {
-	repo repository.AccountContactRepository
+	repo   repository.AccountContactRepository
+	access AccessService
 }
 
 // NewAccountContactService constructs an AccountContactService backed by Postgres.
-func NewAccountContactService(repo repository.AccountContactRepository) AccountContactService {
-	return &accountContactService{repo: repo}
+func NewAccountContactService(repo repository.AccountContactRepository, access AccessService) AccountContactService {
+	return &accountContactService{repo: repo, access: access}
 }
 
 // SearchAccountContacts implements AccountContactService.
@@ -65,7 +82,7 @@ func (s *accountContactService) SearchAccountContacts(ctx context.Context, accou
 		return domain.SearchAccountContactsResponse{}, err
 	}
 
-	callerEmail, err := resolveCallerEmail(ctx)
+	callerEmail, err := resolveContactCaller(ctx, s.access)
 	if err != nil {
 		return domain.SearchAccountContactsResponse{}, err
 	}

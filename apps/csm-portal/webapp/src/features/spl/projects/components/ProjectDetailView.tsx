@@ -21,7 +21,7 @@
 import { useState, type ReactNode } from "react";
 import { Alert, Box, Button, Paper, Stack, Tab, Tabs, Typography } from "@wso2/oxygen-ui";
 import { FileTextIcon } from "@wso2/oxygen-ui-icons-react";
-import { useGetProject } from "../api/useSplProjectsApi";
+import { useGetSplProject } from "../api/useProjectsApi";
 import LinearLoading from "./LinearLoading";
 import ProjectPathView from "./ProjectPathView";
 import ProjectContactsTable from "./ProjectContactsTable";
@@ -33,7 +33,7 @@ const PROJECT_TYPE_CLOUD_EVALUATION_SUPPORT = "Cloud Evaluation Support";
 
 export default function ProjectDetailView({ id }: { id: string }) {
   const [tabValue, setTabValue] = useState(0);
-  const { data, isLoading, error } = useGetProject(id);
+  const { data, isLoading, error } = useGetSplProject(id);
 
   const isTypeCloud =
     data?.projectType === PROJECT_TYPE_CLOUD_SUPPORT || data?.projectType === PROJECT_TYPE_CLOUD_EVALUATION_SUPPORT;

@@ -22,9 +22,7 @@ import (
 	"alert-core-service/internal/engine"
 )
 
-// gapTracker maps an alert seq to when this leader first saw it not found, backing GapTimeout.
-// Every missing id in the window ages at once, so a run of missing ids costs one GapTimeout in
-// total, not one per id. Not safe for concurrent use.
+// gapTracker maps an alert seq to when this leader first saw it missing, backing GapTimeout; a run of missing ids costs one GapTimeout total, not one per id; not safe for concurrent use.
 type gapTracker map[int64]time.Time
 
 // pruneThrough drops entries at or below cursor; those ids are behind the pipeline now.
@@ -45,10 +43,7 @@ type windowDecision struct {
 	skipped []int64
 }
 
-// decideWindow updates gaps from slots, then walks the window from base in id order: ready ids
-// are handled, terminal (Failed) ids and ids missing for at least gapTimeout are skipped, and the
-// walk stops at a newer missing id or a read error. Read errors never start, reset or trigger a
-// skip, so a failing read can't silently drop an alert. gapTimeout <= 0 disables skipping.
+// decideWindow updates gaps from slots, then walks the window handling ready ids and skipping terminal or gapTimeout-expired-missing ids, stopping at a newer missing id or read error; gapTimeout<=0 disables skipping.
 func decideWindow(slots []prepared, base int64, now time.Time, gapTimeout time.Duration, gaps gapTracker) windowDecision {
 	for i, s := range slots {
 		seq := base + int64(i)

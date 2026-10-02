@@ -237,7 +237,7 @@ export default function OutageDetailPage(): JSX.Element {
                 startIcon={<CheckCircle size={14} />}
                 onClick={() => setCloseOpen(true)}
               >
-                Close outage
+                End outage
               </Button>
             ) : (
               <Button

@@ -18,32 +18,30 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { CreateGithubIssueDialog } from "@features/csm-cases/components/CreateGithubIssueDialog";
-import { useGetGithubIssueRepoOptions } from "@features/csm-cases/api/useGetGithubIssueRepoOptions";
+import { useGetProductRepoMapping } from "@features/csm-cases/api/useGetProductRepoMapping";
 
 // CreateGithubIssueDialog consumes this hook directly; mock the hook module
 // itself (per this app's testing convention — mock the hook when testing a
 // component that just consumes an already-built hook) rather than the
-// backend client it wraps.
-vi.mock("@features/csm-cases/api/useGetGithubIssueRepoOptions", () => ({
-  useGetGithubIssueRepoOptions: vi.fn(),
+// backend client it wraps. Product-name matching lives in the entity service.
+vi.mock("@features/csm-cases/api/useGetProductRepoMapping", () => ({
+  useGetProductRepoMapping: vi.fn(),
 }));
 
-const mockUseGetGithubIssueRepoOptions = vi.mocked(useGetGithubIssueRepoOptions);
+const mockUseGetProductRepoMapping = vi.mocked(useGetProductRepoMapping);
 
-const REPO_OPTIONS_FIXTURE = [
-  {
-    value: "asgardeo",
-    displayLabel: "Asgardeo",
-    owner: "wso2-enterprise",
-    repo: "wso2-iam-internal",
-    githubLabel: "Asgardeo",
-  },
-];
+const MAPPING_FIXTURE = {
+  productName: "Alpha",
+  owner: "example-org",
+  repository: "example-repo",
+  githubLabel: "Alpha",
+};
 
 beforeEach(() => {
-  mockUseGetGithubIssueRepoOptions.mockReturnValue({
-    data: REPO_OPTIONS_FIXTURE,
+  mockUseGetProductRepoMapping.mockReturnValue({
+    data: MAPPING_FIXTURE,
     isLoading: false,
+    isError: false,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any);
 });
@@ -71,7 +69,7 @@ describe("CreateGithubIssueDialog — required fields gate submission", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -100,7 +98,7 @@ describe("CreateGithubIssueDialog — per-type field rules", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -118,7 +116,7 @@ describe("CreateGithubIssueDialog — per-type field rules", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -144,7 +142,7 @@ describe("CreateGithubIssueDialog — per-type field rules", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -180,7 +178,7 @@ describe("CreateGithubIssueDialog — stale per-type fields don't leak into the 
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -214,7 +212,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         showRepoField
@@ -227,7 +225,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     fireEvent.click(screen.getByRole("button", { name: /file issue/i }));
     expect(onSubmit).toHaveBeenCalledWith(
       expect.objectContaining({
-        repoOverride: { owner: "wso2-enterprise", repo: "wso2-iam-internal" },
+        repoOverride: { owner: "example-org", repo: "example-repo" },
       }),
     );
   });
@@ -236,7 +234,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         showRepoField
@@ -250,12 +248,12 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
       name: /file this github issue/i,
     });
     expect(
-      within(confirmDialog).getByText(/wso2-enterprise\/wso2-iam-internal \(Asgardeo\)/),
+      within(confirmDialog).getByText(/example-org\/example-repo \(Alpha\)/),
     ).toBeInTheDocument();
   });
 
   it("disables the repo select while options are loading, instead of rendering broken values", () => {
-    mockUseGetGithubIssueRepoOptions.mockReturnValue({
+    mockUseGetProductRepoMapping.mockReturnValue({
       data: undefined,
       isLoading: true,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -263,7 +261,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         showRepoField
@@ -277,7 +275,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
   });
 
   it("keeps Create issue disabled while repo options are still loading, even with every other field filled", () => {
-    mockUseGetGithubIssueRepoOptions.mockReturnValue({
+    mockUseGetProductRepoMapping.mockReturnValue({
       data: undefined,
       isLoading: true,
       isError: false,
@@ -286,7 +284,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         showRepoField
@@ -301,7 +299,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
   });
 
   it("keeps Create issue disabled when the repo options fetch has failed", () => {
-    mockUseGetGithubIssueRepoOptions.mockReturnValue({
+    mockUseGetProductRepoMapping.mockReturnValue({
       data: undefined,
       isLoading: false,
       isError: true,
@@ -310,7 +308,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         showRepoField
@@ -322,7 +320,13 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     expect(screen.getByRole("button", { name: /create issue/i })).toBeDisabled();
   });
 
-  it("keeps Create issue disabled when the product matches no catalogue row", () => {
+  it("keeps Create issue disabled when the lookup finds no mapping", () => {
+    mockUseGetProductRepoMapping.mockReturnValue({
+      data: null,
+      isLoading: false,
+      isError: false,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
     render(
       <CreateGithubIssueDialog
         open
@@ -338,31 +342,22 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     expect(screen.getByRole("button", { name: /create issue/i })).toBeDisabled();
   });
 
-  it("matches Bijira to its own row rather than the shorter BI label", () => {
-    mockUseGetGithubIssueRepoOptions.mockReturnValue({
-      data: [
-        {
-          value: "bi",
-          displayLabel: "BI",
-          owner: "wso2-enterprise",
-          repo: "wso2-integration-internal",
-          githubLabel: "BI",
-        },
-        {
-          value: "bijira",
-          displayLabel: "Bijira",
-          owner: "wso2-enterprise",
-          repo: "wso2-apim-internal",
-          githubLabel: "Bijira",
-        },
-      ],
+  it("shows the repository the lookup returned", () => {
+    mockUseGetProductRepoMapping.mockReturnValue({
+      data: {
+        productName: "Beta",
+        owner: "example-org",
+        repository: "other-repo",
+        githubLabel: "Beta",
+      },
       isLoading: false,
+      isError: false,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
     } as any);
     render(
       <CreateGithubIssueDialog
         open
-        productName="Bijira"
+        productName="Beta"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -370,85 +365,15 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
       />,
     );
     expect(
-      screen.getByText(/wso2-enterprise\/wso2-apim-internal \(Bijira\)/),
+      screen.getByText(/example-org\/other-repo \(Beta\)/),
     ).toBeInTheDocument();
-  });
-
-  it("prefers an exact product label over a longer name that merely contains it", () => {
-    mockUseGetGithubIssueRepoOptions.mockReturnValue({
-      data: [
-        {
-          value: "choreo-connect",
-          displayLabel: "Choreo-Connect",
-          owner: "wso2-enterprise",
-          repo: "choreo",
-          githubLabel: "Choreo-Connect",
-        },
-        {
-          value: "choreo",
-          displayLabel: "Choreo",
-          owner: "wso2-enterprise",
-          repo: "choreo",
-          githubLabel: "Choreo",
-        },
-      ],
-      isLoading: false,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
-    render(
-      <CreateGithubIssueDialog
-        open
-        productName="Choreo"
-        submitting={false}
-        error={null}
-        onClose={() => {}}
-        onSubmit={() => {}}
-      />,
-    );
-    expect(screen.getByText(/\(Choreo\)/)).toBeInTheDocument();
-    expect(screen.queryByText(/\(Choreo-Connect\)/)).not.toBeInTheDocument();
-  });
-
-  it("does not file when several catalogue rows match and none is exact", () => {
-    mockUseGetGithubIssueRepoOptions.mockReturnValue({
-      data: [
-        {
-          value: "is-analytics",
-          displayLabel: "WSO2 Identity Server Analytics",
-          owner: "wso2-enterprise",
-          repo: "wso2-iam-internal",
-          githubLabel: "IS-Analytics",
-        },
-        {
-          value: "is",
-          displayLabel: "WSO2 Identity Server",
-          owner: "wso2-enterprise",
-          repo: "wso2-iam-internal",
-          githubLabel: "IS",
-        },
-      ],
-      isLoading: false,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    } as any);
-    render(
-      <CreateGithubIssueDialog
-        open
-        productName="Identity Server"
-        submitting={false}
-        error={null}
-        onClose={() => {}}
-        onSubmit={() => {}}
-      />,
-    );
-    expect(screen.getByText(/no github repository is mapped/i)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /create issue/i })).toBeDisabled();
   });
 
   it("keeps Create issue disabled while a linked project's status is still loading", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         projectStatusPending
         submitting={false}
         error={null}
@@ -466,7 +391,7 @@ describe("CreateGithubIssueDialog — repo options (showRepoField)", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         projectStatusFailed
         onRetryProjectStatus={onRetryProjectStatus}
         submitting={false}
@@ -491,7 +416,7 @@ describe("CreateGithubIssueDialog — confirm step before filing a real issue", 
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -511,7 +436,7 @@ describe("CreateGithubIssueDialog — confirm step before filing a real issue", 
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -528,7 +453,7 @@ describe("CreateGithubIssueDialog — confirm step before filing a real issue", 
         description: "Latency spiked after the last deploy.",
         issueTypeLabel: "Type/Discussion",
         priorityLevel: "Priority/Critical",
-        repoOverride: { owner: "wso2-enterprise", repo: "wso2-iam-internal" },
+        repoOverride: { owner: "example-org", repo: "example-repo" },
       }),
     );
   });
@@ -538,7 +463,7 @@ describe("CreateGithubIssueDialog — confirm step before filing a real issue", 
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -564,7 +489,7 @@ describe("CreateGithubIssueDialog — confirm step before filing a real issue", 
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error="Something went wrong filing the issue."
         onClose={() => {}}
@@ -586,7 +511,7 @@ describe("CreateGithubIssueDialog — confirm step before filing a real issue", 
     const { rerender } = render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         onClose={() => {}}
@@ -599,7 +524,7 @@ describe("CreateGithubIssueDialog — confirm step before filing a real issue", 
     rerender(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting
         error={null}
         onClose={() => {}}
@@ -620,12 +545,12 @@ describe("CreateGithubIssueDialog — success view", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         createdIssue={{
           message: "Issue created.",
-          issue: { url: "https://github.com/wso2-enterprise/example/issues/42", number: 42, repo: "example" },
+          issue: { url: "https://github.com/example-org/example/issues/42", number: 42, repo: "example" },
         }}
         onClose={onClose}
         onSubmit={() => {}}
@@ -637,7 +562,7 @@ describe("CreateGithubIssueDialog — success view", () => {
     const link = screen.getByRole("link", { name: /example#42/i });
     expect(link).toHaveAttribute(
       "href",
-      "https://github.com/wso2-enterprise/example/issues/42",
+      "https://github.com/example-org/example/issues/42",
     );
     expect(onClose).not.toHaveBeenCalled();
 
@@ -649,7 +574,7 @@ describe("CreateGithubIssueDialog — success view", () => {
     render(
       <CreateGithubIssueDialog
         open
-        productName="Asgardeo"
+        productName="Alpha"
         submitting={false}
         error={null}
         createdIssue={{ message: "Filed, awaiting SN sync." }}

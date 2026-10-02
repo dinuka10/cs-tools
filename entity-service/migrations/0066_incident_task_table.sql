@@ -18,12 +18,13 @@
 -- pattern as incident/incident_alert_task: id IS work_item.id, ON DELETE
 -- CASCADE, no audit columns - those live on work_item and are reachable via
 -- join.
+
 DO $$ BEGIN
     CREATE TYPE incident_task_priority_enum AS ENUM ('CRITICAL', 'HIGH', 'MODERATE', 'LOW', 'PLANNING');
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- ServiceNow's choice list has "Open" for both 0 and 1, and one non-choice
--- garbage value ("SM") not modeled.
+-- garbage value ("SM") not modeled - see incident_task_details.yaml.
 DO $$ BEGIN
     CREATE TYPE incident_task_state_enum AS ENUM (
         'PENDING', 'OPEN', 'WORK_IN_PROGRESS', 'CLOSED_COMPLETE', 'CLOSED_INCOMPLETE', 'CLOSED_SKIPPED'

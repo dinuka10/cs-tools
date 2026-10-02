@@ -71,13 +71,29 @@ type SLAEngineService interface {
 	// if the case had just been created at the new severity. This also
 	// means a clock type no longer applicable after a severity DOWNGRADE
 	// (e.g. Catastrophic -> Low losing "workaround"/"resolution") is
-	// cancelled along with every other active clock, not left running --
-	// unlike RegisterCaseClocks alone, the cancellation touches every clock
-	// type on the case, not just the ones the new severity resolves. A
-	// clock already in a genuine terminal outcome (e.g. a response clock
-	// CompleteResponseClock already marked ACHIEVED) is untouched by the
-	// cancellation (it is not "active") and never resurrected by the
-	// registration that follows either (see slaEngineTerminalOutcomeFilter).
+	// cancelled along with every other clock, not left running -- unlike
+	// RegisterCaseClocks alone, the cancellation touches every clock type on
+	// the case, not just the ones the new severity resolves.
+	//
+	// A WORKAROUND/RESOLUTION clock that had merely BREACHED under the old
+	// severity (ran out the wall clock without ever being satisfied) IS
+	// cancelled and replaced by a fresh one here, same as a still-running
+	// IN_PROGRESS/PAUSED clock -- a real, reported bug had this treated the
+	// same as a genuine completion, leaving a case's workaround/resolution
+	// tracking permanently stuck on a stale, timed-out clock from the OLD
+	// severity instead of starting over under the new one. RESPONSE is the
+	// one deliberate exception, per explicit product direction: "did a
+	// support engineer reply at all" is a fact about the past a severity
+	// change cannot undo either way, so a RESPONSE clock already BREACHED
+	// (the first-reply window closed unanswered) is treated the same as one
+	// already ACHIEVED (a reply came in) -- neither is cancelled or
+	// resurrected by a later severity change (see repository.
+	// SLAEngineRepository's own slaEngineRevisionBlockStages doc comment for
+	// the exact per-target rule). A clock already in a GENUINE completion
+	// outcome (e.g. a workaround CompleteWorkaroundClock already provided)
+	// is likewise always left untouched -- that outcome already happened and
+	// a later severity change must not undo it.
+	//
 	// Because cancellation and registration run in one transaction, a
 	// failure partway through never leaves the case with its old clocks
 	// cancelled and no replacement -- either the whole revision applies, or
@@ -92,11 +108,49 @@ type SLAEngineService interface {
 	// sn_case_service.go's applyResponseSLAOnComment-equivalent hook for the
 	// exact qualification check, ported from the old design).
 	CompleteResponseClock(ctx context.Context, caseID string)
-	// ApplyCaseStateEffects pauses/resumes/completes the case's
-	// CSM-authored "workaround"/"resolution" clocks in reaction to a
-	// state-changing PATCH -- see the old design's applyCaseStateSLAEffects
-	// for the exact per-state behavior this ports (unchanged, including its
-	// documented workaround-completion gap).
+	// CompleteWorkaroundClock marks the case's CSM-authored "workaround"
+	// clock ACHIEVED -- called when a case's WorkaroundProvided is set to
+	// true (the "Provide Workaround" action), the one genuine "workaround
+	// was provided" signal that exists anywhere in the domain model. Closes
+	// a real, previously-accepted gap: ApplyCaseStateEffects below only
+	// ever paused this clock, on any state including Closed, since it had
+	// no signal of its own to complete it on.
+	CompleteWorkaroundClock(ctx context.Context, caseID string)
+	// CompleteFixEtaSharedClocks marks the case's CSM-authored "workaround"
+	// AND "resolution" clocks ACHIEVED -- called when a PATCH shares a fix
+	// ETA with the customer (req.AddPublicComment true alongside a fix-ETA
+	// date, the webapp's "Share fix ETA with customer" action; ServiceNow
+	// data source only -- see case_service.go's own UpdateCase rejection
+	// list, AddPublicComment has no Postgres equivalent). Once WSO2 has
+	// committed a fix timeline to the customer, neither clock has anything
+	// further to track: "complete" here means the same real, uncapped
+	// elapsed-time-at-this-moment semantics CompleteWorkaroundClock/
+	// ApplyCaseStateEffects already use (see repository.
+	// SLAEngineRepository.CompleteClock's own doc comment) -- not an
+	// unconditional 100%, and not a no-op if one or both already happen to
+	// be BREACHED. A clock already ACHIEVED/CANCELLED/COMPLETED (an earlier
+	// workaround/close) is simply unaffected, so calling this alongside
+	// CompleteWorkaroundClock on the same PATCH (a caller can set
+	// workaroundProvided and addPublicComment together) is safe -- whichever
+	// one runs first wins, the second is a no-op for that clock.
+	CompleteFixEtaSharedClocks(ctx context.Context, caseID string)
+	// ApplyCaseStateEffects pauses/resumes the case's CSM-authored
+	// "workaround"/"resolution" clocks in reaction to a state-changing PATCH
+	// -- see the old design's applyCaseStateSLAEffects for the exact
+	// per-state behavior this ports -- and, on CaseStateClosed, completes
+	// all three clock types ("response"/"workaround"/"resolution"), not
+	// just "resolution": a closed case has nothing left to track on any of
+	// them, so whichever haven't already reached a genuine completion
+	// (CompleteResponseClock/CompleteWorkaroundClock, or an earlier close)
+	// are finalized here with their real elapsed time, however far past
+	// 100% a still-BREACHED one has climbed (see repository.
+	// SLAEngineRepository.CompleteClock's own doc comment for why BREACHED
+	// is completable at all) -- rather than left running, or merely paused
+	// with no real disposition, forever. A clock already ACHIEVED/CANCELLED/
+	// COMPLETED is simply unaffected (CompleteClock's own stage filter
+	// matches nothing for it), so this is safe to call unconditionally for
+	// all three on every close, not just the ones that happen to still need
+	// it.
 	ApplyCaseStateEffects(ctx context.Context, caseID string, state domain.CaseState)
 }
 
@@ -242,24 +296,50 @@ func (s *slaEngineService) CompleteResponseClock(ctx context.Context, caseID str
 	}
 }
 
+// CompleteWorkaroundClock implements SLAEngineService.
+func (s *slaEngineService) CompleteWorkaroundClock(ctx context.Context, caseID string) {
+	if _, err := s.repo.CompleteClock(ctx, caseID, slaClockTypeTarget[slaClockTypeWorkaround]); err != nil {
+		slog.ErrorContext(ctx, "sla engine: complete workaround clock failed", "caseId", caseID, "err", err)
+	}
+}
+
+// CompleteFixEtaSharedClocks implements SLAEngineService.
+func (s *slaEngineService) CompleteFixEtaSharedClocks(ctx context.Context, caseID string) {
+	if _, err := s.repo.CompleteClock(ctx, caseID, slaClockTypeTarget[slaClockTypeWorkaround]); err != nil {
+		slog.ErrorContext(ctx, "sla engine: complete workaround clock on fix eta shared failed", "caseId", caseID, "err", err)
+	}
+	if _, err := s.repo.CompleteClock(ctx, caseID, slaClockTypeTarget[slaClockTypeResolution]); err != nil {
+		slog.ErrorContext(ctx, "sla engine: complete resolution clock on fix eta shared failed", "caseId", caseID, "err", err)
+	}
+}
+
 // ApplyCaseStateEffects implements SLAEngineService.
 //
 //   - CaseStateAwaitingInfo/CaseStateSolutionProposed: pause both
 //     workaround and resolution -- the case is waiting on the customer, not
 //     actively being worked.
-//   - CaseStateClosed: resume then complete resolution (claims 100%, same
-//     as CompleteResponseClock does for "response"); workaround is only
-//     paused, never completed -- ported unchanged from the old, deleted
-//     design's own documented gap: there is no "workaround provided"
-//     completion signal wired into this hook (see this engine's delivering
-//     task's own final report for a note that a WorkaroundProvided field
-//     now exists on domain.UpdateCaseRequest/CaseView, added by an
-//     unrelated commit after the old design was written -- wiring it in
-//     here is explicitly out of scope for this change).
+//   - CaseStateClosed: resume then complete all three clock types --
+//     resolution, workaround, and response. Resolution and workaround are
+//     each resumed first (in case either was paused) then completed, same
+//     "claim its real elapsed percentage at completion time" behavior
+//     CompleteResponseClock/CompleteWorkaroundClock already give their own
+//     triggers -- see SLAEngineRepository.CompleteClock's own doc comment,
+//     including why a clock already BREACHED is still completable here, not
+//     left stuck. Response is never paused (this engine never pauses it at
+//     any state), so it's completed directly. A clock that already reached
+//     a genuine completion (an engineer's reply, an earlier close) is
+//     simply untouched -- CompleteClock's own stage filter matches nothing
+//     for it -- so completing all three here unconditionally is safe
+//     regardless of which ones still needed it. This closes a real,
+//     previously-accepted gap: a case closed before response/workaround
+//     ever completed on their own used to leave the response clock
+//     untouched entirely and the workaround clock merely paused forever,
+//     neither with any real final disposition.
 //   - Anything else: resume both -- the case is active again.
 func (s *slaEngineService) ApplyCaseStateEffects(ctx context.Context, caseID string, state domain.CaseState) {
 	workaroundTarget := slaClockTypeTarget[slaClockTypeWorkaround]
 	resolutionTarget := slaClockTypeTarget[slaClockTypeResolution]
+	responseTarget := slaClockTypeTarget[slaClockTypeResponse]
 
 	switch state {
 	case domain.CaseStateAwaitingInfo, domain.CaseStateSolutionProposed:
@@ -276,10 +356,14 @@ func (s *slaEngineService) ApplyCaseStateEffects(ctx context.Context, caseID str
 		if _, err := s.repo.CompleteClock(ctx, caseID, resolutionTarget); err != nil {
 			slog.ErrorContext(ctx, "sla engine: complete resolution clock failed", "caseId", caseID, "err", err)
 		}
-		// workaround: paused, not completed -- see this method's own doc
-		// comment above.
-		if _, err := s.repo.SetPaused(ctx, caseID, workaroundTarget, true); err != nil {
-			slog.ErrorContext(ctx, "sla engine: pause workaround clock failed", "caseId", caseID, "err", err)
+		if _, err := s.repo.SetPaused(ctx, caseID, workaroundTarget, false); err != nil {
+			slog.ErrorContext(ctx, "sla engine: resume workaround clock failed", "caseId", caseID, "err", err)
+		}
+		if _, err := s.repo.CompleteClock(ctx, caseID, workaroundTarget); err != nil {
+			slog.ErrorContext(ctx, "sla engine: complete workaround clock failed", "caseId", caseID, "err", err)
+		}
+		if _, err := s.repo.CompleteClock(ctx, caseID, responseTarget); err != nil {
+			slog.ErrorContext(ctx, "sla engine: complete response clock failed", "caseId", caseID, "err", err)
 		}
 	default:
 		if _, err := s.repo.SetPaused(ctx, caseID, workaroundTarget, false); err != nil {

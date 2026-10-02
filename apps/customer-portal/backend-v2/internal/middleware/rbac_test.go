@@ -232,12 +232,21 @@ func TestHasPermissionMatrix(t *testing.T) {
 				t.Errorf("%s must NOT have CUD on TimeCards", rName)
 			}
 
-			// Projects: Read Only
+			// Projects: Read Only, EXCEPT RoleCustomerAdmin also has Update --
+			// PATCH /projects/{id} (the only route ModuleProjects/ActionUpdate
+			// gates) only ever touches the project's own AI Assistant settings
+			// (hasAgent/hasKbReferences), not general project data, so a
+			// customer's own Admin is allowed to toggle those for their own
+			// project.
+			isCustomerAdmin := rName == string(RoleCustomerAdmin)
 			if !HasPermission(roleSet, ModuleProjects, ActionRead) {
 				t.Errorf("%s must have Read on Projects", rName)
 			}
-			if HasPermission(roleSet, ModuleProjects, ActionCreate) || HasPermission(roleSet, ModuleProjects, ActionUpdate) || HasPermission(roleSet, ModuleProjects, ActionDelete) {
-				t.Errorf("%s must NOT have CUD on Projects", rName)
+			if HasPermission(roleSet, ModuleProjects, ActionCreate) || HasPermission(roleSet, ModuleProjects, ActionDelete) {
+				t.Errorf("%s must NOT have Create/Delete on Projects", rName)
+			}
+			if HasPermission(roleSet, ModuleProjects, ActionUpdate) != isCustomerAdmin {
+				t.Errorf("%s Update on Projects = %v, want %v", rName, !isCustomerAdmin, isCustomerAdmin)
 			}
 
 			// Change Requests: Read Only

@@ -15,7 +15,7 @@
 // under the License.
 
 import { useState } from "react";
-import { useGetProjectContacts } from "../api/useSplProjectsApi";
+import { useGetProjectContacts } from "../api/useProjectsApi";
 import DefaultTable from "./DefaultTable";
 
 export default function ProjectContactsTable({ id }: { id: string }) {

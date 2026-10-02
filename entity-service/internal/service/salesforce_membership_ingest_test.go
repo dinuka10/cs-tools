@@ -83,6 +83,9 @@ type fakeMembershipRepo struct {
 	deactivated   []string
 	deactivateOK  bool
 	deactivateErr error
+	// deactivateBasis is the admin-role basis the DELETED path handed over,
+	// so a test can run it the way the repository would.
+	deactivateBasis repository.AdminRoleBasisFunc
 }
 
 func (f *fakeMembershipRepo) Upsert(_ context.Context, in domain.SalesforceMembershipUpsert, step domain.UpsertOnboardingStepRequest) (domain.SalesforceMembershipUpsertResult, error) {
@@ -100,8 +103,9 @@ func (f *fakeMembershipRepo) Upsert(_ context.Context, in domain.SalesforceMembe
 	}, nil
 }
 
-func (f *fakeMembershipRepo) DeactivateBySfID(_ context.Context, id string) (bool, error) {
+func (f *fakeMembershipRepo) DeactivateBySfID(_ context.Context, id string, basis repository.AdminRoleBasisFunc) (bool, error) {
 	f.deactivated = append(f.deactivated, id)
+	f.deactivateBasis = basis
 	return f.deactivateOK, f.deactivateErr
 }
 
@@ -118,9 +122,22 @@ func (f *fakeMembershipRepo) GetMembershipByEmail(context.Context, string, strin
 }
 
 type fakeStepRepo struct {
-	existing []domain.OnboardingStep
-	upserts  []domain.UpsertOnboardingStepRequest
-	getErr   error
+	existing      []domain.OnboardingStep
+	upserts       []domain.UpsertOnboardingStepRequest
+	getErr        error
+	listErr       error
+	retryAttempts []string
+	requeued      []repository.MissingParent
+}
+
+func (f *fakeStepRepo) RecordRetryAttempt(_ context.Context, stepID string) (bool, error) {
+	f.retryAttempts = append(f.retryAttempts, stepID)
+	return true, nil
+}
+
+func (f *fakeStepRepo) RequeueMissingParentFailures(_ context.Context, parent repository.MissingParent) (int64, error) {
+	f.requeued = append(f.requeued, parent)
+	return 0, nil
 }
 
 func (f *fakeStepRepo) Upsert(_ context.Context, req domain.UpsertOnboardingStepRequest) (domain.OnboardingStep, error) {
@@ -194,12 +211,19 @@ func sampleContact() salesentity.Contact {
 }
 
 type ingestHarness struct {
-	se    *fakeMembershipSalesEntity
-	repo  *fakeMembershipRepo
-	steps *fakeStepRepo
-	pub   *fakeInvitePublisher
-	svc   SalesforceEventService
+	se       *fakeMembershipSalesEntity
+	repo     *fakeMembershipRepo
+	steps    *fakeStepRepo
+	contacts *fakeContactRepo
+	states   *fakeIngestStateRepo
+	accounts *stubSalesforceAccountRepo
+	pub      *fakeInvitePublisher
+	svc      SalesforceEventService
 }
+
+// testAccountCSMID is the CSM id the harness's account lookup answers for
+// testAccountID, so the Contact writer's EnsureAccount finds the parent.
+const testAccountCSMID = "5f0c6f5e-1b1e-4c1e-9d6a-2f6f5f0c6f5e"
 
 func newIngestHarness(pc salesentity.ProjectContact, contact salesentity.Contact, withPublisher bool) *ingestHarness {
 	h := &ingestHarness{
@@ -207,15 +231,18 @@ func newIngestHarness(pc salesentity.ProjectContact, contact salesentity.Contact
 			projectContacts: map[string]salesentity.ProjectContact{pc.ID: pc},
 			contacts:        map[string]salesentity.Contact{derefString(contact.ID): contact},
 		},
-		repo:  &fakeMembershipRepo{deactivateOK: true},
-		steps: &fakeStepRepo{},
+		repo:     &fakeMembershipRepo{deactivateOK: true},
+		steps:    &fakeStepRepo{},
+		contacts: &fakeContactRepo{deactivateFound: true},
+		states:   &fakeIngestStateRepo{},
+		accounts: &stubSalesforceAccountRepo{accountsBySfID: map[string]string{testAccountID: testAccountCSMID}},
 	}
-	ingest := MembershipIngest{Memberships: h.repo, Steps: h.steps, SalesEntity: h.se}
+	ingest := MembershipIngest{Memberships: h.repo, Steps: h.steps, SalesEntity: h.se, Contacts: h.contacts}
 	if withPublisher {
 		h.pub = &fakeInvitePublisher{}
 		ingest.Publisher = h.pub
 	}
-	h.svc = NewSalesforceEventServiceWithMembershipIngest(&stubSalesforceAccountRepo{}, &stubSalesEntityClient{}, ingest)
+	h.svc = NewSalesforceEventServiceWithMembershipIngest(h.accounts, &stubSalesEntityClient{}, SalesforceIngestSupport{Accounts: h.accounts, States: h.states}, ingest)
 	return h
 }
 
@@ -241,6 +268,15 @@ func TestMapProjectGroups(t *testing.T) {
 		{"case-insensitive", []string{"PORTAL USER", " security contact "}, []string{projectGroupFullAccess}, nil},
 		{"unknown roles ignored", []string{"Portal user", "Billing Contact", "Legal"}, []string{projectGroupGeneralAccess}, []string{"Billing Contact", "Legal"}},
 		{"no roles", nil, nil, nil},
+		{"business contact alone", []string{"Business Contact"}, []string{projectGroupBusinessContact}, nil},
+		{"portal user + business contact", []string{"Portal user", "Business Contact"}, []string{projectGroupGeneralAccess, projectGroupBusinessContact}, nil},
+		{"security contact + business contact", []string{"Business Contact", "Security Contact"}, []string{projectGroupSecurityOnly, projectGroupBusinessContact}, nil},
+		{"every mapped role at once", []string{"Portal user", "Security Contact", "Lead", "Admin", "Business Contact"},
+			[]string{projectGroupFullAccess, projectGroupLeadUserGroup, projectGroupAdmin, projectGroupBusinessContact}, nil},
+		{"business contact is case-insensitive", []string{" business CONTACT "}, []string{projectGroupBusinessContact}, nil},
+		{"the six D2 labels stay ignored", []string{"Portal user", "Business Owner", "Business Promoter", "Business Detractor", "Technical Owner", "Technical Champion", "Technical Detractor", "Business Contact"},
+			[]string{projectGroupGeneralAccess, projectGroupBusinessContact},
+			[]string{"Business Owner", "Business Promoter", "Business Detractor", "Technical Owner", "Technical Champion", "Technical Detractor"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -255,44 +291,84 @@ func TestMapProjectGroups(t *testing.T) {
 	}
 }
 
+// TestMapProjectGroups_BusinessContactGroupName pins the exact stored name:
+// ServiceNow named the group with two spaces, and syncProjectGroups matches
+// project_group."group" exactly.
+func TestMapProjectGroups_BusinessContactGroupName(t *testing.T) {
+	if projectGroupBusinessContact != "Business Contact  Group" {
+		t.Errorf("projectGroupBusinessContact = %q, want the stored name with two spaces", projectGroupBusinessContact)
+	}
+}
+
+func TestSalesforceRolesForGroups_BusinessContactRoundTrips(t *testing.T) {
+	groups, _ := mapProjectGroups([]string{"Portal user", "Business Contact"})
+	if got := salesforceRolesForGroups(groups); !reflect.DeepEqual(got, []string{"Portal user", "Business Contact"}) {
+		t.Errorf("roles = %v: a portal deactivation writes these back to Salesforce, and must not drop Business Contact", got)
+	}
+}
+
+func TestSplitIgnoredRoles(t *testing.T) {
+	byDecision, unknown := splitIgnoredRoles([]string{"Technical Owner", "Billing Contact", "business promoter"})
+	if !reflect.DeepEqual(byDecision, []string{"Technical Owner", "business promoter"}) || !reflect.DeepEqual(unknown, []string{"Billing Contact"}) {
+		t.Errorf("byDecision = %v, unknown = %v", byDecision, unknown)
+	}
+}
+
+// TestMapGlobalRoles pins decision D1: customer or partner follows the
+// contact's account classification (it used to follow the membership type),
+// and {customer, partner} is a managed pair only when the classification is
+// known (non-blank).
 func TestMapGlobalRoles(t *testing.T) {
 	sorted := func(s []string) []string { c := append([]string{}, s...); sort.Strings(c); return c }
+	account := func(classification *string) *salesentity.ContactAccount {
+		return &salesentity.ContactAccount{ID: sampleStr(testAccountID), Classification: classification}
+	}
 	cases := []struct {
 		name          string
-		typ           string
+		account       *salesentity.ContactAccount
 		isIntegration bool
 		want          []string
 		wantAdminRole string
 		wantManaged   bool
+		wantOrgPair   bool
 	}{
-		{"own contact", domain.MembershipTypeOwnContact, false, []string{"customer", "external"}, "customer_admin", true},
-		{"partner contact", domain.MembershipTypePartnerContact, false, []string{"external", "partner"}, "partner_admin", true},
-		{"blank type is own", "", false, []string{"customer", "external"}, "customer_admin", true},
-		{"integration user gets nothing", domain.MembershipTypeOwnContact, true, nil, "", false},
+		{"customer account", account(sampleStr("Customer")), false, []string{"customer", "external"}, "customer_admin", true, true},
+		{"partner account", account(sampleStr("Partner")), false, []string{"external", "partner"}, "partner_admin", true, true},
+		{"classification is case-insensitive", account(sampleStr(" partner ")), false, []string{"external", "partner"}, "partner_admin", true, true},
+		{"no classification: customer, pair not managed", account(nil), false, []string{"customer", "external"}, "customer_admin", true, false},
+		{"blank classification: customer, pair not managed", account(sampleStr("  ")), false, []string{"customer", "external"}, "customer_admin", true, false},
+		{"unknown account: customer, pair not managed", nil, false, []string{"customer", "external"}, "customer_admin", true, false},
+		{"integration user gets nothing", account(sampleStr("Partner")), true, nil, "", false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, managed, adminRole := mapGlobalRoles(tc.typ, tc.isIntegration)
-			if !reflect.DeepEqual(sorted(got), sorted(tc.want)) {
-				t.Errorf("grant = %v, want %v", got, tc.want)
+			got := mapGlobalRoles(tc.account, tc.isIntegration)
+			if !reflect.DeepEqual(sorted(got.Grant), sorted(tc.want)) {
+				t.Errorf("grant = %v, want %v", got.Grant, tc.want)
 			}
-			// The admin role is never GRANTED here any more -- mapGlobalRoles
-			// only says which of the two it would be. Whether the user holds
-			// it is derived from every membership they have, in the
-			// repository, after the write.
-			for _, r := range got {
+			// The admin role is never GRANTED here -- mapGlobalRoles only says
+			// which of the two it would be. Whether the user holds it is
+			// derived from every membership they have, in the repository,
+			// after the write.
+			for _, r := range got.Grant {
 				if r == "customer_admin" || r == "partner_admin" {
-					t.Errorf("mapGlobalRoles must not grant an admin role, got %v", got)
+					t.Errorf("mapGlobalRoles must not grant an admin role, got %v", got.Grant)
 				}
 			}
-			if adminRole != tc.wantAdminRole {
-				t.Errorf("adminRole = %q, want %q", adminRole, tc.wantAdminRole)
+			if got.AdminRole != tc.wantAdminRole {
+				t.Errorf("adminRole = %q, want %q", got.AdminRole, tc.wantAdminRole)
 			}
-			if tc.wantManaged && !reflect.DeepEqual(sorted(managed), []string{"customer_admin", "partner_admin"}) {
-				t.Errorf("managed = %v", managed)
+			if tc.wantManaged && !reflect.DeepEqual(sorted(got.ManagedAdmin), []string{"customer_admin", "partner_admin"}) {
+				t.Errorf("managed admin = %v", got.ManagedAdmin)
 			}
-			if !tc.wantManaged && managed != nil {
-				t.Errorf("managed = %v, want nil", managed)
+			if !tc.wantManaged && got.ManagedAdmin != nil {
+				t.Errorf("managed admin = %v, want nil", got.ManagedAdmin)
+			}
+			if tc.wantOrgPair && !reflect.DeepEqual(sorted(got.ManagedGlobal), []string{"customer", "partner"}) {
+				t.Errorf("managed org roles = %v, want the {customer, partner} pair", got.ManagedGlobal)
+			}
+			if !tc.wantOrgPair && got.ManagedGlobal != nil {
+				t.Errorf("managed org roles = %v, want nil", got.ManagedGlobal)
 			}
 		})
 	}
@@ -604,27 +680,54 @@ func TestMembershipIngest_UnknownStateIsValidationError(t *testing.T) {
 	}
 }
 
-func TestMembershipIngest_PartnerContactRoles(t *testing.T) {
-	pc := sampleProjectContact("INVITED", "Portal user", "Admin")
-	pc.Type = sampleStr(domain.MembershipTypePartnerContact)
-	h := newIngestHarness(pc, sampleContact(), false)
-	if err := h.svc.HandleEvent(context.Background(), membershipEvent("CREATED", "Project_Contact__c")); err != nil {
-		t.Fatal(err)
-	}
-	got := h.repo.upserts[0].GlobalRoles
-	sort.Strings(got)
-	if !reflect.DeepEqual(got, []string{"external", "partner"}) {
-		t.Errorf("partner roles = %v", got)
-	}
-	if h.repo.upserts[0].AdminRoleName != "partner_admin" {
-		t.Errorf("adminRoleName = %q, want partner_admin", h.repo.upserts[0].AdminRoleName)
-	}
-	if !reflect.DeepEqual(h.repo.upserts[0].ProjectGroups, []string{projectGroupGeneralAccess, projectGroupAdmin}) {
-		t.Errorf("groups = %v", h.repo.upserts[0].ProjectGroups)
-	}
-	if h.repo.upserts[0].Type != domain.MembershipTypePartnerContact {
-		t.Errorf("type = %q", h.repo.upserts[0].Type)
-	}
+// TestMembershipIngest_RolesFollowAccountClassification is decision D1 on the
+// membership path. It used to read the membership TYPE: a PARTNER CONTACT
+// got partner/partner_admin whatever their own account was. Now the
+// contact's account classification decides, as in the Contact writer, so
+// the two writers agree.
+func TestMembershipIngest_RolesFollowAccountClassification(t *testing.T) {
+	t.Run("a PARTNER CONTACT from a customer account is a customer", func(t *testing.T) {
+		pc := sampleProjectContact("INVITED", "Portal user", "Admin")
+		pc.Type = sampleStr(domain.MembershipTypePartnerContact)
+		c := sampleContact()
+		c.Account.Classification = sampleStr("Customer")
+		h := newIngestHarness(pc, c, false)
+		if err := h.svc.HandleEvent(context.Background(), membershipEvent("CREATED", "Project_Contact__c")); err != nil {
+			t.Fatal(err)
+		}
+		in := h.repo.upserts[0]
+		got := append([]string{}, in.GlobalRoles...)
+		sort.Strings(got)
+		// Changed expectation: [external partner] / partner_admin before D1.
+		if !reflect.DeepEqual(got, []string{"customer", "external"}) || in.AdminRoleName != "customer_admin" {
+			t.Errorf("roles = %v, adminRole = %q, want customer roles", got, in.AdminRoleName)
+		}
+		if !reflect.DeepEqual(in.ManagedGlobalRoles, []string{"customer", "partner"}) {
+			t.Errorf("managed org roles = %v", in.ManagedGlobalRoles)
+		}
+		// The membership type itself is untouched: it is still stored and sent.
+		if in.Type != domain.MembershipTypePartnerContact {
+			t.Errorf("type = %q", in.Type)
+		}
+		if !reflect.DeepEqual(in.ProjectGroups, []string{projectGroupGeneralAccess, projectGroupAdmin}) {
+			t.Errorf("groups = %v", in.ProjectGroups)
+		}
+	})
+
+	t.Run("an OWN CONTACT of a Partner account is a partner", func(t *testing.T) {
+		c := sampleContact()
+		c.Account.Classification = sampleStr("Partner")
+		h := newIngestHarness(sampleProjectContact("INVITED", "Portal user"), c, false)
+		if err := h.svc.HandleEvent(context.Background(), membershipEvent("CREATED", "Project_Contact__c")); err != nil {
+			t.Fatal(err)
+		}
+		in := h.repo.upserts[0]
+		got := append([]string{}, in.GlobalRoles...)
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, []string{"external", "partner"}) || in.AdminRoleName != "partner_admin" {
+			t.Errorf("roles = %v, adminRole = %q, want partner roles", got, in.AdminRoleName)
+		}
+	})
 }
 
 func TestMembershipIngest_IntegrationUser(t *testing.T) {
@@ -691,6 +794,9 @@ func TestMembershipIngest_DeletedDeactivates(t *testing.T) {
 	if !reflect.DeepEqual(h.repo.deactivated, []string{testMembershipID}) || len(h.repo.upserts) != 0 || len(h.se.pcCalls) != 0 {
 		t.Errorf("DELETED must only deactivate: deactivated=%v upserts=%d pcCalls=%d", h.repo.deactivated, len(h.repo.upserts), len(h.se.pcCalls))
 	}
+	if h.repo.deactivateBasis == nil {
+		t.Error("DELETED must hand the repository an admin-role basis so the admin role is re-derived")
+	}
 	// Unknown membership: still a success (204).
 	h.repo.deactivateOK = false
 	if err := h.svc.HandleEvent(context.Background(), membershipEvent("DELETED", "Project_Contact__c")); err != nil {
@@ -727,7 +833,7 @@ func TestMembershipIngest_UnknownEntityAndDisabledAreNoOps(t *testing.T) {
 	}
 
 	// Constructed without the ingest (flag off): membership envelopes are acknowledged and ignored.
-	off := NewSalesforceEventService(&stubSalesforceAccountRepo{}, &stubSalesEntityClient{})
+	off := NewSalesforceEventService(&stubSalesforceAccountRepo{}, &stubSalesEntityClient{}, SalesforceIngestSupport{})
 	for _, entity := range []string{"Project_Contact__c", "Contact"} {
 		if err := off.HandleEvent(context.Background(), membershipEvent("UPDATED", entity)); err != nil {
 			t.Errorf("disabled %s: %v", entity, err)
@@ -775,17 +881,13 @@ func TestContactEvent_UpdatedReplaysMemberships(t *testing.T) {
 	if len(h.pub.published) != 1 || h.pub.published[0].EntityID != pc2.ID {
 		t.Errorf("only the INVITED membership publishes: %+v", h.pub.published)
 	}
-
-	// CREATED / DELETED contact events do nothing.
-	before := len(h.se.contactCalls)
-	for _, et := range []string{"CREATED", "DELETED"} {
-		req.EventType = et
-		if err := h.svc.HandleEvent(context.Background(), req); err != nil {
-			t.Errorf("%s: %v", et, err)
-		}
+	// The contact is read once and handed to every membership.
+	if len(h.se.contactCalls) != 1 {
+		t.Errorf("contact reads = %d, want 1 (the fan-out reuses the fetched contact)", len(h.se.contactCalls))
 	}
-	if len(h.se.contactCalls) != before {
-		t.Error("CREATED/DELETED contact events must not call sales-entity")
+	// And the Contact writer ran first.
+	if len(h.contacts.upserts) != 1 || h.contacts.upserts[0].LastName != "Roe" {
+		t.Errorf("contact writer upserts = %+v", h.contacts.upserts)
 	}
 }
 
@@ -879,5 +981,137 @@ func TestBuildMembershipUpsert_Fallbacks(t *testing.T) {
 	pc.Contact.Email = nil
 	if _, _, err := buildMembershipUpsert(pc, c); err == nil {
 		t.Error("no email anywhere must be a ValidationError")
+	}
+}
+
+func (f *fakeStepRepo) ListMissingParentFailures(_ context.Context, _ time.Duration, maxAttempts, limit int) ([]domain.OnboardingStep, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	out := []domain.OnboardingStep{}
+	for _, s := range f.existing {
+		if s.Step == domain.OnboardingStepDatabase && s.Status == domain.OnboardingStepFailed &&
+			repository.IsMissingParentError(derefString(s.LastError)) && s.RetryCount < maxAttempts && len(out) < limit {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// TestMembershipIngest_RegisteredTransitionPublishesWelcome: only a move from
+// INVITED/RE-INVITED into REGISTERED publishes project_contact.registered.
+func TestMembershipIngest_RegisteredTransitionPublishesWelcome(t *testing.T) {
+	cases := map[string]struct {
+		existed  bool
+		previous string
+		want     int
+	}{
+		"invited to registered":     {existed: true, previous: "INVITED", want: 1},
+		"re-invited to registered":  {existed: true, previous: "RE-INVITED", want: 1},
+		"echo of registered":        {existed: true, previous: "REGISTERED", want: 0},
+		"deactivated to registered": {existed: true, previous: "DEACTIVATED", want: 0},
+		"backfilled as registered":  {existed: false, want: 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newIngestHarness(sampleProjectContact("REGISTERED", "Portal user"), sampleContact(), true)
+			h.repo.rowAlreadyExisted = tc.existed
+			h.repo.previousState = tc.previous
+			if err := h.svc.HandleEvent(context.Background(), membershipEvent("UPDATED", "Project_Contact__c")); err != nil {
+				t.Fatalf("HandleEvent: %v", err)
+			}
+			welcomes := publishedOfType(h.pub, events.TypeProjectContactRegistered)
+			if len(welcomes) != tc.want {
+				t.Fatalf("welcomes = %d, want %d", len(welcomes), tc.want)
+			}
+			if tc.want == 0 {
+				return
+			}
+			env := welcomes[0]
+			if env.Type != events.TypeProjectContactRegistered || env.EntityID != testMembershipID {
+				t.Errorf("envelope = %s %s", env.Type, env.EntityID)
+			}
+			var p events.ProjectContactRegisteredPayload
+			if err := json.Unmarshal(env.Payload, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.MembershipSfID != testMembershipID || p.ContactSfID != testContactID || p.Email != "jane@acme.com" ||
+				p.GivenName != "Jane" || p.FamilyName != "Doe" || p.ProjectName != "Acme Prod" || p.ProjectKey != "ACMEPROD" || p.EventModifiedOn == "" {
+				t.Errorf("payload = %+v", p)
+			}
+		})
+	}
+}
+
+// TestMembershipIngest_ReplayOfRegisteredVersionDoesNotPublish: the duplicate
+// guard drops a replay before any publish.
+func TestMembershipIngest_ReplayOfRegisteredVersionDoesNotPublish(t *testing.T) {
+	h := newIngestHarness(sampleProjectContact("REGISTERED", "Portal user"), sampleContact(), true)
+	h.repo.rowAlreadyExisted = true
+	h.repo.previousState = "INVITED"
+	if err := h.svc.HandleEvent(context.Background(), membershipEvent("UPDATED", "Project_Contact__c")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.pub.published) != 1 {
+		t.Fatalf("published = %d, want 1 for the transition", len(h.pub.published))
+	}
+	h.steps.existing = []domain.OnboardingStep{{
+		MembershipSfID: testMembershipID, Step: domain.OnboardingStepDatabase, Status: domain.OnboardingStepSucceeded, EventModifiedOn: h.repo.steps[0].EventModifiedOn,
+	}}
+	if err := h.svc.HandleEvent(context.Background(), membershipEvent("UPDATED", "Project_Contact__c")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.pub.published) != 1 {
+		t.Errorf("published = %d after a replay, want still 1", len(h.pub.published))
+	}
+}
+
+func publishedOfType(p *fakeInvitePublisher, typ events.Type) []events.Envelope {
+	var out []events.Envelope
+	for _, e := range p.published {
+		if e.Type == typ {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestMembershipIngest_NewMembershipOfASignedInContactPublishesInvited: an
+// unlocked contact's new membership is saved REGISTERED; only a new one is told.
+func TestMembershipIngest_NewMembershipOfASignedInContactPublishesInvited(t *testing.T) {
+	fresh := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	old := time.Now().UTC().Add(-48 * time.Hour).Format(time.RFC3339)
+	cases := map[string]struct {
+		eventType   string
+		existed     bool
+		previous    string
+		createdDate *string
+		want        int
+	}{
+		"created now":                   {eventType: "CREATED", createdDate: &fresh, want: 1},
+		"created by an UPDATED first":   {eventType: "UPDATED", createdDate: &fresh, want: 1},
+		"backfill of an old record":     {eventType: "UPDATED", createdDate: &old, want: 0},
+		"no createdDate":                {eventType: "CREATED", want: 0},
+		"reactivated from deactivated":  {eventType: "UPDATED", existed: true, previous: "DEACTIVATED", want: 1},
+		"undelete of a deactivated row": {eventType: "RESTORED", existed: true, previous: "DEACTIVATED", want: 0},
+		"echo of a portal write":        {eventType: "UPDATED", existed: true, previous: "REGISTERED", createdDate: &fresh, want: 0},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			pc := sampleProjectContact("REGISTERED", "Portal user")
+			pc.CreatedDate = tc.createdDate
+			h := newIngestHarness(pc, sampleContact(), true)
+			h.repo.rowAlreadyExisted = tc.existed
+			h.repo.previousState = tc.previous
+			if err := h.svc.HandleEvent(context.Background(), membershipEvent(tc.eventType, "Project_Contact__c")); err != nil {
+				t.Fatalf("HandleEvent: %v", err)
+			}
+			if got := len(publishedOfType(h.pub, events.TypeProjectContactInvited)); got != tc.want {
+				t.Errorf("invited = %d, want %d", got, tc.want)
+			}
+			if got := len(publishedOfType(h.pub, events.TypeProjectContactRegistered)); got != 0 {
+				t.Errorf("welcomes = %d, want 0", got)
+			}
+		})
 	}
 }

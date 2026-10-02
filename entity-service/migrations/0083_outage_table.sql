@@ -11,7 +11,7 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- cmdb_ci is polymorphic on the ServiceNow side: it can point at either a
 -- service or a service_offering row. Both FKs are nullable and exactly one
--- is populated per row.
+-- is populated per row (internal/transform's polymorphic_fk transform).
 CREATE TABLE IF NOT EXISTS outage (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,

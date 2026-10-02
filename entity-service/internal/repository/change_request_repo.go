@@ -18,6 +18,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,7 +26,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -53,15 +53,33 @@ import (
 // and read back by GetChangeRequestByID as domain.ChangeRequest.CustomerGroup
 // (see changeRequestDetailJoins/changeRequestDetailColumns).
 //
+// AssignedTeamID (distinct from CustomerGroupID) is backed by
+// work_item.assignment_group_id (migration 0075, a FK into "group") and read
+// back as domain.ChangeRequest.AssignedTeam via changeRequestFromJoins' own
+// "group" ag join -- see changeRequestSelectColumns' own doc comment for the
+// real bug this fixes (Assess could never be requested for any change
+// request, since the frontend requires it set first). Writing it via
+// PatchChangeRequestRequest.AssignedTeamID is now wired too (addWI sets
+// assignment_group_id, same shape as AssignedEngineerID immediately above
+// it; a 23503 on the FK is mapped to the friendly field name "assignedTeamId"
+// via changeRequestPatchFKField, the same convention every other FK column
+// on this PATCH already uses) -- csm-sync-service still separately populates
+// it from ServiceNow's own Assignment group field for every work_item type
+// the same way it does assigned_to_id, but a caller can now also set it
+// directly through this API. Writing it at create time
+// (CreateChangeRequestRequest.GroupID) remains unwired -- see this file's
+// own doc comment on CreateChangeRequestFromServiceNow. Filtering search
+// results by it (the parsed filter array's assignmentGroupId) is also still
+// unwired -- see changeRequestWhereClause's own comment.
+//
 // The remaining fields on the request/response contract have no
 // established mapping and are always left unset rather than guessed at:
 // ConfigurationItemID (no CMDB table exists at all in this schema); GroupID
-// and AssignedTeamID (distinct from CustomerGroupID -- these would need
-// work_item.assignment_group_id, migration 0075, which nothing in this
-// file joins or reads yet); ApprovedBy/ApprovedOn on domain.ChangeRequest
-// (there is a summary change_request.approval enum but no approver/date
-// columns); Environments/DeploymentProducts/Labels/Deployments (no M2M join
-// table exists for any of the four).
+// (the create-time field distinct from the above -- still unwired, for the
+// same reason); ApprovedBy/ApprovedOn on domain.ChangeRequest (there is a
+// summary change_request.approval enum but no approver/date columns);
+// Environments/DeploymentProducts/Labels/Deployments (no M2M join table
+// exists for any of the four).
 //
 // LegalNextStates is populated -- see legalChangeRequestNextStates's own
 // doc comment for how, and for the one branch it deliberately does not
@@ -96,9 +114,11 @@ type ChangeRequestRepository interface {
 	// array) -- parsing happens in the service layer
 	// (service.ParseChangeRequestFieldFilters), never here, since this
 	// layer must not import the service package. assignmentGroupIDs is
-	// accepted for interface symmetry with that parsed result but never
-	// applied: there is no column anywhere in this schema for it (see this
-	// file's own package doc comment).
+	// accepted for interface symmetry with that parsed result but still never
+	// applied here: the column it would filter on (work_item.assignment_group_id)
+	// does have a real join now (see this file's own package doc comment,
+	// and changeRequestWhereClause's own comment), but wiring this specific
+	// filter remains out of scope.
 	SearchChangeRequests(ctx context.Context, req domain.SearchChangeRequestsRequest, createdStartDate, createdEndDate *time.Time, approval *string, assignmentGroupIDs []string) ([]domain.SearchChangeRequestView, int, error)
 	// AggregateChangeRequests returns server-side aggregated counts of
 	// change requests per value of groupBy, capped to the top maxGroups
@@ -195,16 +215,20 @@ type ChangeRequestRepository interface {
 	// all in the one WHERE clause (mirrors ServiceNow's decideApproval
 	// restriction that only the caller's own PENDING approval can be acted
 	// on -- see sn_change_request_service.go's DecideChangeRequestApproval
-	// doc comment).
+	// doc comment). Also cascades change_request.state from Assess to
+	// Authorize when this decision is the one that resolves that stage's own
+	// approval (first-responder-wins, same quorum rule as
+	// buildChangeRequestApprovals) -- see this method's own doc comment for
+	// the full reasoning and its deliberately narrow scope.
 	DecideChangeRequestApproval(ctx context.Context, id, approverUserID, decision, actorEmail string) (string, error)
 }
 
 type changeRequestRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewChangeRequestRepository constructs a ChangeRequestRepository backed by the given connection pool.
-func NewChangeRequestRepository(db *pgxpool.Pool) ChangeRequestRepository {
+func NewChangeRequestRepository(db *Scoped) ChangeRequestRepository {
 	return &changeRequestRepo{db: db}
 }
 
@@ -223,8 +247,26 @@ const changeRequestFromJoins = `
 	LEFT JOIN service svc ON svc.id = cr.service_id
 	LEFT JOIN service_offering so ON so.id = cr.service_offering_id
 	LEFT JOIN "user" ae ON ae.id = wi.assigned_to_id
-	LEFT JOIN work_item origin_case ON origin_case.id = wi.parent_id`
+	LEFT JOIN work_item origin_case ON origin_case.id = wi.parent_id
+	LEFT JOIN "group" ag ON ag.id = wi.assignment_group_id`
 
+// ag (work_item.assignment_group_id, migration 0075) backs
+// domain.ChangeRequest's AssignedTeam -- the same column incident_repo.go's
+// own GetIncidentByID already joins and reads (as AssignmentGroup there; a
+// different domain field name for the same underlying column, matching what
+// the CSM Portal calls it for each entity type). This file used to leave it
+// entirely unread ("no confirmed mapping" -- see this file's own package doc
+// comment history): a real, reported bug -- Assess could never be requested
+// for *any* change request through the portal, since the frontend's own
+// TARGET_BLOCKED_REASON requires assignedTeam to be set first, and it could
+// never come back non-null. Confirmed live against a real change request
+// with a genuine ServiceNow Assignment group ("Devops"): its Assigned
+// engineer synced and displayed correctly (a column read the same way), but
+// Assigned team always showed empty -- proving csm-sync-service already
+// populates work_item.assignment_group_id for change requests the same way
+// it does for every other work_item type; this was purely a read-side gap,
+// not a missing-data one, so no create/patch write-path changes are needed
+// alongside this join.
 const changeRequestSelectColumns = `
 	wi.id, wi.number, wi.subject, wi.description,
 	p.id, p.name,
@@ -236,7 +278,8 @@ const changeRequestSelectColumns = `
 	so.id, so.name,
 	ae.id, COALESCE(ae.name, NULLIF(TRIM(CONCAT_WS(' ', ae.first_name, ae.last_name)), '')),
 	cr.start_on, cr.end_on, cr.impact::TEXT, cr.state::TEXT, cr.change_model::TEXT,
-	wi.created_on, wi.updated_on`
+	wi.created_on, wi.updated_on,
+	ag.id, ag.name`
 
 // changeRequestChangeModelToType/changeRequestTypeToChangeModel map between
 // change_request.change_model's real enum labels (migration 0056) and
@@ -383,6 +426,7 @@ func scanChangeRequestView(row interface{ Scan(...any) error }) (domain.SearchCh
 		svcID, svcName         *string
 		soID, soName           *string
 		aeID, aeName           *string
+		agID, agName           *string
 		startOn, endOn         *time.Time
 		impact, state          *string
 		changeModel            *string
@@ -400,6 +444,7 @@ func scanChangeRequestView(row interface{ Scan(...any) error }) (domain.SearchCh
 		&aeID, &aeName,
 		&startOn, &endOn, &impact, &state, &changeModel,
 		&createdOn, &updatedOn,
+		&agID, &agName,
 	)
 	if err != nil {
 		return domain.SearchChangeRequestView{}, err
@@ -427,6 +472,9 @@ func scanChangeRequestView(row interface{ Scan(...any) error }) (domain.SearchCh
 	}
 	if aeID != nil {
 		v.AssignedEngineer = &domain.EntityRef{ID: *aeID, Name: stringOrEmpty(aeName)}
+	}
+	if agID != nil {
+		v.AssignedTeam = &domain.EntityRef{ID: *agID, Name: stringOrEmpty(agName)}
 	}
 	if startOn != nil {
 		s := startOn.UTC().Format(time.RFC3339)
@@ -511,9 +559,11 @@ func changeRequestWhereClause(f domain.SearchChangeRequestsFilters, createdStart
 	if approval != nil {
 		add("cr.approval = $%d::change_request_approval_enum", changeRequestApprovalEnum(*approval))
 	}
-	// The parsed filter array's assignmentGroupId has no corresponding
-	// column anywhere in this schema (see this file's own package doc
-	// comment) and is deliberately not applied here.
+	// The parsed filter array's assignmentGroupId has a real backing column
+	// now (work_item.assignment_group_id, read as AssignedTeam -- see this
+	// file's own package doc comment), but filtering search results by it is
+	// still not wired here; out of scope for the read-side fix that added
+	// the column's own join.
 
 	return where, args
 }
@@ -528,6 +578,11 @@ func changeRequestApprovalEnum(snApproval string) string {
 // SearchChangeRequests implements ChangeRequestRepository.
 func (r *changeRequestRepo) SearchChangeRequests(ctx context.Context, req domain.SearchChangeRequestsRequest, createdStartDate, createdEndDate *time.Time, approval *string, _ []string) ([]domain.SearchChangeRequestView, int, error) {
 	where, args := changeRequestWhereClause(req.Filters, createdStartDate, createdEndDate, approval)
+	// Planner hint for external callers only (see viewerProjectHint): without
+	// it, making the policy helpers parallel safe lets Postgres pick a parallel
+	// scan of all of work_item for a customer with a handful of change requests.
+	// RLS remains the authorization boundary.
+	where += viewerProjectHintFor(ctx, "wi")
 
 	sortCol := "wi.created_on"
 	if req.SortBy.Field == domain.ChangeRequestSortFieldUpdatedOn {
@@ -601,6 +656,7 @@ func (r *changeRequestRepo) AggregateChangeRequests(ctx context.Context, req dom
 	}
 
 	where, args := changeRequestWhereClause(req.Filters, createdStartDate, createdEndDate, approval)
+	where += viewerProjectHintFor(ctx, "wi") // planner hint, external callers only; see SearchChangeRequests
 
 	query := fmt.Sprintf(`
 		SELECT %s AS bucket, COUNT(*) AS bucket_count
@@ -719,6 +775,7 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 		svcID, svcName         *string
 		soID, soName           *string
 		aeID, aeName           *string
+		agID, agName           *string
 		startOn, endOn         *time.Time
 		impact, state          *string
 		changeModel            *string
@@ -750,6 +807,7 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 		&aeID, &aeName,
 		&startOn, &endOn, &impact, &state, &changeModel,
 		&createdOn, &updatedOn,
+		&agID, &agName,
 		&createdBy, &justification, &impactDescription, &serviceOutage, &communicationPlan, &rollbackPlan, &testPlan,
 		&isCustomerApproved, &isCustomerReviewed,
 		&implementationPlan, &priority, &category,
@@ -786,6 +844,9 @@ func scanChangeRequestViewAndDetail(row pgx.Row, cr *domain.ChangeRequest) error
 	}
 	if aeID != nil {
 		v.AssignedEngineer = &domain.EntityRef{ID: *aeID, Name: stringOrEmpty(aeName)}
+	}
+	if agID != nil {
+		v.AssignedTeam = &domain.EntityRef{ID: *agID, Name: stringOrEmpty(agName)}
 	}
 	if startOn != nil {
 		s := startOn.UTC().Format(time.RFC3339)
@@ -883,6 +944,7 @@ var changeRequestPatchFKField = map[string]string{
 	"work_item_deployment_id_fkey":       "deploymentId",
 	"work_item_deployed_product_id_fkey": "deployedProductId",
 	"work_item_assigned_to_id_fkey":      "assignedEngineerId",
+	"work_item_assignment_group_id_fkey": "assignedTeamId",
 }
 
 // changeRequestPatchCRFKField mirrors changeRequestPatchFKField for the
@@ -894,11 +956,53 @@ var changeRequestPatchCRFKField = map[string]string{
 
 // PatchChangeRequest implements ChangeRequestRepository.
 func (r *changeRequestRepo) PatchChangeRequest(ctx context.Context, id string, req domain.PatchChangeRequestRequest, actorEmail string) (domain.ChangeRequest, error) {
-	tx, err := r.db.Begin(ctx)
+	wiID, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) (string, error) {
+		return patchChangeRequestTx(ctx, tx, id, req, actorEmail)
+	})
 	if err != nil {
-		return domain.ChangeRequest{}, fmt.Errorf("patch change request: begin tx: %w", err)
+		return domain.ChangeRequest{}, err
 	}
-	defer tx.Rollback(ctx)
+	return r.GetChangeRequestByID(ctx, wiID)
+}
+
+// patchChangeRequestTx is PatchChangeRequest's body, extracted so it can run
+// inside r.db.InTx's closure (Scoped.InTx pulls caller identity from ctx and
+// sets it once for the whole transaction, same shape as
+// timeCardRepo.createTimeCardTx). Returns the change request's id (== the
+// work_item id) on success.
+func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.PatchChangeRequestRequest, actorEmail string) (string, error) {
+	// New->Assess is compulsorily gated on an assigned team -- a real,
+	// reported bug: this used to be a frontend-only courtesy check
+	// (ChangeRequestActionBar.tsx's TARGET_BLOCKED_REASON), easily bypassed
+	// by any direct API caller, and it was carried over stale from an
+	// earlier, since-disproven model of this transition. Confirmed by
+	// explicit product decision that assignedTeamId IS genuinely required to
+	// move to Assess -- enforced here, not just in the UI, so this can never
+	// be skipped. Accepts either a team supplied in this same request or one
+	// already on the record (e.g. set via a prior PATCH through the Edit
+	// dialog, then "Move to Assess" sent as its own separate request). The
+	// SELECT below runs under the caller's own (not yet escalated) identity
+	// -- work_item_visibility's USING clause (migration 0147) already allows
+	// any project member to read their own row, so this needs no escalation
+	// of its own.
+	var effectiveAssignedTeamID *string
+	if req.State != nil && strings.EqualFold(string(*req.State), "assess") {
+		if req.AssignedTeamID != nil {
+			effectiveAssignedTeamID = req.AssignedTeamID
+		} else {
+			var existing *string
+			if err := tx.QueryRow(ctx, `SELECT assignment_group_id::text FROM work_item WHERE id = $1`, id).Scan(&existing); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return "", &apierror.NotFoundError{Msg: "change request not found"}
+				}
+				return "", fmt.Errorf("patch change request: check existing assigned team: %w", err)
+			}
+			effectiveAssignedTeamID = existing
+		}
+		if effectiveAssignedTeamID == nil || *effectiveAssignedTeamID == "" {
+			return "", &apierror.ValidationError{Msg: "assignedTeamId is required before moving a change request to Assess"}
+		}
+	}
 
 	wiSets := []string{"updated_on = NOW()", "updated_by = $1"}
 	wiArgs := []any{actorEmail}
@@ -929,23 +1033,29 @@ func (r *changeRequestRepo) PatchChangeRequest(ctx context.Context, id string, r
 	if req.AssignedEngineerID != nil {
 		addWI("assigned_to_id = $%d::uuid", *req.AssignedEngineerID)
 	}
-	// AssignedTeamID has no wired mapping here -- see this file's own package doc comment.
+	if req.AssignedTeamID != nil {
+		addWI("assignment_group_id = $%d::uuid", *req.AssignedTeamID)
+	}
 
 	wiArgs = append(wiArgs, id)
 	wiQuery := fmt.Sprintf(`UPDATE work_item SET %s WHERE id = $%d AND type = 'CHANGE_REQUEST' RETURNING id`, strings.Join(wiSets, ", "), wiIdx)
 	var wiID string
 	if err := tx.QueryRow(ctx, wiQuery, wiArgs...).Scan(&wiID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.ChangeRequest{}, &apierror.NotFoundError{Msg: "change request not found"}
+		if errors.Is(err, pgx.ErrNoRows) || IsRLSPolicyViolation(err) {
+			// A member moving the change request to a project they do not
+			// belong to fails work_item's WITH CHECK (SQLSTATE 42501):
+			// refused on purpose, so not-found, like the change_request
+			// UPDATE below, never a 500.
+			return "", &apierror.NotFoundError{Msg: "change request not found"}
 		}
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
 			field := changeRequestPatchFKField[pgErr.ConstraintName]
 			if field == "" {
 				field = "one or more referenced fields"
 			}
-			return domain.ChangeRequest{}, &apierror.ValidationError{Msg: field + " does not refer to an existing record"}
+			return "", &apierror.ValidationError{Msg: field + " does not refer to an existing record"}
 		}
-		return domain.ChangeRequest{}, fmt.Errorf("patch change request work_item: %w", err)
+		return "", fmt.Errorf("patch change request work_item: %w", err)
 	}
 
 	crSets := []string{}
@@ -988,7 +1098,7 @@ func (r *changeRequestRepo) PatchChangeRequest(ctx context.Context, id string, r
 			// "model"/"site_reliability_ops" predate change_model
 			// (migration 0056) and have no real enum label there --
 			// see changeRequestChangeModelToType's own doc comment.
-			return domain.ChangeRequest{}, &apierror.ValidationError{Msg: fmt.Sprintf("type %q is not supported on the PostgreSQL data source", *req.Type)}
+			return "", &apierror.ValidationError{Msg: fmt.Sprintf("type %q is not supported on the PostgreSQL data source", *req.Type)}
 		}
 		addCR("change_model = $%d::change_request_change_model_enum", enumValue)
 	}
@@ -1016,65 +1126,203 @@ func (r *changeRequestRepo) PatchChangeRequest(ctx context.Context, id string, r
 	if req.IsCustomerReviewed != nil {
 		addCR("is_customer_reviewed = $%d", *req.IsCustomerReviewed)
 	}
+	// RequestApproval is a pure bookkeeping flag: it records that approval
+	// has been requested (change_request.approval = 'REQUESTED') and has no
+	// state-transition side effect of its own. This used to also force
+	// state to ASSESS when req.State wasn't separately provided, modeling
+	// New->Assess as an approval-gated ceremony -- confirmed against the
+	// real ServiceNow instance to be wrong: New->Assess (like every other
+	// non-approval-gated transition) is a plain, ungated state change, no
+	// different from picking a new value from a dropdown, and has nothing
+	// to do with approval at all. The frontend now sends a plain
+	// {state: "assess"} for that transition, handled generically by the
+	// req.State branch above -- no special casing needed here for
+	// New->Assess specifically. The one real approval-gated transition is
+	// Assess->Authorize, which is unrelated to this flag entirely and is
+	// handled by DecideChangeRequestApproval, which already cascades
+	// change_request.state forward on its own.
 	if req.RequestApproval != nil && *req.RequestApproval {
 		addCR("approval = $%d::change_request_approval_enum", "REQUESTED")
-		// The New -> Assess promote action sends {requestApproval: true}
-		// rather than {state: "assess"} (see ChangeRequestActionBar.tsx /
-		// buildTransitionPatch on the frontend -- "assess" is the one target
-		// requested through the approval workflow, not a raw state PATCH).
-		// An earlier revision of this handler only recorded the approval
-		// request itself, never advancing state -- a real, reported bug:
-		// with legalChangeRequestNextStates now actually populated, clicking
-		// "Request Approval" got a 200 back but the record's own state (and
-		// therefore its own next legal action) never moved off New, so the
-		// same button just reappeared. req.State is never also set for this
-		// same request (the frontend sends one or the other, never both),
-		// so this cannot conflict with the req.State branch above.
-		//
-		// Only a record actually sitting in New may advance this way: the
-		// crQuery below filters solely by id, so nothing stops this branch
-		// from writing ASSESS over a record already at, say, Implement or
-		// Closed if a stale/replayed {requestApproval: true} request arrived
-		// for it. Locking the row's current state here (in the same
-		// transaction as the update below) closes that gap; a concurrent
-		// second RequestApproval racing this one blocks on the lock rather
-		// than both reading New and both writing ASSESS.
-		if req.State == nil {
-			var currentState string
-			if err := tx.QueryRow(ctx, `SELECT state FROM change_request WHERE id = $1 FOR UPDATE`, id).Scan(&currentState); err != nil {
-				if errors.Is(err, pgx.ErrNoRows) {
-					return domain.ChangeRequest{}, &apierror.NotFoundError{Msg: "change request not found"}
-				}
-				return domain.ChangeRequest{}, fmt.Errorf("patch change request: check current state: %w", err)
-			}
-			if strings.ToLower(currentState) != string(domain.ChangeRequestStateNew) {
-				return domain.ChangeRequest{}, &apierror.ConflictError{Msg: "approval can only be requested while the change request is in New, not " + strings.ToLower(currentState)}
-			}
-			addCR("state = $%d::change_request_state_enum", "ASSESS")
+	}
+	// **T fields: nil outer = omitted, non-nil outer with nil inner = explicit
+	// null (clear the column), otherwise set it.
+	addNullableText := func(col string, v **string) {
+		if v == nil {
+			return
 		}
+		if *v == nil {
+			crSets = append(crSets, col+" = NULL")
+			return
+		}
+		addCR(col+" = $%d", **v)
+	}
+	addNullableText("implementation_plan", req.ImplementationPlan)
+	addNullableText("affected_services", req.AffectedServicesText)
+	addNullableText("affected_component", req.AffectedComponentsText)
+	addNullableText("rollback_duration", req.RollbackDurationText)
+	if req.RequestedByID != nil {
+		if *req.RequestedByID == nil {
+			crSets = append(crSets, "requested_by_user_id = NULL")
+		} else {
+			addCR("requested_by_user_id = $%d::uuid", **req.RequestedByID)
+		}
+	}
+	if req.CustomerGroupID != nil {
+		if *req.CustomerGroupID == nil {
+			crSets = append(crSets, "customer_group_id = NULL")
+		} else {
+			addCR("customer_group_id = $%d::uuid", **req.CustomerGroupID)
+		}
+	}
+	if req.Priority != nil {
+		if *req.Priority == nil {
+			crSets = append(crSets, "priority = NULL")
+		} else {
+			addCR("priority = $%d::change_request_priority_enum", strings.ToUpper(string(**req.Priority)))
+		}
+	}
+	if req.Category != nil {
+		if *req.Category == nil {
+			crSets = append(crSets, "category = NULL")
+		} else {
+			label := strings.ToUpper(string(**req.Category))
+			if !changeRequestCategoryPGLabels[label] {
+				return "", &apierror.ValidationError{Msg: fmt.Sprintf("category %q is not supported on the PostgreSQL data source", **req.Category)}
+			}
+			addCR("category = $%d::change_request_category_enum", label)
+		}
+	}
+	if req.IsPlanningVisibleToCustomers != nil {
+		addCR("is_planning_visible_to_customers = $%d", *req.IsPlanningVisibleToCustomers)
 	}
 	// Type has no real mapping -- see this file's own package doc comment.
 
 	if len(crSets) > 0 {
 		crArgs = append(crArgs, id)
 		crQuery := fmt.Sprintf(`UPDATE change_request SET %s WHERE id = $%d`, strings.Join(crSets, ", "), crIdx)
-		if _, err := tx.Exec(ctx, crQuery, crArgs...); err != nil {
+		ct, err := tx.Exec(ctx, crQuery, crArgs...)
+		if err != nil {
+			if IsRLSPolicyViolation(err) {
+				return "", &apierror.NotFoundError{Msg: "change request not found"}
+			}
 			if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
 				field := changeRequestPatchCRFKField[pgErr.ConstraintName]
 				if field == "" {
 					field = "one or more referenced fields"
 				}
-				return domain.ChangeRequest{}, &apierror.ValidationError{Msg: field + " does not refer to an existing record"}
+				return "", &apierror.ValidationError{Msg: field + " does not refer to an existing record"}
 			}
-			return domain.ChangeRequest{}, fmt.Errorf("patch change request: %w", err)
+			return "", fmt.Errorf("patch change request: %w", err)
+		}
+		// change_request's RLS USING clause (migration 0145) silently
+		// excludes a row the caller isn't a project member of -- a plain
+		// Exec with no RETURNING never surfaces that as pgx.ErrNoRows the
+		// way the work_item UPDATE above does, so it must be checked
+		// explicitly here or a non-member caller would see a false
+		// "success" with nothing actually changed.
+		if ct.RowsAffected() == 0 {
+			return "", &apierror.NotFoundError{Msg: "change request not found"}
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.ChangeRequest{}, fmt.Errorf("patch change request: commit tx: %w", err)
+	// The moment a change request actually enters Assess, the assigned
+	// team's own members are provisioned as its Assess-stage approvers --
+	// by explicit product decision, so there is always someone to approve
+	// once a request reaches Assess, instead of landing in the Approvals
+	// tab with nobody listed. Scoped to "no approval_stage exists for this
+	// work item yet" so a later no-op {state: "assess"} PATCH (or any other
+	// field edit while already in Assess) can never duplicate the stage or
+	// re-seed approvers for a group that may since have changed; the
+	// Assess->Authorize cascade (DecideChangeRequestApproval) owns
+	// everything about this stage from here on.
+	if req.State != nil && strings.EqualFold(string(*req.State), "assess") {
+		// approval_stage_visibility's SELECT policy (migration 0145) already
+		// allows any member of the change request's own project to see this
+		// count, so -- like the assigned-team check above -- this still runs
+		// under the caller's own identity, no escalation needed yet.
+		var existingStages int
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM approval_stage WHERE work_item_id = $1`, id).Scan(&existingStages); err != nil {
+			return "", fmt.Errorf("patch change request: check existing approval stages: %w", err)
+		}
+		if existingStages == 0 {
+			// approval_stage/approval_stage_approver's own INSERT policies
+			// (migration 0145) are internal-only -- a real project member's
+			// own identity cannot write either table directly. Escalating
+			// here is safe: the caller's project membership for THIS change
+			// request has already been confirmed by the work_item/
+			// change_request writes above, under their own, unescalated
+			// identity, before this point is ever reached. setCallerIdentity
+			// re-sets the same session-local GUCs Scoped.InTx set at the
+			// start of this transaction -- its own doc comment's "LOCAL
+			// scoping" note means this takes effect for the remainder of
+			// THIS transaction only, same as every other statement here.
+			if err := setCallerIdentity(ctx, tx, SearchScope{Unrestricted: true}); err != nil {
+				return "", fmt.Errorf("patch change request: escalate identity for approver provisioning: %w", err)
+			}
+
+			// team_member.group_id (distinct from its own team_id, the
+			// hand-curated internal registry's own FK) is exactly what
+			// identifies membership of a "group" row -- the same table
+			// work_item.assignment_group_id/approval_stage.assignment_group_id
+			// both reference. Populated by csm-sync-service mirroring
+			// ServiceNow's own sys_user_grmember, same as every other
+			// group-derived column in this schema. team_member carries no
+			// RLS of its own (confirmed against rlsProtectedTables), so the
+			// identity escalation above makes no difference to this read --
+			// it's here only for the stage/approver INSERTs below.
+			//
+			// Queried -- and validated as non-empty -- BEFORE the stage is
+			// created (CodeRabbit catch): creating an empty stage first and
+			// finding no members after would still commit the empty stage,
+			// since "no approval_stage exists yet" is exactly what gates
+			// provisioning -- leaving the change request stuck in Assess
+			// with an approval_stage nobody can ever decide, since a later
+			// PATCH would skip provisioning entirely. DISTINCT guards
+			// against team_member having no unique constraint on
+			// (user_id, group_id); a duplicate row must not seed two
+			// requested approver rows for the same person.
+			memberRows, err := tx.Query(ctx, `SELECT DISTINCT user_id FROM team_member WHERE group_id = $1::uuid`, *effectiveAssignedTeamID)
+			if err != nil {
+				return "", fmt.Errorf("patch change request: list assignment group members: %w", err)
+			}
+			var memberIDs []string
+			for memberRows.Next() {
+				var uid string
+				if err := memberRows.Scan(&uid); err != nil {
+					memberRows.Close()
+					return "", fmt.Errorf("patch change request: scan assignment group member: %w", err)
+				}
+				memberIDs = append(memberIDs, uid)
+			}
+			memberRows.Close()
+			if err := memberRows.Err(); err != nil {
+				return "", fmt.Errorf("patch change request: assignment group members: %w", err)
+			}
+			if len(memberIDs) == 0 {
+				return "", &apierror.ValidationError{Msg: "the assigned team has no members to provision as Assess approvers"}
+			}
+
+			var stageID string
+			if err := tx.QueryRow(ctx,
+				`INSERT INTO approval_stage (id, created_on, updated_on, created_by, updated_by, work_item_id, assignment_group_id)
+				 VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, $2, $3::uuid)
+				 RETURNING id`,
+				actorEmail, id, *effectiveAssignedTeamID).Scan(&stageID); err != nil {
+				return "", fmt.Errorf("patch change request: create approval stage: %w", err)
+			}
+
+			for _, uid := range memberIDs {
+				if _, err := tx.Exec(ctx,
+					`INSERT INTO approval_stage_approver (id, created_on, updated_on, created_by, updated_by, work_item_id, stage_id, approver_user_id, status)
+					 VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, $2, $3, $4::uuid, 'requested')`,
+					actorEmail, id, stageID, uid); err != nil {
+					return "", fmt.Errorf("patch change request: seed approval stage approver: %w", err)
+				}
+			}
+		}
 	}
 
-	return r.GetChangeRequestByID(ctx, wiID)
+	return wiID, nil
 }
 
 // createChangeRequestFromServiceNowQuery inserts both halves of a change
@@ -1160,6 +1408,15 @@ func (r *changeRequestRepo) CreateChangeRequestFromServiceNow(ctx context.Contex
 		outID, outNumber, outSubject, outCreatedBy string
 		outCreatedOn, outUpdatedOn                 time.Time
 	)
+	// WithSystemIdentity: change_request's INSERT policy (migration 0145)
+	// is internal-only -- this insert never sets a project_id (see this
+	// file's own package doc comment on CreateChangeRequestFromServiceNow),
+	// so there is nothing to check project membership against regardless of
+	// who issued the original HTTP request, and the insert only ever runs
+	// after ServiceNow's own workflow has already accepted the create --
+	// treat it as the trusted, already-authorized system operation it is
+	// rather than inheriting whatever identity happened to be on ctx.
+	ctx = WithSystemIdentity(ctx)
 	err := r.db.QueryRow(ctx, createChangeRequestFromServiceNowQuery,
 		id, createdBy,
 		number, req.Subject, req.Description, req.AssignedEngineerID,
@@ -1214,10 +1471,21 @@ const changeRequestApprovalStagesQuery = `
 // onto approval_stage_approver, migration 0089's own comment on why)
 // rather than joining through approval_stage, same reasoning as that
 // column's own comment.
+//
+// u.id is selected alongside asa.id because domain.ChangeRequestApprover.ID
+// must be the approver's own user id, not this junction row's id -- the
+// ServiceNow-backed GetChangeRequestApprovals (sn_change_request_service.go)
+// already returns sysidToUUID(the approver's own sys_id) there, and the CSM
+// webapp's isMyPendingApproval compares this field against the signed-in
+// caller's own /users/me id to decide whether to render Approve/Reject at
+// all. A real, reported bug: this query used to select only asa.id, so
+// every approver here carried the junction row's own id instead -- nobody
+// could ever approve/reject their own pending approval through the portal
+// on this data source, since that id could never equal any real user's id.
 const changeRequestApprovalApproversQuery = `
-	SELECT asa.id, asa.stage_id,
+	SELECT asa.id, asa.stage_id, u.id,
 	       COALESCE(NULLIF(TRIM(u.name), ''), NULLIF(TRIM(CONCAT_WS(' ', u.first_name, u.last_name)), ''), '') AS approver_name,
-	       asa.status, asa.updated_on
+	       asa.status, asa.created_on, asa.updated_on, asa.comments
 	FROM approval_stage_approver asa
 	LEFT JOIN "user" u ON u.id = asa.approver_user_id
 	WHERE asa.work_item_id = $1
@@ -1233,13 +1501,18 @@ type changeRequestApprovalStageRow struct {
 // changeRequestApprovalApproversQuery. rawStatus/stageID are nullable
 // pointers because both approval_stage_approver.status and .stage_id are
 // (migration 0089's own comment on nullable FKs throughout, plus status
-// having no NOT NULL/DEFAULT).
+// having no NOT NULL/DEFAULT). approverUserID is nullable because the LEFT
+// JOIN to "user" leaves it null whenever approver_user_id itself is null or
+// points to a since-deleted user row.
 type changeRequestApprovalApproverRow struct {
-	id           string
-	stageID      *string
-	approverName string
-	rawStatus    *string
-	updatedOn    time.Time
+	id             string
+	stageID        *string
+	approverUserID *string
+	approverName   string
+	rawStatus      *string
+	createdOn      time.Time
+	updatedOn      time.Time
+	comments       *string
 }
 
 // GetChangeRequestApprovals implements ChangeRequestRepository.
@@ -1269,7 +1542,7 @@ func (r *changeRequestRepo) GetChangeRequestApprovals(ctx context.Context, id st
 	var approvers []changeRequestApprovalApproverRow
 	for approverRows.Next() {
 		var ap changeRequestApprovalApproverRow
-		if err := approverRows.Scan(&ap.id, &ap.stageID, &ap.approverName, &ap.rawStatus, &ap.updatedOn); err != nil {
+		if err := approverRows.Scan(&ap.id, &ap.stageID, &ap.approverUserID, &ap.approverName, &ap.rawStatus, &ap.createdOn, &ap.updatedOn, &ap.comments); err != nil {
 			approverRows.Close()
 			return domain.ChangeRequestApprovals{}, fmt.Errorf("get change request approvals: scan approver: %w", err)
 		}
@@ -1388,11 +1661,26 @@ func buildChangeRequestApprovals(stages []changeRequestApprovalStageRow, approve
 				respondedOn = &s
 			}
 
+			// Falls back to the junction row's own id only when the
+			// approver's user can't be resolved (approver_user_id null, or
+			// pointing at a since-deleted user) -- purely so this approver
+			// still has a stable, non-empty id to key a list on; it can
+			// never equal a real caller's own id, so isMyPendingApproval
+			// (webapp) correctly never offers Approve/Reject for it either.
+			approverID := ap.id
+			if ap.approverUserID != nil {
+				approverID = *ap.approverUserID
+			}
+
+			createdOn := ap.createdOn.UTC().Format(time.RFC3339)
+
 			domainApprovers = append(domainApprovers, domain.ChangeRequestApprover{
-				ID:          ap.id,
+				ID:          approverID,
 				Name:        ap.approverName,
 				Status:      status,
+				CreatedOn:   &createdOn,
 				RespondedOn: respondedOn,
+				Comments:    ap.comments,
 			})
 		}
 
@@ -1423,22 +1711,162 @@ func buildChangeRequestApprovals(stages []changeRequestApprovalStageRow, approve
 // decideChangeRequestApprovalQuery backs DecideChangeRequestApproval. The
 // WHERE clause's status = 'requested' is the entire enforcement of "only the
 // caller's own PENDING approval can be decided" -- see that method's own
-// doc comment.
+// doc comment. stage_id is also returned (nullable, same as everywhere else
+// in this file) so the caller can re-check that stage's own overall outcome
+// for the Assess->Authorize cascade below.
 const decideChangeRequestApprovalQuery = `
 	UPDATE approval_stage_approver
 	SET status = $3, updated_on = NOW(), updated_by = $4
 	WHERE work_item_id = $1 AND approver_user_id = $2 AND status = 'requested'
-	RETURNING id`
+	RETURNING id, stage_id`
 
 // DecideChangeRequestApproval implements ChangeRequestRepository.
+//
+// A real, reported gap: this used to only flip the one approval_stage_approver
+// row and stop there -- nothing else on the stage was touched, and
+// change_request.state never moved, which left Authorize permanently
+// unreachable once the direct "Change state -> Authorize" button was removed
+// (see ChangeRequestActionBar.tsx's NEVER_OFFERED_TARGETS): approving
+// correctly recorded the decision, but nothing in the system ever advanced
+// the record past Assess. Confirmed live against a real approval on this
+// data source before this fix.
+//
+// An approval that resolves the stage (first-responder-wins: a single
+// approval is enough once nobody on it has rejected -- the same quorum rule
+// buildChangeRequestApprovals already uses at read time) now does two
+// things, matching real ServiceNow's own observed behavior on a genuine
+// multi-approver group:
+//
+//  1. Every other still-Requested approver on the same stage is moved to
+//     Cancelled, not left sitting at Requested indefinitely.
+//  2. If the change request is currently sitting in Assess, state advances
+//     to Authorize.
+//
+// A rejection never does either (there is no confirmed target for a
+// rejected Assess stage in this schema -- see changeRequestForwardNextStates'
+// own doc comment on what is and isn't modeled), and neither does an
+// approval that arrives after the record has already moved on (the
+// currentState check simply no longer matches).
+//
+// The state cascade is deliberately scoped to Assess->Authorize only --
+// Authorize's own outgoing approval gate (into Scheduled or Customer
+// Approval) is a separate, deferred piece of work, so a decision on an
+// Authorize-stage approver still cancels its own siblings but has no state
+// cascade effect at all yet.
+//
+// Three correctness issues caught on CodeRabbit review of this method, all
+// fixed here:
+//
+//  1. Concurrency: two decisions on the same change request (a concurrent
+//     approval/rejection race, or two approvals racing each other's sibling
+//     cancellation) were not serialized at all, so one could read a stale
+//     "no rejection yet" snapshot or deadlock against the other. Every
+//     decision now locks the change_request row (SELECT ... FOR UPDATE)
+//     before touching any approver row, for both approvals and rejections.
+//  2. change_request.state is nullable (see this file's own CLAUDE.md on
+//     pre-existing NULL-state records) and used to be scanned into a plain
+//     string, which would crash on such a record instead of simply leaving
+//     the decision recorded with no cascade.
+//  3. The cascade used to key off change_request.state == "ASSESS" alone,
+//     with no check on which stage was actually being decided -- approving
+//     a pending Authorize-stage approver while the record happened to still
+//     read ASSESS would incorrectly advance it too. It now also confirms
+//     stageID is the Assess-position stage (the earliest by created_on/id,
+//     the same ordinal changeRequestApprovalStagePosition uses at read
+//     time) before advancing; an Authorize-stage decision still cancels its
+//     own siblings regardless.
 func (r *changeRequestRepo) DecideChangeRequestApproval(ctx context.Context, id, approverUserID, decision, actorEmail string) (string, error) {
-	var approvalID string
-	err := r.db.QueryRow(ctx, decideChangeRequestApprovalQuery, id, approverUserID, decision, actorEmail).Scan(&approvalID)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", &apierror.NotFoundError{Msg: "no pending approval found for this change request and caller"}
-	}
-	if err != nil {
-		return "", fmt.Errorf("decide change request approval: %w", err)
-	}
-	return approvalID, nil
+	// InTxReturning: Scoped stamps the caller identity on the transaction's
+	// own session (the base branch's r.db.Begin is not available on Scoped).
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (string, error) {
+		// Locks the change_request row before any approver row is touched,
+		// serializing every decision against it -- approvals and rejections
+		// alike -- so the hasRejection/isAssessStage checks below always see a
+		// consistent snapshot and two concurrent approvals can't deadlock
+		// cancelling each other's sibling rows. A change request that doesn't
+		// exist yields no row here; the approver UPDATE just below still
+		// produces the real pgx.ErrNoRows for that case, so this lock query's
+		// own ErrNoRows is swallowed rather than treated as a fault.
+		var lockedID string
+		if err := tx.QueryRow(ctx, `SELECT id FROM change_request WHERE id = $1 FOR UPDATE`, id).Scan(&lockedID); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("decide change request approval: lock change request: %w", err)
+		}
+
+		var approvalID string
+		var stageID *string
+		err := tx.QueryRow(ctx, decideChangeRequestApprovalQuery, id, approverUserID, decision, actorEmail).Scan(&approvalID, &stageID)
+		if errors.Is(err, pgx.ErrNoRows) || IsRLSPolicyViolation(err) {
+			return "", &apierror.NotFoundError{Msg: "no pending approval found for this change request and caller"}
+		}
+		if err != nil {
+			return "", fmt.Errorf("decide change request approval: %w", err)
+		}
+
+		if decision == "approved" && stageID != nil {
+			var hasRejection bool
+			if err := tx.QueryRow(ctx,
+				`SELECT EXISTS(SELECT 1 FROM approval_stage_approver WHERE stage_id = $1 AND status = 'rejected')`,
+				*stageID).Scan(&hasRejection); err != nil {
+				return "", fmt.Errorf("decide change request approval: check stage rejections: %w", err)
+			}
+			if !hasRejection {
+				// This decision resolves the stage (first-responder-wins: a
+				// single approval is enough once nobody on it has rejected) --
+				// cancel every other still-pending approver on the same stage,
+				// matching real ServiceNow's own observed behavior: confirmed
+				// live against a real 119-approver group, only the 1-2 who
+				// actually responded first were left Approved, every other
+				// still-Requested approver on that same group was moved to
+				// Cancelled, not left sitting at Requested indefinitely.
+				if _, err := tx.Exec(ctx,
+					`UPDATE approval_stage_approver SET status = 'cancelled', updated_on = NOW(), updated_by = $2
+				 WHERE stage_id = $1 AND status = 'requested'`,
+					*stageID, actorEmail); err != nil {
+					return "", fmt.Errorf("decide change request approval: cancel sibling approvers: %w", err)
+				}
+
+				// The one real change_request.state cascade this repository
+				// attempts: Assess -> Authorize. Deliberately scoped this
+				// narrow -- see this method's own doc comment for why
+				// Authorize's own outgoing gate isn't attempted here. Gated on
+				// stageID actually being the Assess-position stage (position 0,
+				// same ordinal changeRequestApprovalStagePosition uses), not
+				// merely on change_request.state reading ASSESS -- see this
+				// method's own doc comment, point 3.
+				var isAssessStage bool
+				if err := tx.QueryRow(ctx, `
+					SELECT NOT EXISTS (
+						SELECT 1 FROM approval_stage earlier
+						WHERE earlier.work_item_id = $1
+						  AND (earlier.created_on, earlier.id) < (SELECT created_on, id FROM approval_stage WHERE id = $2)
+					)`, id, *stageID).Scan(&isAssessStage); err != nil {
+					return "", fmt.Errorf("decide change request approval: check stage position: %w", err)
+				}
+				if isAssessStage {
+					// Nullable (see this method's own doc comment, point 2) --
+					// a NULL state simply has nothing to cascade from, not a
+					// scan failure.
+					var currentState sql.NullString
+					if err := tx.QueryRow(ctx, `SELECT state FROM change_request WHERE id = $1`, id).Scan(&currentState); err != nil {
+						return "", fmt.Errorf("decide change request approval: check current state: %w", err)
+					}
+					if currentState.Valid && currentState.String == "ASSESS" {
+						if _, err := tx.Exec(ctx, `UPDATE change_request SET state = 'AUTHORIZE' WHERE id = $1`, id); err != nil {
+							return "", fmt.Errorf("decide change request approval: advance state: %w", err)
+						}
+					}
+				}
+			}
+		}
+
+		return approvalID, nil
+	})
+}
+
+// changeRequestCategoryPGLabels is change_request_category_enum's label set
+// (migration 0043). The domain enum carries four more values (regular/hotfix
+// release cloud, devops, cloud computing) with no label here.
+var changeRequestCategoryPGLabels = map[string]bool{
+	"SOFTWARE": true, "NETWORK": true, "SERVICE": true, "TELECOM": true, "HARDWARE": true,
+	"SYSTEM_SOFTWARE": true, "DOCUMENTATION": true, "APPLICATIONS_SOFTWARE": true, "OTHER": true,
 }

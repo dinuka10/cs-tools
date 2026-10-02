@@ -42,3 +42,25 @@ func TestProjectContactInvitedPayload_ResendWireName(t *testing.T) {
 		t.Errorf("payload = %s, an ordinary invitation must omit the resend marker", raw)
 	}
 }
+
+// csm-notification-service decodes this payload with DisallowUnknownFields,
+// so the wire names are pinned here.
+func TestProjectContactRegisteredPayload_WireNames(t *testing.T) {
+	raw, err := json.Marshal(ProjectContactRegisteredPayload{IsIntegrationUser: true, EventModifiedOn: "2026-09-18T06:37:07Z"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"membershipSfId", "contactSfId", "email", "givenName", "familyName", "projectName", "projectKey", "isIntegrationUser", "eventModifiedOn"}
+	if len(got) != len(want) {
+		t.Errorf("payload = %s, want exactly %v", raw, want)
+	}
+	for _, k := range want {
+		if _, ok := got[k]; !ok {
+			t.Errorf("payload = %s, missing %q", raw, k)
+		}
+	}
+}

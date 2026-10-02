@@ -46,6 +46,7 @@ import (
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 
+	csmhandler "github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/handler"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg/config"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg/entityclient"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg/handler"
@@ -53,19 +54,40 @@ import (
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/plg/service"
 )
 
-// Mount wires PLG onto mux.
+// RouteFunc registers one route with the permission its caller must hold.
+//
+// This is csm-portal's own route() helper (cmd/server/main.go) seen from the
+// inside: PLG is handed the ability to register a guarded route without being
+// handed the guard. It therefore knows which permission each of its routes
+// requires — a PLG decision — and nothing about how that permission is checked,
+// which is csm-portal's.
+//
+// The one thing this type does NOT capture is middleware ordering, and it
+// matters: whatever the caller wraps around h ends up OUTSIDE anything PLG
+// wraps. That is what keeps the cheap roles check ahead of the identity
+// resolver's entity-service call. See register().
+type RouteFunc func(pattern string, perm csmhandler.Permission, h http.HandlerFunc)
+
+// Mount wires PLG onto csm-portal's router.
 //
 // cfgPath points at PLG's own config.json — or nothing, in which case every
 // setting comes from the PLG_* environment variables. Choreo deploys from
 // environment alone, so the file is optional by design.
 //
+// route is csm-portal's own route() helper from cmd/server/main.go, passed in
+// rather than reimplemented. Every route in this backend goes through it, PLG's
+// included, so there is one place where a pattern is bound to the permission it
+// requires. PLG therefore takes no mux and holds no AccessGuard: it declares
+// what each route needs and lets the caller enforce it. See register() for the
+// permissions and for why the identity middleware is nested inside.
+//
 // It returns no shutdown function because it starts nothing: PLG is a set of
 // handlers on csm-portal's mux and owns no goroutine. It did own one, for the
 // queue poller, until registrations moved to the webhook-queue service.
 func Mount(
-	mux *http.ServeMux,
 	cfgPath string,
 	entityDefaults config.EntityDefaults,
+	route RouteFunc,
 ) error {
 	cfg, err := config.LoadWith(cfgPath, entityDefaults)
 	if err != nil {
@@ -99,7 +121,7 @@ func Mount(
 	// resolver, which turns the validated caller into the "user".id every PLG
 	// write records. It wraps only this subtree — csm-portal's routes neither
 	// need it nor pay for it.
-	register(mux, handlers, plgmw.ResolveIdentity(entity))
+	register(handlers, plgmw.ResolveIdentity(entity), route)
 
 	slog.Info("plg: mounted", "entityBaseURL", cfg.Entity.BaseURL)
 	return nil
@@ -110,70 +132,90 @@ func Mount(
 // Every path is prefixed /plg — csm-portal's backend has 116 routes of its own
 // and `/products` means a different thing to each side. Verified before the
 // merge: zero path overlaps.
-// AUTHORISATION IS PLG'S OWN, NOT csm-portal's accessGuard, and that is a
-// decision rather than an omission.
+// EVERY ROUTE PASSES TWO GUARDS, AND THEY ANSWER DIFFERENT QUESTIONS.
 //
-// csm-portal's routes go through `accessGuard.Require(perm, h)`, which checks
-// the token's `roles` claim for PermView / PermWrite and so on. PLG's go
-// through `identity` instead — see middleware/identity.go — which resolves the
-// caller's email to a `"user".id` and refuses anyone who is not an ACTIVE
-// INTERNAL user with 403. These routes are not unguarded; they are guarded by a
-// different rule.
+//   - `accessGuard.Require(perm, …)` — csm-portal's own, the same one its 116
+//     routes use. A set lookup against the token's `roles` claim, no upstream
+//     call. It asks: what does this token entitle you to?
+//   - `identity` — PLG's own, see middleware/identity.go. It resolves the
+//     caller's email to the `"user".id` every PLG write records as its actor,
+//     and refuses anyone who is not ACTIVE INTERNAL staff. It asks: who are you
+//     in the database, and are you still an employee?
 //
-// The rule: any active internal engineer may work the customer-success queue.
-// There is deliberately no view/write split, because the queue is a shared
-// worklist rather than a permissioned record — an engineer who can see a
-// pairing is expected to act on it, and a read-only PLG user would be a person
-// who can watch work pile up and not touch it.
+// Neither subsumes the other. A token's roles claim cannot tell you that
+// somebody was offboarded this morning — role revocation in the IdP and
+// `is_active` in the platform database are separate lifecycles, and whichever
+// happens second leaves a window the other check covers. Equally, a `"user"`
+// row cannot tell you what the person is entitled to do.
 //
-// If PLG ever needs to distinguish who may WRITE, this is the place to add it,
-// and accessGuard is the thing to reach for rather than a second scheme.
+// THE GUARD RUNS FIRST, DELIBERATELY. It is a map lookup; `identity` is an HTTP
+// round trip to entity-service on every request. Ordering them this way means a
+// caller who fails the role check costs nothing upstream.
+//
+// THE POLICY. PermUsePlg — CS engineer and admin — covers every route except
+// the four that author a playbook template, which are PermManagePlaybooks and
+// admin-only. Within PermUsePlg there is deliberately no view/write split: the
+// queue is a shared worklist, and an engineer who can see a pairing is expected
+// to act on it. Note that playbook *assignment* is PermUsePlg, not
+// PermManagePlaybooks — an engineer runs playbooks, they just cannot edit the
+// templates.
 //
 // Every route below is a read or a write made by a person. There is no machine
 // caller: registrations reach the database through the webhook-queue service
 // posting to entity-service, never through this backend.
-func register(mux *http.ServeMux, h *handler.Handlers, identity func(http.Handler) http.Handler) {
-	add := func(pattern string, fn http.HandlerFunc) {
-		mux.Handle(pattern, identity(fn))
+func register(
+	h *handler.Handlers,
+	identity func(http.Handler) http.Handler,
+	route RouteFunc,
+) {
+	// perm is a required argument with no default, exactly as in csm-portal's
+	// own route() — a new PLG route cannot go live without someone choosing one.
+	//
+	// identity is applied HERE, inside what route() will wrap, so the composed
+	// order stays guard-then-identity: route() puts accessGuard.Require on the
+	// outside, and a caller whose roles are wrong is refused before the identity
+	// resolver makes its entity-service call.
+	add := func(pattern string, perm csmhandler.Permission, fn http.HandlerFunc) {
+		route(pattern, perm, identity(fn).ServeHTTP)
 	}
 
 	// Reference data.
-	add("GET /plg/me", h.Me)
-	add("GET /plg/products", h.ListProducts)
-	add("GET /plg/cs-users", h.ListCSUsers)
-	add("GET /plg/lifecycle", h.Lifecycle)
+	add("GET /plg/me", csmhandler.PermUsePlg, h.Me)
+	add("GET /plg/products", csmhandler.PermUsePlg, h.ListProducts)
+	add("GET /plg/cs-users", csmhandler.PermUsePlg, h.ListCSUsers)
+	add("GET /plg/lifecycle", csmhandler.PermUsePlg, h.Lifecycle)
 
 	// Organisations and the overview tab.
-	add("POST /plg/organizations/search", h.SearchOrganizations)
-	add("GET /plg/organizations/{organizationId}", h.GetOrganization)
-	add("PATCH /plg/organizations/{organizationId}", h.PatchOrganization)
+	add("POST /plg/organizations/search", csmhandler.PermUsePlg, h.SearchOrganizations)
+	add("GET /plg/organizations/{organizationId}", csmhandler.PermUsePlg, h.GetOrganization)
+	add("PATCH /plg/organizations/{organizationId}", csmhandler.PermUsePlg, h.PatchOrganization)
 
 	// The product tab — one organisation, one platform.
-	add("GET /plg/organizations/{organizationId}/products/{product}", h.GetProduct)
-	add("PATCH /plg/organizations/{organizationId}/products/{product}", h.PatchProduct)
-	add("POST /plg/organizations/{organizationId}/products/{product}/playbook-runs", h.AttachPlaybook)
-	add("POST /plg/organizations/{organizationId}/products/{product}/notes", h.CreateNote)
+	add("GET /plg/organizations/{organizationId}/products/{product}", csmhandler.PermUsePlg, h.GetProduct)
+	add("PATCH /plg/organizations/{organizationId}/products/{product}", csmhandler.PermUsePlg, h.PatchProduct)
+	add("POST /plg/organizations/{organizationId}/products/{product}/playbook-runs", csmhandler.PermUsePlg, h.AttachPlaybook)
+	add("POST /plg/organizations/{organizationId}/products/{product}/notes", csmhandler.PermUsePlg, h.CreateNote)
 
 	// Playbook execution.
-	add("DELETE /plg/playbook-runs/{playbookRunId}", h.DetachRun)
-	add("PATCH /plg/playbook-run-tasks/{taskId}", h.PatchRunTask)
-	add("PATCH /plg/notes/{noteId}", h.PatchNote)
+	add("DELETE /plg/playbook-runs/{playbookRunId}", csmhandler.PermUsePlg, h.DetachRun)
+	add("PATCH /plg/playbook-run-tasks/{taskId}", csmhandler.PermUsePlg, h.PatchRunTask)
+	add("PATCH /plg/notes/{noteId}", csmhandler.PermUsePlg, h.PatchNote)
 
 	// New registrations.
-	add("POST /plg/registrations/search", h.SearchRegistrations)
-	add("POST /plg/registrations/{orgPlatformId}/acknowledge", h.Acknowledge)
+	add("POST /plg/registrations/search", csmhandler.PermUsePlg, h.SearchRegistrations)
+	add("POST /plg/registrations/{orgPlatformId}/acknowledge", csmhandler.PermUsePlg, h.Acknowledge)
 
 	// Playbook manager.
-	add("GET /plg/playbooks", h.ListPlaybooks)
-	add("POST /plg/products/{product}/playbooks", h.CreatePlaybook)
-	add("GET /plg/playbooks/{playbookId}", h.GetPlaybook)
-	add("PATCH /plg/playbooks/{playbookId}", h.PatchPlaybook)
-	add("PUT /plg/playbooks/{playbookId}/tasks", h.ReplacePlaybookTasks)
-	add("DELETE /plg/playbooks/{playbookId}", h.DeletePlaybook)
+	add("GET /plg/playbooks", csmhandler.PermUsePlg, h.ListPlaybooks)
+	add("POST /plg/products/{product}/playbooks", csmhandler.PermManagePlaybooks, h.CreatePlaybook)
+	add("GET /plg/playbooks/{playbookId}", csmhandler.PermUsePlg, h.GetPlaybook)
+	add("PATCH /plg/playbooks/{playbookId}", csmhandler.PermManagePlaybooks, h.PatchPlaybook)
+	add("PUT /plg/playbooks/{playbookId}/tasks", csmhandler.PermManagePlaybooks, h.ReplacePlaybookTasks)
+	add("DELETE /plg/playbooks/{playbookId}", csmhandler.PermManagePlaybooks, h.DeletePlaybook)
 
 	// Analytics.
-	add("GET /plg/analytics/dashboard", h.Dashboard)
-	add("GET /plg/work-queue", h.WorkQueue)
+	add("GET /plg/analytics/dashboard", csmhandler.PermUsePlg, h.Dashboard)
+	add("GET /plg/work-queue", csmhandler.PermUsePlg, h.WorkQueue)
 }
 
 // entityHTTPClient returns a client that attaches an OAuth2 bearer token to

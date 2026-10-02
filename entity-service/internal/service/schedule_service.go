@@ -90,14 +90,7 @@ func NewScheduleService(repo repository.ScheduleRepository, access AccessService
 // given: an internal caller sees all of it and anyone else sees none. Mirrors
 // sla_status_service.go's helper of the same name.
 func (s *scheduleService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.access.ResolveScope(ctx)
-	if err != nil {
-		return err
-	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "the team schedule is only available to internal staff"}
-	}
-	return nil
+	return RequireInternalCaller(ctx, s.access, "the team schedule is only available to internal staff")
 }
 
 func (s *scheduleService) Catalogue(ctx context.Context) (domain.ScheduleCatalogue, error) {

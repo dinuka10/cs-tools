@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,8 +35,7 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// fakeAlerts is a minimal in-memory alertReader. errByID lets a test force a specific error (e.g.
-// store.ErrAlertNotFound or a generic read failure) for an id not present in byID.
+// fakeAlerts is a minimal in-memory alertReader; errByID forces a specific error for an id not present in byID.
 type fakeAlerts struct {
 	byID    map[string]model.Alert
 	errByID map[string]error
@@ -52,16 +52,13 @@ func (f *fakeAlerts) Get(_ context.Context, id string) (model.Alert, error) {
 	return a, nil
 }
 
-// fakeIncidents is an in-memory incidentStore, safe for concurrent use, mirroring what
-// store.IncidentRepo does against Cassandra closely enough to exercise the engine's own logic.
+// fakeIncidents is an in-memory incidentStore, safe for concurrent use, mirroring store.IncidentRepo closely enough to exercise the engine's own logic.
 type fakeIncidents struct {
 	mu   sync.Mutex
 	byFP map[string]model.Incident
-	// recordCSMIncidentErr forces RecordCSMIncident to fail, simulating a persist failure right
-	// after CSM has already accepted the incident.
+	// recordCSMIncidentErr forces RecordCSMIncident to fail, simulating a persist failure right after CSM accepted the incident.
 	recordCSMIncidentErr error
-	// dedupWindow mirrors store.IncidentRepo's own field, used by Upsert's IsOpen check below.
-	// Defaults to a generous value so existing tests are unaffected unless they shrink it.
+	// dedupWindow mirrors store.IncidentRepo's own field; defaults generous so existing tests are unaffected unless they shrink it.
 	dedupWindow time.Duration
 }
 
@@ -112,9 +109,7 @@ func (f *fakeIncidents) Upsert(_ context.Context, alertID string, a model.Alert,
 		existing.Severity = severityNum
 	}
 	existing.LastSeen = time.Now()
-	// Mirrors store.IncidentRepo.Upsert: this path is only ever reached (rather than annotate) for
-	// an incident that is no longer open, so folding a new occurrence into it must reset delivery
-	// state -- otherwise a closed incident's csm_confirmed/notified silently swallow the recurrence.
+	// Mirrors store.IncidentRepo.Upsert: this path only reaches a no-longer-open incident, so folding a new occurrence in must reset delivery state.
 	if !existing.IsOpen(time.Now(), f.dedupWindow) {
 		existing.FirstSeen = existing.LastSeen
 		existing.IncidentID = ""
@@ -126,103 +121,107 @@ func (f *fakeIncidents) Upsert(_ context.Context, alertID string, a model.Alert,
 		existing.PendingNotes = nil
 		existing.StateCheckedAt = time.Time{}
 	}
+	existing.Version++
 	f.byFP[fp] = existing
 	return existing, false, nil
 }
 
-func (f *fakeIncidents) RecordAlertID(_ context.Context, existing model.Incident, alertID string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	inc := f.byFP[existing.Fingerprint]
-	for _, seen := range inc.AlertIDs {
-		if seen == alertID {
-			return nil
-		}
+// casUpdate mirrors store.IncidentRepo.casUpdate's contract: mutate only if existing.Version matches what's stored, else report store.ErrStaleWrite; callers must hold f.mu.
+func (f *fakeIncidents) casUpdate(existing model.Incident, mutate func(*model.Incident)) (int64, error) {
+	inc, ok := f.byFP[existing.Fingerprint]
+	if !ok || inc.Version != existing.Version {
+		return existing.Version, store.ErrStaleWrite
 	}
-	inc.AlertIDs = append(inc.AlertIDs, alertID)
+	mutate(&inc)
+	inc.Version++
 	f.byFP[existing.Fingerprint] = inc
-	return nil
+	return inc.Version, nil
 }
 
-func (f *fakeIncidents) RecordCSMIncident(_ context.Context, fingerprint, incidentID, incidentNumber string) error {
+func (f *fakeIncidents) RecordAlertID(_ context.Context, existing model.Incident, alertID string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, seen := range existing.AlertIDs {
+		if seen == alertID {
+			return existing.Version, nil
+		}
+	}
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.AlertIDs = append(inc.AlertIDs, alertID)
+	})
+}
+
+func (f *fakeIncidents) RecordCSMIncident(_ context.Context, existing model.Incident, incidentID, incidentNumber string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.recordCSMIncidentErr != nil {
-		return f.recordCSMIncidentErr
+		return existing.Version, f.recordCSMIncidentErr
 	}
-	inc := f.byFP[fingerprint]
-	inc.IncidentID = incidentID
-	inc.IncidentNumber = incidentNumber
-	inc.CSMConfirmed = true
-	f.byFP[fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.IncidentID = incidentID
+		inc.IncidentNumber = incidentNumber
+		inc.CSMConfirmed = true
+	})
 }
 
-func (f *fakeIncidents) RecordCSMAttemptStarted(_ context.Context, fingerprint string, attempts int) error {
+func (f *fakeIncidents) RecordCSMAttemptStarted(_ context.Context, existing model.Incident, attempts int) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	inc := f.byFP[fingerprint]
-	inc.CSMAttempts = attempts
-	inc.CSMLastAttemptAt = time.Now()
-	f.byFP[fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.CSMAttempts = attempts
+		inc.CSMLastAttemptAt = time.Now()
+	})
 }
 
-func (f *fakeIncidents) RecordCSMAttemptFailure(_ context.Context, fingerprint string, attempts, maxAttempts int, permanent bool) error {
+func (f *fakeIncidents) RecordCSMAttemptFailure(_ context.Context, existing model.Incident, attempts, maxAttempts int, permanent bool) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	inc := f.byFP[fingerprint]
-	inc.CSMAttempts = attempts
-	inc.CSMPermanentlyFailed = permanent || attempts >= maxAttempts
-	f.byFP[fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.CSMAttempts = attempts
+		inc.CSMPermanentlyFailed = permanent || attempts >= maxAttempts
+	})
 }
 
-func (f *fakeIncidents) SyncStatus(_ context.Context, fingerprint, status string, checkedAt time.Time) error {
+func (f *fakeIncidents) SyncStatus(_ context.Context, existing model.Incident, status string, checkedAt time.Time) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	inc := f.byFP[fingerprint]
-	inc.Status = status
-	inc.StateCheckedAt = checkedAt
-	f.byFP[fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.Status = status
+		inc.StateCheckedAt = checkedAt
+	})
 }
 
-func (f *fakeIncidents) RecordStateChecked(_ context.Context, fingerprint string, checkedAt time.Time) error {
+func (f *fakeIncidents) RecordStateChecked(_ context.Context, existing model.Incident, checkedAt time.Time) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	inc := f.byFP[fingerprint]
-	inc.StateCheckedAt = checkedAt
-	f.byFP[fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.StateCheckedAt = checkedAt
+	})
 }
 
-func (f *fakeIncidents) AppendWorkNote(_ context.Context, existing model.Incident, note string) error {
+func (f *fakeIncidents) AppendWorkNote(_ context.Context, existing model.Incident, note string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	inc := f.byFP[existing.Fingerprint]
-	inc.WorkNotes = append(inc.WorkNotes, note)
-	inc.PendingNotes = append(inc.PendingNotes, note)
-	f.byFP[existing.Fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.WorkNotes = append(inc.WorkNotes, note)
+		inc.PendingNotes = append(inc.PendingNotes, note)
+	})
 }
 
-func (f *fakeIncidents) ClearPendingNotes(_ context.Context, fingerprint string, remaining []string) error {
+func (f *fakeIncidents) ClearPendingNotes(_ context.Context, existing model.Incident, remaining []string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	inc := f.byFP[fingerprint]
-	inc.PendingNotes = remaining
-	f.byFP[fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.PendingNotes = remaining
+	})
 }
 
-func (f *fakeIncidents) MarkFallbackNotified(_ context.Context, fingerprint string) error {
+func (f *fakeIncidents) MarkFallbackNotified(_ context.Context, existing model.Incident) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	inc := f.byFP[fingerprint]
-	inc.Fallback = true
-	f.byFP[fingerprint] = inc
-	return nil
+	return f.casUpdate(existing, func(inc *model.Incident) {
+		inc.Fallback = true
+	})
 }
 
 func (f *fakeIncidents) ListPending(_ context.Context) ([]model.Incident, error) {
@@ -239,8 +238,7 @@ func (f *fakeIncidents) ListPending(_ context.Context) ([]model.Incident, error)
 	return out, nil
 }
 
-// fakeNotifier counts NotifyCSM calls so tests can assert an incident is never delivered to CSM
-// twice, and lets tests control whether CSM confirms.
+// fakeNotifier counts NotifyCSM calls so tests can assert no double-delivery, and lets tests control whether CSM confirms.
 type fakeNotifier struct {
 	csmOK      bool
 	csmID      string
@@ -255,6 +253,10 @@ type fakeNotifier struct {
 	pushNoteCalls atomic.Int32
 	pushNoteErr   error
 	pushedNotes   []string
+
+	chatAnnotationCalls atomic.Int32
+	chatAnnotationKinds []string // kind observed on each NotifyChatAnnotation call, in order
+	chatAnnotationNotes []string // note observed on each NotifyChatAnnotation call, in order
 }
 
 func (n *fakeNotifier) NotifyCSM(_ context.Context, inc model.Incident) (string, string, bool, bool) {
@@ -270,6 +272,15 @@ func (n *fakeNotifier) NotifyCSM(_ context.Context, inc model.Incident) (string,
 
 func (n *fakeNotifier) NotifyChat(_ context.Context, inc model.Incident) bool {
 	n.chatCalls.Add(1)
+	return n.chatOK
+}
+
+func (n *fakeNotifier) NotifyChatAnnotation(_ context.Context, inc model.Incident, kind, note string) bool {
+	n.chatAnnotationCalls.Add(1)
+	n.mu.Lock()
+	n.chatAnnotationKinds = append(n.chatAnnotationKinds, kind)
+	n.chatAnnotationNotes = append(n.chatAnnotationNotes, note)
+	n.mu.Unlock()
 	return n.chatOK
 }
 
@@ -291,7 +302,7 @@ func (n *fakeNotifier) IncidentState(_ context.Context, incidentNumber string) (
 
 func newTestEngine(alerts map[string]model.Alert, notifier *fakeNotifier) (*Engine, *fakeIncidents) {
 	incidents := newFakeIncidents()
-	e := New(testLogger(), &fakeAlerts{byID: alerts}, incidents, notifier, model.Defaults{}, 3, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{byID: alerts}, incidents, notifier, model.Defaults{}, 3, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
 	return e, incidents
 }
 
@@ -441,7 +452,7 @@ func TestHandle_PermanentlyFailedIncident_RecoversOnNextAlert(t *testing.T) {
 	notifier := &fakeNotifier{csmOK: false, chatOK: true}
 	incidents := newFakeIncidents()
 	// maxCSMAttempts=1 so the very first failed attempt already exhausts retries and marks permanent failure.
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 1, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 1, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
@@ -456,8 +467,7 @@ func TestHandle_PermanentlyFailedIncident_RecoversOnNextAlert(t *testing.T) {
 		t.Fatalf("expected a permanently-failed incident to report IsOpen()=false")
 	}
 
-	// CSM recovers; a later alert on the same fingerprint must get its own fresh delivery attempt,
-	// not be silently swallowed as a local Duplicate note forever.
+	// CSM recovers; a later alert on the same fingerprint must get its own fresh delivery attempt, not be swallowed as a Duplicate note forever.
 	notifier.csmOK = true
 	notifier.csmID, notifier.csmNumber = "csm-2", "INC0000002"
 	outcome := e.Handle(ctx, "ALT2", alert)
@@ -477,7 +487,7 @@ func TestHandle_PermanentlyFailedIncident_RecoversOnNextAlert(t *testing.T) {
 func TestDeliverAndPersist_CSMRetryBacksOffDuringOutage(t *testing.T) {
 	notifier := &fakeNotifier{csmOK: false, chatOK: true}
 	incidents := newFakeIncidents()
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 20, 0, time.Hour, CSMRetryConfig{BaseDelay: 30 * time.Second, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 20, 0, time.Hour, CSMRetryConfig{BaseDelay: 30 * time.Second, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
@@ -505,7 +515,7 @@ func TestHandle_DuplicateWithinDedupWindow_Folds(t *testing.T) {
 	notifier := &fakeNotifier{csmOK: true, csmID: "csm-1", csmNumber: "INC0000001"}
 	incidents := newFakeIncidents()
 	incidents.dedupWindow = 5 * time.Minute
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, 5*time.Minute, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, 5*time.Minute, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
@@ -533,7 +543,7 @@ func TestHandle_DedupWindowExpired_StartsNewIncidentGeneration(t *testing.T) {
 	notifier := &fakeNotifier{csmOK: true, csmID: "csm-1", csmNumber: "INC0000001"}
 	incidents := newFakeIncidents()
 	incidents.dedupWindow = 5 * time.Minute
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, 5*time.Minute, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, 5*time.Minute, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
@@ -562,15 +572,14 @@ func TestHandle_GenerationReset_FlushesPendingNotesFirst(t *testing.T) {
 	notifier := &fakeNotifier{csmOK: true, csmID: "csm-1", csmNumber: "INC0000001"}
 	incidents := newFakeIncidents()
 	incidents.dedupWindow = 5 * time.Minute
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, 5*time.Minute, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, 5*time.Minute, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
 	e.Handle(ctx, "ALT1", alert) // creates + confirms the incident
 	fp := model.Fingerprint(alert.Source, alert.Service, alert.MetricName, alert.Environment, alert.UniqueIdentifier)
 
-	// A note queued on the outgoing generation, still unflushed, and the incident has aged past its
-	// dedup window -- the next alert on this fingerprint is about to trigger a generation reset.
+	// A note queued on the outgoing generation is still unflushed, and the incident has aged past its dedup window, about to trigger a generation reset.
 	inc := incidents.byFP[fp]
 	inc.PendingNotes = []string{"queued note"}
 	inc.FirstSeen = time.Now().Add(-6 * time.Minute)
@@ -626,7 +635,7 @@ func TestAnnotate_PushesPendingNoteImmediately_AndRetriesOnFailure(t *testing.T)
 func TestAnnotate_NoteWrittenBeforeCsmConfirmed_FlushesOnceConfirmed(t *testing.T) {
 	notifier := &fakeNotifier{csmOK: false} // CSM create keeps failing (transient) while the duplicate arrives
 	incidents := newFakeIncidents()
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 5, 0, time.Hour, CSMRetryConfig{BaseDelay: 0, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 5, 0, time.Hour, CSMRetryConfig{BaseDelay: 0, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
@@ -659,10 +668,94 @@ func TestAnnotate_NoteWrittenBeforeCsmConfirmed_FlushesOnceConfirmed(t *testing.
 	}
 }
 
+func TestAnnotate_ChatFallbackIncident_ThreadsDuplicateWhenThreadingEnabled(t *testing.T) {
+	notifier := &fakeNotifier{csmOK: false, chatOK: true}
+	incidents := newFakeIncidents()
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 5, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
+	ctx := context.Background()
+
+	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
+	fp := model.Fingerprint(alert.Source, alert.Service, alert.MetricName, alert.Environment, alert.UniqueIdentifier)
+	incidents.byFP[fp] = model.Incident{
+		Fingerprint: fp, IncidentNumber: "PENDING-abc", Status: "new", Severity: 1,
+		Service: "svc", MetricName: "cpu", Source: "vendor", AlertIDs: []string{"ALT1"}, AlertCount: 1,
+		FirstSeen: time.Now(), Fallback: true, // already pushed to chat once; CSM never confirmed (IncidentID stays "").
+	}
+
+	outcome := e.Handle(ctx, "ALT2", alert) // duplicate on an incident already stuck in chat-fallback
+	if outcome != Processed {
+		t.Fatalf("outcome = %v, want Processed", outcome)
+	}
+	if calls := notifier.chatAnnotationCalls.Load(); calls != 1 {
+		t.Fatalf("NotifyChatAnnotation calls = %d, want 1: duplicate should thread into the existing fallback message", calls)
+	}
+	if got, want := notifier.chatAnnotationKinds[0], "Duplicate"; got != want {
+		t.Fatalf("annotation kind = %q, want %q: the reply must be visibly labeled, not a repeat of the original card", got, want)
+	}
+	if !strings.Contains(notifier.chatAnnotationNotes[0], "Duplicate alert received") {
+		t.Fatalf("annotation note = %q, want it to name the kind", notifier.chatAnnotationNotes[0])
+	}
+	if calls := notifier.chatCalls.Load(); calls != 0 {
+		t.Fatalf("NotifyChat calls = %d, want 0: a Duplicate/OK annotation must not repost the original fallback card", calls)
+	}
+}
+
+func TestAnnotate_ChatFallbackIncident_ThreadsOKWhenThreadingEnabled(t *testing.T) {
+	notifier := &fakeNotifier{csmOK: false, chatOK: true}
+	incidents := newFakeIncidents()
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 5, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
+	ctx := context.Background()
+
+	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "ok", Source: "vendor"}
+	fp := model.Fingerprint(alert.Source, alert.Service, alert.MetricName, alert.Environment, alert.UniqueIdentifier)
+	incidents.byFP[fp] = model.Incident{
+		Fingerprint: fp, IncidentNumber: "PENDING-abc", Status: "new", Severity: 1,
+		Service: "svc", MetricName: "cpu", Source: "vendor", AlertIDs: []string{"ALT1"}, AlertCount: 1,
+		FirstSeen: time.Now(), Fallback: true,
+	}
+
+	outcome := e.Handle(ctx, "ALT2", alert) // OK/resolving alert on an incident already stuck in chat-fallback
+	if outcome != Processed {
+		t.Fatalf("outcome = %v, want Processed", outcome)
+	}
+	if calls := notifier.chatAnnotationCalls.Load(); calls != 1 {
+		t.Fatalf("NotifyChatAnnotation calls = %d, want 1: OK should thread into the existing fallback message", calls)
+	}
+	if got, want := notifier.chatAnnotationKinds[0], "OK"; got != want {
+		t.Fatalf("annotation kind = %q, want %q: the resolution must be visibly labeled, not a repeat of the original critical card", got, want)
+	}
+	if !strings.Contains(notifier.chatAnnotationNotes[0], "OK alert received") {
+		t.Fatalf("annotation note = %q, want it to name the kind", notifier.chatAnnotationNotes[0])
+	}
+}
+
+func TestAnnotate_ChatFallbackIncident_SkipsThreadingWhenDisabled(t *testing.T) {
+	notifier := &fakeNotifier{csmOK: false, chatOK: true}
+	incidents := newFakeIncidents()
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 5, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, false)
+	ctx := context.Background()
+
+	alert := model.Alert{Service: "svc", MetricName: "cpu", Severity: "critical", Source: "vendor"}
+	fp := model.Fingerprint(alert.Source, alert.Service, alert.MetricName, alert.Environment, alert.UniqueIdentifier)
+	incidents.byFP[fp] = model.Incident{
+		Fingerprint: fp, IncidentNumber: "PENDING-abc", Status: "new", Severity: 1,
+		Service: "svc", MetricName: "cpu", Source: "vendor", AlertIDs: []string{"ALT1"}, AlertCount: 1,
+		FirstSeen: time.Now(), Fallback: true,
+	}
+
+	outcome := e.Handle(ctx, "ALT2", alert)
+	if outcome != Processed {
+		t.Fatalf("outcome = %v, want Processed", outcome)
+	}
+	if calls := notifier.chatAnnotationCalls.Load(); calls != 0 {
+		t.Fatalf("NotifyChatAnnotation calls = %d, want 0: threading disabled must preserve today's silent-until-CSM-recovers behavior", calls)
+	}
+}
+
 func TestDeliverAndPersist_ChatNotSentWhenCsmSucceedsButPersistFails(t *testing.T) {
 	notifier := &fakeNotifier{csmOK: true, csmID: "csm-1", csmNumber: "INC0000001", chatOK: true}
 	incidents := newFakeIncidents()
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 3, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	fp := model.Fingerprint("vendor", "svc", "cpu", "", "")
@@ -686,7 +779,7 @@ func TestPrepare_DistinguishesNotFoundFromOtherReadErrors(t *testing.T) {
 			"DBERR":    context.DeadlineExceeded,
 		},
 	}
-	e := New(testLogger(), alerts, newFakeIncidents(), &fakeNotifier{}, model.Defaults{}, 3, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), alerts, newFakeIncidents(), &fakeNotifier{}, model.Defaults{}, 3, 0, time.Hour, CSMRetryConfig{BaseDelay: time.Hour, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	if _, _, outcome, ready, notFound := e.Prepare(ctx, "NOTFOUND"); ready || outcome != Retry || !notFound {
@@ -698,8 +791,7 @@ func TestPrepare_DistinguishesNotFoundFromOtherReadErrors(t *testing.T) {
 }
 
 func TestAnnotate_UsesFreshReadNotStaleSnapshot(t *testing.T) {
-	// Push fails so the newly appended note stays visible in PendingNotes for inspection, rather than
-	// being immediately flushed away by annotate's own deliverAndPersist call.
+	// Push fails so the newly appended note stays visible in PendingNotes instead of being flushed away by annotate's deliverAndPersist call.
 	notifier := &fakeNotifier{csmOK: true, csmID: "csm-1", csmNumber: "INC0000001", pushNoteErr: fmt.Errorf("csm patch failed")}
 	e, incidents := newTestEngine(nil, notifier)
 	ctx := context.Background()
@@ -730,7 +822,7 @@ func TestDeliverAndPersist_CSMAttemptsAdvanceEvenWhenConfirmPersistFails(t *test
 	notifier := &fakeNotifier{csmOK: true, csmID: "csm-1", csmNumber: "INC0000001"}
 	incidents := newFakeIncidents()
 	incidents.recordCSMIncidentErr = fmt.Errorf("cassandra write failed")
-	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 5, 0, time.Hour, CSMRetryConfig{BaseDelay: 0, Multiplier: 3, MaxDelay: time.Hour})
+	e := New(testLogger(), &fakeAlerts{}, incidents, notifier, model.Defaults{}, 5, 0, time.Hour, CSMRetryConfig{BaseDelay: 0, Multiplier: 3, MaxDelay: time.Hour}, true)
 	ctx := context.Background()
 
 	fp := model.Fingerprint("vendor", "svc", "cpu", "", "")

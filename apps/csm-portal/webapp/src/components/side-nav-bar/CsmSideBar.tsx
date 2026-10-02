@@ -109,15 +109,14 @@ function pickActiveId(pathname: string): string {
 
 /**
  * Active id for the Sales/SA view's flat nav (see the "sales-sa" branch
- * below): the matched `spl.*` node, or "spl.accounts" (that view's own
+ * below): the matched `viewer.*` node, or "viewer.cases" (that view's own
  * landing page — see RootLanding in App.tsx) for any route this nav has no
  * entry for, e.g. /spl/projects/:id/sla-report/:sysId or the bare "/"
- * redirect. Cases (a still-unmerged sibling PR) would otherwise leave the
- * rail with nothing highlighted.
+ * redirect, which would otherwise leave the rail with nothing highlighted.
  */
-function pickSplActiveId(pathname: string): string {
+function pickViewerActiveId(pathname: string): string {
   const match = navNodeMatchForPath(pathname);
-  return match?.node.id.startsWith("spl.") ? match.node.id : "spl.accounts";
+  return match?.node.id.startsWith("viewer.") ? match.node.id : "viewer.cases";
 }
 
 export default function CsmSideBar({
@@ -135,13 +134,13 @@ export default function CsmSideBar({
   // values and the final JSX are conditional.
   const view = usePortalView();
   const activeItem =
-    view === "sales-sa" ? pickSplActiveId(location.pathname) : pickActiveId(location.pathname);
+    view === "sales-sa" ? pickViewerActiveId(location.pathname) : pickActiveId(location.pathname);
   useEffect(() => {
     // Last-section persistence is CS-nav-only bookkeeping (see
     // `pickActiveId`'s doc comment) — the Sales/SA view never falls back to
-    // it (`pickSplActiveId` always resolves to a real `spl.*` id or its own
-    // default), and persisting an `spl.*` id here would corrupt that
-    // fallback for the CS view the next time this session renders it.
+    // it (`pickViewerActiveId` always resolves to a real `viewer.*` id or
+    // its own default), and persisting a `viewer.*` id here would corrupt
+    // that fallback for the CS view the next time this session renders it.
     if (view === "sales-sa") return;
     // The persisted id is the fallback used for routes with no owning section
     // (see `pickActiveId`'s doc comment) -- it must stay a *section* id.
@@ -199,12 +198,12 @@ export default function CsmSideBar({
   // Sales/SA view — SPL's own flat nav (this node's children, no nesting),
   // entirely replacing the CS section list below rather than merging into
   // it. featureState/visibleNavChildren still apply (a deployment can still
-  // WIP/hide an individual spl.* page via CSM_PORTAL_FEATURE_OVERRIDES), but
-  // there is no per-user PortalAccess capability gating here — SPL's own
-  // access model is the separate useSplAccess audience gate (see
+  // WIP/hide an individual viewer.* page via CSM_PORTAL_FEATURE_OVERRIDES),
+  // but there is no per-user PortalAccess capability gating here — SPL's own
+  // access model is the separate useAccess audience gate (see
   // usePortalView.ts), not this app's `requires` mechanism.
-  const splNode = view === "sales-sa" ? navNodeById("spl") : undefined;
-  const splItems = splNode ? visibleNavChildren(splNode, access) : [];
+  const viewerNode = view === "sales-sa" ? navNodeById("viewer") : undefined;
+  const viewerItems = viewerNode ? visibleNavChildren(viewerNode, access) : [];
 
   return (
     <Sidebar
@@ -222,9 +221,12 @@ export default function CsmSideBar({
       <Sidebar.Nav>
         <Sidebar.Category>
           {view === "sales-sa" ? (
+            // No category label here, matching the CS-ABT branch below: a
+            // viewer with the "viewer" role is just a CSM Portal user whose
+            // nav happens to be this set of sections, not someone using a
+            // separate "Support Portal Lite" product -- see usePortalView.ts.
             <>
-              <Sidebar.CategoryLabel>Support Portal Lite</Sidebar.CategoryLabel>
-              {splItems.map((item) => {
+              {viewerItems.map((item) => {
                 const itemContent = (
                   <Sidebar.Item id={item.id}>
                     {item.icon && (
@@ -261,11 +263,11 @@ export default function CsmSideBar({
             </>
           ) : (
             /* `hidden` sections are filtered out entirely; `wip` ones stay
-               rendered but disabled below. "spl" itself is excluded here —
+               rendered but disabled below. "viewer" itself is excluded here —
                it renders as its own exclusive view above, not merged into
                this list (see usePortalView.ts). */
             visibleNavSections(access)
-              .filter((item) => item.id !== "spl")
+              .filter((item) => item.id !== "viewer")
               .map((item) => {
                 const itemContent = (
                   <Sidebar.Item id={item.id}>

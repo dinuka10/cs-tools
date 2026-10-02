@@ -17,7 +17,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router";
 import { useIdTokenClaims } from "@hooks/useIdTokenClaims";
-import { useSearchAccounts } from "../api/useSplAccountsApi";
+import { useSearchSplAccounts } from "../api/useAccountsApi";
 import AccountSearch from "./AccountSearch";
 import AccountsDataTable from "./AccountsDataTable";
 
@@ -28,7 +28,7 @@ export default function ListMyAccounts({ active }: { active: boolean }) {
   const navigate = useNavigate();
   const email = useIdTokenClaims()?.email;
 
-  const { data, isLoading, error } = useSearchAccounts({
+  const { data, isLoading, error } = useSearchSplAccounts({
     email,
     offset: page * rowsPerPage,
     limit: rowsPerPage,

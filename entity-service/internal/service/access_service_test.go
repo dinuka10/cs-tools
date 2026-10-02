@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -162,5 +163,59 @@ func TestAccessService_InternalSkipsProjectLookup(t *testing.T) {
 	_, _ = NewAccessService(repo, nil).ResolveScope(idCtx(auth.Identity{Validated: true, UserEmail: "a@b.c"}))
 	if repo.projectCalls != 0 {
 		t.Fatalf("project lookups = %d, want 0", repo.projectCalls)
+	}
+}
+
+// TestAccessService_ResolveScope_UsesCachedScopeFromContext is the
+// regression test for issue #2128: callerIdentityMiddleware already calls
+// ResolveScope once per request and stamps its result onto ctx for Scoped's
+// benefit (repository.WithCallerIdentity) -- a second call on that same ctx
+// (from case_service.go/escalation_service.go/etc, each resolving its own
+// AccessScope independently) must reuse that cached value rather than
+// repeating the full resolution (UsersByEmail + RegisteredProjectIDs for an
+// external caller). Proven here by a fakeAccessRepo that would fail loudly
+// (call counts > 0) if ResolveScope re-resolved instead of trusting the
+// cache.
+func TestAccessService_ResolveScope_UsesCachedScopeFromContext(t *testing.T) {
+	repo := &fakeAccessRepo{}
+	svc := NewAccessService(repo, testInternalClientIDs)
+
+	want := repository.SearchScope{Unrestricted: false, ProjectIDs: []string{"p1", "p2"}, ViewerEmail: "cached@test.local"}
+	// Deliberately NOT auth.WithIdentity: a cache hit must not need to
+	// re-derive anything from the auth identity at all -- this ctx carries
+	// only the middleware's own cached scope, exactly like a real request
+	// reaching a second ResolveScope call downstream.
+	ctx := repository.WithCallerIdentity(context.Background(), want)
+
+	got, err := svc.ResolveScope(ctx)
+	if err != nil {
+		t.Fatalf("ResolveScope() with a cached scope on ctx: unexpected error = %v", err)
+	}
+	if got.Unrestricted != want.Unrestricted || got.ViewerEmail != want.ViewerEmail || !slices.Equal(got.ProjectIDs, want.ProjectIDs) {
+		t.Errorf("ResolveScope() = %+v, want the cached %+v unchanged", got, want)
+	}
+	if repo.userLookups != 0 || repo.projectCalls != 0 {
+		t.Errorf("repo calls = %d userLookups, %d projectCalls, want 0 and 0 -- a cache hit must never touch the database", repo.userLookups, repo.projectCalls)
+	}
+}
+
+// TestAccessService_ResolveScope_FallsThroughWithoutCachedScope confirms the
+// cache-first check in TestAccessService_ResolveScope_UsesCachedScopeFromContext
+// doesn't break the ordinary (uncached) path: a ctx with no prior
+// repository.WithCallerIdentity stamp -- the normal case for the middleware's
+// own first call on a request -- still resolves for real, against the repo.
+func TestAccessService_ResolveScope_FallsThroughWithoutCachedScope(t *testing.T) {
+	repo := &fakeAccessRepo{users: []repository.AccessUser{userOf("EXTERNAL", true)}, projects: []string{"p1"}}
+	svc := NewAccessService(repo, testInternalClientIDs)
+
+	scope, err := svc.ResolveScope(idCtx(auth.Identity{Validated: true, UserEmail: "real@test.local"}))
+	if err != nil {
+		t.Fatalf("ResolveScope() with no cached scope: unexpected error = %v", err)
+	}
+	if scope.Unrestricted || len(scope.ProjectIDs) != 1 || scope.ProjectIDs[0] != "p1" {
+		t.Errorf("ResolveScope() = %+v, want a real resolution against the repo (ProjectIDs=[p1])", scope)
+	}
+	if repo.userLookups != 1 || repo.projectCalls != 1 {
+		t.Errorf("repo calls = %d userLookups, %d projectCalls, want exactly 1 and 1 -- the uncached path must still do real work", repo.userLookups, repo.projectCalls)
 	}
 }

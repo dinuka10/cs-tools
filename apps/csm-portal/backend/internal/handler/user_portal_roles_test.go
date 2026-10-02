@@ -62,7 +62,7 @@ func TestGetUser_PortalRoles_ReplacesEntityRolesForInternalUser(t *testing.T) {
 		getUserFn: func(_ context.Context, _ string) ([]byte, error) {
 			return []byte(`{"id":"` + id + `","email":"staff@example.com","userType":"internal","roles":["admin","internal"]}`), nil
 		},
-	}, testDirectory(t), false).WithAccessGuard(NewAccessGuard(testAccessConfigForCSMRoles()))
+	}, testDirectory(t), false, "").WithAccessGuard(NewAccessGuard(testAccessConfigForCSMRoles()))
 
 	r := withUser(httptest.NewRequest(http.MethodGet, "/users/"+id, nil))
 	r.SetPathValue("id", id)
@@ -96,7 +96,7 @@ func TestGetUser_PortalRoles_SkippedForExternalUser(t *testing.T) {
 		getUserFn: func(_ context.Context, _ string) ([]byte, error) {
 			return []byte(`{"id":"` + id + `","email":"contact@example.com","userType":"external","roles":["customer"]}`), nil
 		},
-	}, testDirectory(t), false).WithAccessGuard(NewAccessGuard(testAccessConfigForCSMRoles()))
+	}, testDirectory(t), false, "").WithAccessGuard(NewAccessGuard(testAccessConfigForCSMRoles()))
 
 	r := withUser(httptest.NewRequest(http.MethodGet, "/users/"+id, nil))
 	r.SetPathValue("id", id)
@@ -130,7 +130,7 @@ func TestGetUser_PortalRoles_SkippedWhenAccessGuardNotWired(t *testing.T) {
 		getUserFn: func(_ context.Context, _ string) ([]byte, error) {
 			return []byte(`{"id":"` + id + `","email":"staff@example.com","userType":"internal","roles":["admin"]}`), nil
 		},
-	}, testDirectory(t), false)
+	}, testDirectory(t), false, "")
 
 	r := withUser(httptest.NewRequest(http.MethodGet, "/users/"+id, nil))
 	r.SetPathValue("id", id)
@@ -162,7 +162,7 @@ func TestGetUser_PortalRoles_FailureDoesNotFailTheRequest(t *testing.T) {
 		getUserFn: func(_ context.Context, _ string) ([]byte, error) {
 			return []byte(`{"id":"` + id + `","email":"staff@example.com","userType":"internal","roles":["admin"]}`), nil
 		},
-	}, testDirectory(t), false).WithAccessGuard(NewAccessGuard(testAccessConfigForCSMRoles()))
+	}, testDirectory(t), false, "").WithAccessGuard(NewAccessGuard(testAccessConfigForCSMRoles()))
 
 	r := withUser(httptest.NewRequest(http.MethodGet, "/users/"+id, nil))
 	r.SetPathValue("id", id)

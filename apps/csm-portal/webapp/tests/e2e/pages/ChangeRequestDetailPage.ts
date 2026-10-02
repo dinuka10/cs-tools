@@ -18,10 +18,16 @@ import { type Locator, type Page, expect } from "@playwright/test";
 
 /**
  * Page object for `/operations/change-requests/:id`
- * (`CsmChangeRequestDetailPage.tsx`). "Request approval" is only rendered
- * when the CR's `legalNextStates` includes `"assess"` (data-driven — see
- * `canRequestApproval` in the source); it will be absent for a CR already
- * past that stage.
+ * (`CsmChangeRequestDetailPage.tsx`). "Move to Assess" is only rendered when
+ * the CR's `legalNextStates` includes `"assess"` (data-driven, via
+ * `ChangeRequestActionBar`'s own `legalNextStates` filtering); it will be
+ * absent for a CR already past that stage. New -> Assess is a plain, direct
+ * state PATCH (`{state: "assess"}`) like every other forward transition in
+ * this bar — it used to be modeled as a special "approval request" action
+ * (`{requestApproval: true}`, labeled "Request approval"), which was
+ * backwards relative to the real ServiceNow process; that's fixed now, but
+ * the label/method names below were kept in sync with the source rather than
+ * left pointing at the old wording.
  */
 export class ChangeRequestDetailPage {
   constructor(private readonly page: Page) {}
@@ -44,12 +50,12 @@ export class ChangeRequestDetailPage {
     return this.page.getByRole("button", { name: "Back to change requests" });
   }
 
-  requestApprovalButton(): Locator {
-    return this.page.getByRole("button", { name: "Request approval" });
+  moveToAssessButton(): Locator {
+    return this.page.getByRole("button", { name: "Move to Assess" });
   }
 
-  async requestApproval(): Promise<void> {
-    await this.requestApprovalButton().click();
+  async moveToAssess(): Promise<void> {
+    await this.moveToAssessButton().click();
   }
 
   editButton(): Locator {

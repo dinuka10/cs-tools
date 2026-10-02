@@ -34,7 +34,7 @@ import {
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip as RTooltip, XAxis, YAxis } from "recharts";
 import { type StatSummary, fmtNumber, fmtDate, cleanJdkVersion } from "../utils/formatters";
 import { METRIC_CHART_CONFIG, METRIC_CHART_CONFIG_FALLBACK, CORE_CHART_CONFIG } from "../utils/usageMetricsProductClassifier";
-import type { SnInstancesResponse, SnDeployedProductMetricsResponse, SnDeployedProductUsageCountsResponse } from "../api/splUsageMetricsTypes";
+import type { SnInstancesResponse, SnDeployedProductMetricsResponse, SnDeployedProductUsageCountsResponse } from "../api/usageMetricsTypes";
 import { USAGE_ACCENT_FIXED } from "../utils/usageMetricsAccent";
 
 const MAX_HEADER_TILES = 4;

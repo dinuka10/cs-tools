@@ -75,11 +75,11 @@ type Incident struct {
 	CSMPermanentlyFailed bool `json:"csm_permanently_failed" db:"csm_permanently_failed"`
 	// CSMLastAttemptAt backs CSMRetryDue's exponential backoff, so RetrySweep doesn't hit CSM every sweep during an outage.
 	CSMLastAttemptAt time.Time `json:"csm_last_attempt_at" db:"csm_last_attempt_at"`
+	// Version fences mutating writes so a replica whose lease expired mid-operation can't overwrite a newer leader's update.
+	Version int64 `json:"-" db:"version"`
 }
 
-// CSMRetryDue reports whether enough time has passed since the last CSM attempt to try again,
-// growing the wait exponentially (base, base*mult, base*mult^2, ...) capped at maxDelay, so a
-// prolonged CSM outage doesn't get hit every sweep interval forever.
+// CSMRetryDue reports whether enough time has passed since the last CSM attempt, growing the wait exponentially (base, base*mult, ...) capped at maxDelay.
 func (i Incident) CSMRetryDue(now time.Time, base time.Duration, multiplier float64, maxDelay time.Duration) bool {
 	if i.CSMAttempts == 0 {
 		return true // never attempted yet
@@ -188,13 +188,20 @@ func ImpactUrgency(severityNum int) (impact, urgency string) {
 	}
 }
 
-// BuildWorkNote formats a work note as HTML, referencing the alert by id rather than instance URL.
-// The workNotes field is HTML-sourced, so plain "\n" newlines render as a single unbroken line.
+// BuildWorkNote formats a work note as HTML (referencing the alert by id), since workNotes is HTML-sourced and plain "\n" would render as one unbroken line.
 func BuildWorkNote(kind, alertID, metricName, source string) string {
 	metricName = firstNonEmpty(metricName, "N/A")
 	source = firstNonEmpty(source, "N/A")
 	return fmt.Sprintf("%s alert received.<br>Alert: %s<br>Metric: %s<br>Source: %s",
 		html.EscapeString(kind), html.EscapeString(alertID), html.EscapeString(metricName), html.EscapeString(source))
+}
+
+// BuildChatAnnotationText formats a Duplicate/OK annotation's body for the Chat card, omitting the alert id since the card no longer carries a header naming the incident to repeat it against.
+func BuildChatAnnotationText(kind, metricName, source string) string {
+	metricName = firstNonEmpty(metricName, "N/A")
+	source = firstNonEmpty(source, "N/A")
+	return fmt.Sprintf("<b>%s alert received.</b><br>Metric: %s<br>Source: %s",
+		html.EscapeString(kind), html.EscapeString(metricName), html.EscapeString(source))
 }
 
 // kv preserves field order in HTML tables (Go map iteration is random).

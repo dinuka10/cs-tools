@@ -20,12 +20,14 @@ package csm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/sony/gobreaker/v2"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
 
@@ -34,6 +36,12 @@ import (
 
 // tokenFetchTimeout is the HTTP client timeout for token-endpoint requests.
 var tokenFetchTimeout = 10 * time.Second
+
+// breakerOpenTimeout is how long the breaker stays open before allowing one probe request through.
+const breakerOpenTimeout = 30 * time.Second
+
+// breakerConsecutiveFailures trips the breaker after this many back-to-back failures.
+const breakerConsecutiveFailures = 5
 
 type ctxKey string
 
@@ -61,6 +69,8 @@ type Config struct {
 type Client struct {
 	http    *http.Client
 	baseURL string
+	// breaker trips after a run of failures so a confirmed outage fails fast instead of retrying against a known-down downstream.
+	breaker *gobreaker.CircuitBreaker[[]byte]
 }
 
 // NewClient constructs a Client using the OAuth2 client-credentials grant.
@@ -90,48 +100,83 @@ func NewClient(cfg Config) *Client {
 	return &Client{
 		http:    httpClient,
 		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
+		breaker: newBreaker(),
 	}
 }
 
-// do executes an authenticated request; the caller owns the returned response body slice.
+// newBreaker excludes a non-retryable 4xx and genuine caller cancellation from tripping the breaker, but not a bare http.Client timeout, which must count as a real CSM-is-down failure.
+func newBreaker() *gobreaker.CircuitBreaker[[]byte] {
+	return gobreaker.NewCircuitBreaker[[]byte](gobreaker.Settings{
+		Name:    "csm",
+		Timeout: breakerOpenTimeout,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			return counts.ConsecutiveFailures >= breakerConsecutiveFailures
+		},
+		IsExcluded: func(err error) bool {
+			if errors.Is(err, errCallerDone) {
+				return true
+			}
+			var apiErr *apierror.Error
+			if errors.As(err, &apiErr) {
+				return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusTooManyRequests
+			}
+			return false
+		},
+	})
+}
+
+// errCallerDone marks a failure as caused by the caller's own ctx, not an http.Client-level timeout.
+var errCallerDone = errors.New("csm: caller context canceled or deadline exceeded")
+
+// do executes an authenticated request through the circuit breaker (caller owns the returned body slice); when open it returns gobreaker.ErrOpenState with no network call, which callers already treat as retryable.
 func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
-	var reqBody io.Reader
-	if len(body) > 0 {
-		reqBody = bytes.NewReader(body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("csm: build request %s %s: %w", method, path, err)
-	}
-	if len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if id := correlationIDFromContext(ctx); id != "" {
-		req.Header.Set("X-CSM-Correlation-ID", id)
-	}
-
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("csm: %s %s: %w", method, path, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		const maxErrBody = 256
-		excerpt, err := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))
-		if err != nil {
-			return nil, fmt.Errorf("csm: read error response body: %w", err)
+	return c.breaker.Execute(func() ([]byte, error) {
+		var reqBody io.Reader
+		if len(body) > 0 {
+			reqBody = bytes.NewReader(body)
 		}
-		return nil, &apierror.Error{StatusCode: resp.StatusCode, Body: string(excerpt)}
-	}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("csm: read response body: %w", err)
-	}
+		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reqBody)
+		if err != nil {
+			return nil, fmt.Errorf("csm: build request %s %s: %w", method, path, err)
+		}
+		if len(body) > 0 {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		if id := correlationIDFromContext(ctx); id != "" {
+			req.Header.Set("X-CSM-Correlation-ID", id)
+		}
 
-	return respBody, nil
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, wrapCallerDone(ctx, fmt.Errorf("csm: %s %s: %w", method, path, err))
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			const maxErrBody = 256
+			excerpt, err := io.ReadAll(io.LimitReader(resp.Body, maxErrBody))
+			if err != nil {
+				return nil, wrapCallerDone(ctx, fmt.Errorf("csm: read error response body: %w", err))
+			}
+			return nil, &apierror.Error{StatusCode: resp.StatusCode, Body: string(excerpt)}
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, wrapCallerDone(ctx, fmt.Errorf("csm: read response body: %w", err))
+		}
+
+		return respBody, nil
+	})
+}
+
+// wrapCallerDone wraps err with errCallerDone only if ctx itself is done, so an http.Client timeout stays a plain error (counts as a breaker failure) while genuine caller cancellation is excluded.
+func wrapCallerDone(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("%w: %w", errCallerDone, err)
+	}
+	return err
 }
 
 // httpsOnlyTransport blocks non-HTTPS requests since this client always carries a secret or bearer token.

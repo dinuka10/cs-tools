@@ -317,16 +317,30 @@ func TestDeployedProductService_UpdateDeployedProduct_RejectsInvalidRequest(t *t
 	}
 }
 
-func TestDeployedProductService_SearchDeployedProducts_RejectsProductCategories(t *testing.T) {
-	svc := NewDeployedProductService(&stubDeployedProductRepo{})
+// TestDeployedProductService_SearchDeployedProducts_ForwardsProductCategories
+// guards against a regression CodeRabbit caught on PR #2189: once
+// SearchDeployedProducts stopped delegating to ServiceNow under dual-write
+// (see that method's own doc comment), ProductCategories had nowhere to go
+// but the Postgres repository -- the category predicate is implemented
+// there (deployed_product_repo.go), so the service must forward the filter
+// rather than reject it.
+func TestDeployedProductService_SearchDeployedProducts_ForwardsProductCategories(t *testing.T) {
+	var gotCategories []string
+	svc := NewDeployedProductService(&stubDeployedProductRepo{
+		searchDeployedProducts: func(ctx context.Context, req domain.SearchDeployedProductsRequest) ([]domain.DeployedProductView, int, error) {
+			gotCategories = req.ProductCategories
+			return nil, 0, nil
+		},
+	})
 
 	_, err := svc.SearchDeployedProducts(context.Background(), domain.SearchDeployedProductsRequest{
 		ProductCategories: []string{"pdp"},
 	})
-
-	var ve *apierror.ValidationError
-	if !asValidationError(err, &ve) {
-		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(gotCategories) != 1 || gotCategories[0] != "pdp" {
+		t.Fatalf("expected ProductCategories [\"pdp\"] to reach the repository, got %v", gotCategories)
 	}
 }
 

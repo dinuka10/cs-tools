@@ -82,6 +82,8 @@ type MembershipWriteDeps struct {
 	// nil, in which case invitations are not checked beyond the request's
 	// own shape.
 	Invitations InvitationValidator
+	// Admins says whether a customer caller is an account admin; nil refuses every customer.
+	Admins repository.AccountAdminRepository
 }
 
 type projectMembershipWriteService struct {
@@ -112,24 +114,31 @@ func NewProjectMembershipWriteService(deps MembershipWriteDeps) ProjectMembershi
 	return &projectMembershipWriteService{deps: deps}
 }
 
-// requireInternalCaller gates every method on an allow-listed internal client
-// (AUTH_INTERNAL_CLIENT_IDS), exactly as the onboarding-step endpoints do.
-//
-// A portal END USER must never reach these directly: whether this particular
-// customer admin may invite this particular person into this particular
-// project is the portal backend's decision, made against the account it has
-// already scoped the session to. This service only knows that the caller is
-// one of the portal backends, and deliberately does not re-derive that
-// authorization from a forwarded user token.
-func (s *projectMembershipWriteService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.deps.Access.ResolveScope(ctx)
+// msgNotAccountAdmin refuses a customer who can see the project but isn't an account admin.
+const msgNotAccountAdmin = "only an account admin can manage this project's contacts"
+
+// authorizeMembershipWrite allows trusted callers, and customers REGISTERED on the project who hold
+// customer_admin/partner_admin. For a customer it returns their email, used as the inviter.
+func (s *projectMembershipWriteService) authorizeMembershipWrite(ctx context.Context, projectID string) (customerEmail string, err error) {
+	scope, err := authorizeProject(ctx, s.deps.Access, projectID)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "membership writes are only available to internal services"}
+	if scope.Unrestricted {
+		return "", nil
 	}
-	return nil
+	email := strings.TrimSpace(scope.ViewerEmail)
+	if email == "" || s.deps.Admins == nil {
+		return "", &apierror.ForbiddenError{Msg: msgNotAccountAdmin}
+	}
+	isAdmin, err := s.deps.Admins.HoldsAccountAdminRole(ctx, email)
+	if err != nil {
+		return "", err
+	}
+	if !isAdmin {
+		return "", &apierror.ForbiddenError{Msg: msgNotAccountAdmin}
+	}
+	return email, nil
 }
 
 // Membership write operation names. They key the caller-facing message a
@@ -216,11 +225,12 @@ func requireSalesforceLinks(ctx context.Context, operation string, wc repository
 
 // Invite implements ProjectMembershipWriteService.
 func (s *projectMembershipWriteService) Invite(ctx context.Context, projectID string, req domain.CreateProjectMembershipRequest) (domain.ProjectMembership, error) {
-	if err := s.requireInternalCaller(ctx); err != nil {
+	customerEmail, err := s.authorizeMembershipWrite(ctx, projectID)
+	if err != nil {
 		return domain.ProjectMembership{}, err
 	}
-	if err := validateUUIDs("id", []string{projectID}); err != nil {
-		return domain.ProjectMembership{}, err
+	if customerEmail != "" {
+		req.InviterEmail = customerEmail
 	}
 	email, err := normalizeMembershipEmail(req.Email)
 	if err != nil {
@@ -273,6 +283,11 @@ func (s *projectMembershipWriteService) Invite(ctx context.Context, projectID st
 		if err != nil {
 			return domain.SalesforceMembershipUpsert{}, domain.UpsertOnboardingStepRequest{}, err
 		}
+		if rec.StoredState == domain.MembershipStateRegistered {
+			// The contact has signed in before, so Salesforce saved REGISTERED;
+			// store that too, so the echo finds no INVITED -> REGISTERED Welcome.
+			in.State, rec.State = rec.StoredState, rec.StoredState
+		}
 		written = rec
 		return in, membershipStep(in, rec), nil
 	})
@@ -316,11 +331,12 @@ const msgAlreadyProjectContact = "this address is already a contact on the proje
 // Invite checks everything again, so this is advice to the person inviting,
 // never a guarantee.
 func (s *projectMembershipWriteService) ValidateInvitation(ctx context.Context, projectID string, req domain.ValidateProjectMembershipRequest) (domain.ProjectMembershipValidation, error) {
-	if err := s.requireInternalCaller(ctx); err != nil {
+	customerEmail, err := s.authorizeMembershipWrite(ctx, projectID)
+	if err != nil {
 		return domain.ProjectMembershipValidation{}, err
 	}
-	if err := validateUUIDs("id", []string{projectID}); err != nil {
-		return domain.ProjectMembershipValidation{}, err
+	if customerEmail != "" {
+		req.InviterEmail = customerEmail
 	}
 	email, err := normalizeMembershipEmail(req.Email)
 	if err != nil {
@@ -423,10 +439,7 @@ func validatedInvitee(c salesentity.Contact) *domain.ValidatedInvitee {
 
 // UpdateRoles implements ProjectMembershipWriteService.
 func (s *projectMembershipWriteService) UpdateRoles(ctx context.Context, projectID, email string, req domain.UpdateProjectMembershipRolesRequest) (domain.ProjectMembership, error) {
-	if err := s.requireInternalCaller(ctx); err != nil {
-		return domain.ProjectMembership{}, err
-	}
-	if err := validateUUIDs("id", []string{projectID}); err != nil {
+	if _, err := s.authorizeMembershipWrite(ctx, projectID); err != nil {
 		return domain.ProjectMembership{}, err
 	}
 	normalized, err := normalizeMembershipEmail(email)
@@ -480,10 +493,7 @@ func (s *projectMembershipWriteService) UpdateRoles(ctx context.Context, project
 
 // Deactivate implements ProjectMembershipWriteService.
 func (s *projectMembershipWriteService) Deactivate(ctx context.Context, projectID, email string) error {
-	if err := s.requireInternalCaller(ctx); err != nil {
-		return err
-	}
-	if err := validateUUIDs("id", []string{projectID}); err != nil {
+	if _, err := s.authorizeMembershipWrite(ctx, projectID); err != nil {
 		return err
 	}
 	normalized, err := normalizeMembershipEmail(email)
@@ -527,10 +537,7 @@ func (s *projectMembershipWriteService) Deactivate(ctx context.Context, projectI
 
 // ResendInvitation implements ProjectMembershipWriteService.
 func (s *projectMembershipWriteService) ResendInvitation(ctx context.Context, projectID, email string) error {
-	if err := s.requireInternalCaller(ctx); err != nil {
-		return err
-	}
-	if err := validateUUIDs("id", []string{projectID}); err != nil {
+	if _, err := s.authorizeMembershipWrite(ctx, projectID); err != nil {
 		return err
 	}
 	normalized, err := normalizeMembershipEmail(email)
@@ -660,6 +667,9 @@ type salesforceWriteRecord struct {
 	Roles             []string
 	CreatedContact    bool
 	CreatedMembership bool
+	// StoredState is the state Salesforce returned after this write ("" when
+	// it returned none); its automation may differ from the requested state.
+	StoredState string
 	// The rest is what project_contact.invited needs, captured here because
 	// the Salesforce contact and the project are both already in hand at
 	// that point and neither is worth re-reading after the commit.
@@ -696,6 +706,9 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 	var preWriteModified time.Time
 	var patched bool
 	var rec salesforceWriteRecord
+	// writtenRoles is the Role__c list Salesforce ends up with: the intent's
+	// roles, plus on an update the labels the portal does not manage.
+	writtenRoles := intent.Roles
 
 	var contact salesentity.Contact
 	var found bool
@@ -764,6 +777,7 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 			return domain.SalesforceMembershipUpsert{}, rec, err
 		}
 		rec.CreatedMembership = true
+		rec.StoredState = storedMembershipState(membership)
 	default:
 		var state *string
 		var roles *[]string
@@ -771,8 +785,16 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 			state = &intent.State
 		}
 		if intent.SetRoles {
-			r := intent.Roles
-			roles = &r
+			// Role__c is replaced as a whole list, and the portal owns only
+			// four of its labels. The rest (Business Contact, the D2 labels,
+			// anything newer) are set in Salesforce and must survive a
+			// portal edit, so they are read off the record just fetched.
+			merged, merr := mergePortalManagedRoles(intent.Roles, membership)
+			if merr != nil {
+				return domain.SalesforceMembershipUpsert{}, rec, merr
+			}
+			writtenRoles = merged
+			roles = &merged
 		}
 		if state != nil || roles != nil {
 			preWriteModified, _ = parseSalesforceLastModified(membership.LastModifiedDate)
@@ -787,6 +809,7 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 			}
 			if strings.TrimSpace(updated.ID) != "" {
 				membership = updated
+				rec.StoredState = storedMembershipState(membership)
 			}
 		}
 	}
@@ -795,7 +818,7 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 		return domain.SalesforceMembershipUpsert{}, rec, &apierror.ServiceUnavailableError{Msg: "sales/sales-entity-service returned a membership with no id"}
 	}
 	rec.State = intent.State
-	rec.Roles = intent.Roles
+	rec.Roles = writtenRoles
 	modified, ok := parseSalesforceLastModified(membership.LastModifiedDate)
 	switch {
 	case patched && (!ok || !modified.After(preWriteModified)):
@@ -825,7 +848,10 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 
 	groups := intent.Groups
 	if groups == nil {
-		groups, _ = mapProjectGroups(intent.Roles)
+		// From what Salesforce now holds, so a preserved Business Contact
+		// keeps its group here too rather than waiting for an echo that
+		// the version stamp below suppresses.
+		groups, _ = mapProjectGroups(writtenRoles)
 	}
 	// The Salesforce value wins for a contact that already existed. For one
 	// this call just CREATED, POST /contacts is only contracted to return an
@@ -836,7 +862,11 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 	if rec.CreatedContact && contact.IsCsIntegrationUser == nil {
 		isIntegrationUser = intent.IsCsIntegrationUser
 	}
-	globalRoles, managed, adminRole := mapGlobalRoles(membershipType, isIntegrationUser)
+	// customer/partner follow the contact's account classification, as in
+	// the ingest. A contact this call just created carries no account in
+	// the create response; mapGlobalRoles then treats it as a customer
+	// without revoking anything.
+	globalRoles := mapGlobalRoles(contact.Account, isIntegrationUser)
 
 	first, last := strings.TrimSpace(derefString(contact.FirstName)), strings.TrimSpace(derefString(contact.LastName))
 	if first == "" && last == "" {
@@ -869,11 +899,22 @@ func (s *projectMembershipWriteService) writeSalesforce(ctx context.Context, wc 
 		IsCsIntegrationUser: isIntegrationUser,
 		ProjectSfID:         wc.Target.ProjectSfID,
 		ProjectKey:          wc.Target.ProjectKey,
-		GlobalRoles:         globalRoles,
-		ManagedAdminRoles:   managed,
-		AdminRoleName:       adminRole,
+		GlobalRoles:         globalRoles.Grant,
+		ManagedGlobalRoles:  globalRoles.ManagedGlobal,
+		ManagedAdminRoles:   globalRoles.ManagedAdmin,
+		AdminRoleName:       globalRoles.AdminRole,
 		ProjectGroups:       groups,
 	}, rec, nil
+}
+
+// storedMembershipState is the membership's Salesforce state when it is a
+// known one, else "".
+func storedMembershipState(pc salesentity.ProjectContact) string {
+	state, err := normalizeMembershipState(derefString(pc.State))
+	if err != nil {
+		return ""
+	}
+	return state
 }
 
 // membershipStep is the DATABASE onboarding step a portal write records, in
@@ -904,7 +945,8 @@ func (s *projectMembershipWriteService) publishInvited(ctx context.Context, m do
 	if s.deps.Publisher == nil {
 		return
 	}
-	if m.State != domain.MembershipStateInvited && m.State != domain.MembershipStateReInvited {
+	// REGISTERED here is a new membership of a contact who already signed in.
+	if m.State != domain.MembershipStateInvited && m.State != domain.MembershipStateReInvited && m.State != domain.MembershipStateRegistered {
 		return
 	}
 	payload, err := json.Marshal(events.ProjectContactInvitedPayload{
@@ -1045,6 +1087,53 @@ func canonicalSalesforceRoles(raw []string) ([]string, error) {
 		}
 		seen[label] = true
 		out = append(out, label)
+	}
+	return out, nil
+}
+
+// mergePortalManagedRoles is the Role__c list a portal role edit writes to
+// an existing Salesforce membership: the requested portal-managed labels
+// (validSalesforceRoles: Portal user, Security Contact, Lead, Admin) first,
+// then every other label the membership already carries, in its stored
+// order — Business Contact, Business Owner/Promoter/Detractor, Technical
+// Owner/Champion/Detractor, and any label this service has never seen. A
+// portal-managed label the request leaves out is removed; nothing else is.
+//
+// The current list comes from the record the write path just fetched:
+// roles (Sales Entity documents it as never null), else the raw
+// semicolon-separated role. When the record carries neither, the current
+// roles are unknown, and writing the requested list would silently erase
+// whatever Salesforce holds, so the write fails instead (503: the caller
+// may retry once Sales Entity answers in full).
+func mergePortalManagedRoles(requested []string, current salesentity.ProjectContact) ([]string, error) {
+	var existing []string
+	switch {
+	case current.Roles != nil:
+		existing = current.Roles
+	case current.Role != nil:
+		existing = splitSalesforceRoles(*current.Role)
+	default:
+		return nil, &apierror.ServiceUnavailableError{Msg: "the Salesforce membership's current roles could not be read; not overwriting them"}
+	}
+	out := make([]string, 0, len(requested)+len(existing))
+	seen := map[string]bool{}
+	add := func(label string) {
+		label = strings.TrimSpace(label)
+		key := strings.ToLower(label)
+		if key == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, label)
+	}
+	for _, r := range requested {
+		add(r)
+	}
+	for _, r := range existing {
+		if _, managed := validSalesforceRoles[strings.ToLower(strings.TrimSpace(r))]; managed {
+			continue
+		}
+		add(r)
 	}
 	return out, nil
 }

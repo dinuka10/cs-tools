@@ -93,11 +93,19 @@ func slaBreachColor(tier string) string {
 }
 
 // SendSLABreachAlert posts a card announcing that an SLA clock has crossed
-// a tier (50%, 75%, or 100% elapsed), to the Google Chat space configured
-// for product. Called directly from internal/slaengine.Engine, not routed
-// through internal/dispatch (see that package's own CLAUDE.md note: there
-// is no dispatch.go reaction for SLA events at all — slaengine owns
-// sending this itself).
+// a tier (50%, 75%, or 100% elapsed) to the Chat audience space configured
+// for audience — routes on team/standing-audience, not product, per
+// explicit product direction: SLA breach alerts (and, eventually, a
+// customer-frustration-detector alert) are the only Chat-sending event
+// types that route this way; every other type (case.created/
+// case.acknowledged/case.severity_changed/incident.created) still routes
+// by product to a single configured default space. The caller
+// (internal/slaengine.Engine) resolves the audience list itself (see
+// internal/chataudience.Resolve) and posts once per resolved audience.
+// Called directly from
+// internal/slaengine.Engine, not routed through internal/dispatch (see
+// that package's own CLAUDE.md note: there is no dispatch.go reaction for
+// SLA events at all — slaengine owns sending this itself).
 //
 // Two things distinguish this card from every case.*/incident.* alert
 // elsewhere in this file — both matching the reference mockups this was
@@ -110,6 +118,10 @@ func slaBreachColor(tier string) string {
 //     something the case.*/incident.created cards happen to use
 //     themselves.
 //
+// teamLeadName, when non-empty, is appended to the Team line in parens
+// ("<team> (<lead>)") — "" leaves the Team line as the bare team name, same
+// convention as the SLA breach team email's own Team line.
+//
 // Header wording distinguishes a genuine breach from an early warning:
 // "[<SEVERITY>] <ClockTypeLabel> SLA Violation - <caseRef>" at 100%
 // elapsed (severity uppercase, unresolved — e.g. "CRITICAL", not the
@@ -117,7 +129,7 @@ func slaBreachColor(tier string) string {
 // "<ClockTypeLabel> SLA at Risk - <caseRef>" at 50/75%. No Subtitle: unlike
 // the case.*/incident.* cards, this card's header is the whole heading on
 // one line.
-func (c *GoogleChatClient) SendSLABreachAlert(ctx context.Context, product, clockType, tier, caseNumber, wso2CaseID, caseTitle, caseType, productName, team, severity, state, openedAt, caseLink string) error {
+func (c *GoogleChatClient) SendSLABreachAlert(ctx context.Context, audience, clockType, tier, caseNumber, wso2CaseID, caseTitle, caseType, productName, team, teamLeadName, severity, state, openedAt, caseLink string) error {
 	if caseNumber == "" {
 		return fmt.Errorf("notifications: caseNumber is required")
 	}
@@ -148,7 +160,11 @@ func (c *GoogleChatClient) SendSLABreachAlert(ctx context.Context, product, cloc
 		lines = append(lines, caseAlertLine(`<b>Product :</b> %s`, productName))
 	}
 	if team != "" {
-		lines = append(lines, caseAlertLine(`<b>Team :</b> <b>%s</b>`, team))
+		teamDisplay := team
+		if teamLeadName != "" {
+			teamDisplay = team + " (" + teamLeadName + ")"
+		}
+		lines = append(lines, caseAlertLine(`<b>Team :</b> <b>%s</b>`, teamDisplay))
 	}
 	lines = append(lines, caseAlertLine(`<b>Priority :</b> <font color="%s">%s</font>`, severityColor, severityLabel))
 	if state != "" {
@@ -187,5 +203,5 @@ func (c *GoogleChatClient) SendSLABreachAlert(ctx context.Context, product, cloc
 			},
 		},
 	}
-	return c.sendCard(ctx, product, msg)
+	return c.sendCardToAudience(ctx, audience, msg)
 }

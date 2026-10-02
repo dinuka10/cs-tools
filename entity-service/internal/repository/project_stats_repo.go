@@ -23,7 +23,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // StateCount is one state group of a stats aggregation. State is empty for a
@@ -86,7 +85,11 @@ type ProjectStatsRepository interface {
 	// OutstandingCounts returns the per-type counts of work items in an
 	// outstanding state: caseStates for the five case-like types, crStates
 	// for change requests (the two sets differ -- see the service's own
-	// constants).
+	// constants). The announcement count this returns comes from a query
+	// joining `announcement`, which is RLS-protected (migration 000085) --
+	// Scoped carries the caller's real identity (from ctx) into that same
+	// transaction automatically, so the count only ever includes
+	// announcements the caller is otherwise entitled to see.
 	OutstandingCounts(ctx context.Context, projectID string, caseStates, crStates []string) (map[string]int, error)
 
 	// SLAStatusInputs evaluates the four projectSLAStatus conditions in one
@@ -108,11 +111,15 @@ type ProjectStatsRepository interface {
 }
 
 type projectStatsRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewProjectStatsRepository constructs a ProjectStatsRepository backed by the given connection pool.
-func NewProjectStatsRepository(db *pgxpool.Pool) ProjectStatsRepository {
+// NewProjectStatsRepository constructs a ProjectStatsRepository backed by
+// the given Scoped connection -- time_card's project-membership visibility
+// (migration 0144) and announcement's (migration 000085) are both
+// enforced entirely by Postgres RLS now, reading the caller's identity from
+// ctx automatically.
+func NewProjectStatsRepository(db *Scoped) ProjectStatsRepository {
 	return &projectStatsRepo{db: db}
 }
 
@@ -214,27 +221,38 @@ func (r *projectStatsRepo) LastDeploymentOn(ctx context.Context, projectID strin
 func (r *projectStatsRepo) OutstandingCounts(ctx context.Context, projectID string, caseStates, crStates []string) (map[string]int, error) {
 	out := make(map[string]int)
 
-	rows, err := r.db.Query(ctx, `
-		SELECT wi.type::TEXT, COUNT(*)
-		  FROM work_item wi
-		  LEFT JOIN "case" c ON c.id = wi.id`+caseLikeJoins+`
-		 WHERE wi.project_id = $1::uuid
-		   AND wi.type = ANY(`+caseLikeWorkItemTypes+`)
-		   AND `+caseLikeStateColumn+` = ANY($2)
-		 GROUP BY 1`, projectID, caseStates)
-	if err != nil {
-		return nil, fmt.Errorf("project stats: outstanding case counts: %w", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var t string
-		var n int
-		if err := rows.Scan(&t, &n); err != nil {
-			return nil, fmt.Errorf("project stats: scan outstanding count: %w", err)
+	// caseLikeJoins LEFT JOINs announcement, which is RLS-protected (migration
+	// 000085): without the caller's identity set in this same transaction, a
+	// restricted announcement's row is invisible to the join, ann.state comes
+	// back NULL, and caseLikeStateColumn's CASE/COALESCE then excludes it from
+	// every state filter -- undercounting outstanding announcements for a
+	// caller who is otherwise entitled to see them via project membership.
+	// Scoped.InTx sets that identity (read from ctx) once at the start of
+	// this transaction.
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT wi.type::TEXT, COUNT(*)
+			  FROM work_item wi
+			  LEFT JOIN "case" c ON c.id = wi.id`+caseLikeJoins+`
+			 WHERE wi.project_id = $1::uuid
+			   AND wi.type = ANY(`+caseLikeWorkItemTypes+`)
+			   AND `+caseLikeStateColumn+` = ANY($2)
+			 GROUP BY 1`, projectID, caseStates)
+		if err != nil {
+			return fmt.Errorf("project stats: outstanding case counts: %w", err)
 		}
-		out[strings.ToLower(t)] = n
-	}
-	if err := rows.Err(); err != nil {
+		defer rows.Close()
+		for rows.Next() {
+			var t string
+			var n int
+			if err := rows.Scan(&t, &n); err != nil {
+				return fmt.Errorf("project stats: scan outstanding count: %w", err)
+			}
+			out[strings.ToLower(t)] = n
+		}
+		return rows.Err()
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -267,7 +285,20 @@ func (r *projectStatsRepo) SLAStatusInputs(ctx context.Context, projectID string
 		  ),
 		  EXISTS (SELECT 1 FROM deployed_product WHERE project_id = $1::uuid AND active IS TRUE),
 		  EXISTS (SELECT 1 FROM project WHERE id = $1::uuid AND end_date IS NOT NULL AND end_date >= CURRENT_DATE),
-		  EXISTS (
+		  `+hasCustomerAdminContactExists, projectID).
+		Scan(&in.HasOutstandingCase, &in.HasDeployedProduct, &in.HasActiveEndDate, &in.HasCustomerAdminContact)
+	if err != nil {
+		return ProjectSLAStatusInputs{}, fmt.Errorf("project stats: sla status: %w", err)
+	}
+	return in, nil
+}
+
+// hasCustomerAdminContactExists is SLAStatusInputs' customer-admin check: a
+// live contact of this project resolves to a user holding customer_admin.
+// DEACTIVATED memberships do not count -- the Salesforce ingest keeps a
+// removed contact as a DEACTIVATED row, and someone removed from this project
+// who is an admin elsewhere is not this project's admin contact.
+const hasCustomerAdminContactExists = `EXISTS (
 		    SELECT 1
 		      FROM project_contact pc
 		      JOIN account_contact ac ON ac.id = pc.account_contact_id
@@ -275,13 +306,8 @@ func (r *projectStatsRepo) SLAStatusInputs(ctx context.Context, projectID string
 		      JOIN user_role ur ON ur.user_id = u.id
 		      JOIN role rl ON rl.id = ur.role_id
 		     WHERE pc.project_id = $1::uuid AND rl.name = 'customer_admin'
-		  )`, projectID).
-		Scan(&in.HasOutstandingCase, &in.HasDeployedProduct, &in.HasActiveEndDate, &in.HasCustomerAdminContact)
-	if err != nil {
-		return ProjectSLAStatusInputs{}, fmt.Errorf("project stats: sla status: %w", err)
-	}
-	return in, nil
-}
+		       AND (pc.state IS NULL OR pc.state <> 'DEACTIVATED'::project_contact_state_enum)
+		  )`
 
 // ConversationStateCounts implements ProjectStatsRepository.
 func (r *projectStatsRepo) ConversationStateCounts(ctx context.Context, projectID, createdBy string) ([]StateCount, error) {

@@ -47,9 +47,12 @@ INSERT INTO account (id, created_on, updated_on, created_by, updated_by, name, n
   ('00000000-0000-0000-0000-000000000301', now(), now(), 'seed', 'seed', 'Example Corp', 'ACC-0001', 'SF-0001', '00000000-0000-0000-0000-000000000001', 'United States', 'Mountain View', 'https://drive.example.com/example-corp')
 ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO project (id, created_on, updated_on, created_by, updated_by, key, sf_id, name, account_id, is_active) VALUES
-  ('00000000-0000-0000-0000-000000000401', now(), now(), 'seed', 'seed', 'EXCORP-PROJ-1', 'SF-PROJ-0001', 'Example Corp Production', '00000000-0000-0000-0000-000000000301', true)
-ON CONFLICT (id) DO NOTHING;
+-- project_type_id is set (a3 = "Subscription", from the project_type fixture) because the
+-- customer portal treats a project with no type as "type not loaded" and then offers no
+-- deployments in the create-case form.
+INSERT INTO project (id, created_on, updated_on, created_by, updated_by, key, sf_id, name, account_id, is_active, project_type_id) VALUES
+  ('00000000-0000-0000-0000-000000000401', now(), now(), 'seed', 'seed', 'EXCORP-PROJ-1', 'SF-PROJ-0001', 'Example Corp Production', '00000000-0000-0000-0000-000000000301', true, '00000000-0000-0000-0000-0000000000a3')
+ON CONFLICT (id) DO UPDATE SET project_type_id = COALESCE(project.project_type_id, EXCLUDED.project_type_id);
 
 INSERT INTO deployment (id, created_on, updated_on, created_by, updated_by, number, name, type, is_active, project_id) VALUES
   ('00000000-0000-0000-0000-000000000501', now(), now(), 'seed', 'seed', 'DEP-0001', 'Production', 'PRIMARY_PRODUCTION', true, '00000000-0000-0000-0000-000000000401')
@@ -60,8 +63,10 @@ INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by, numbe
   ('00000000-0000-0000-0000-000000000601', now(), now(), 'seed', 'seed', 'CASE-0001', 'CASE-0001', 'Sample case seeded for local dev', 'CASE', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000501', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed data for docker-compose local dev stack.')
 ON CONFLICT (id) DO NOTHING;
 
+-- work_state is NULL: an OPEN case has not been started. ONGOING here would also make
+-- jane.doe (its assignee) fail every later "Resume work" with "already has an Ongoing case".
 INSERT INTO "case" (id, severity, issue_type, state, current_escalation_level, is_escalated, work_state) VALUES
-  ('00000000-0000-0000-0000-000000000601', 'S3', 'QUESTION', 'OPEN', 'EL0', false, 'ONGOING')
+  ('00000000-0000-0000-0000-000000000601', 'S3', 'QUESTION', 'OPEN', 'EL0', false, NULL)
 ON CONFLICT (id) DO NOTHING;
 
 -- One comment on the seeded case.
@@ -75,8 +80,12 @@ INSERT INTO time_card (id, created_on, updated_on, created_by, updated_by, case_
 ON CONFLICT (id) DO NOTHING;
 
 -- One ABT team with both seeded users as members, for GET /teams/{id}/members.
-INSERT INTO team (id, created_on, updated_on, created_by, updated_by, name, type) VALUES
-  ('00000000-0000-0000-0000-000000000901', now(), now(), 'seed', 'seed', 'Example Corp ABT', 'ABT')
+-- key is required (migration 000101_schedule_team_key_catalogue.up.sql added
+-- it NOT NULL) -- lower(name), matching that migration's own backfill
+-- convention for a row that predates it, since this one is inserted fresh
+-- after every migration has already run.
+INSERT INTO team (id, created_on, updated_on, created_by, updated_by, name, type, key) VALUES
+  ('00000000-0000-0000-0000-000000000901', now(), now(), 'seed', 'seed', 'Example Corp ABT', 'ABT', 'example corp abt')
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id) VALUES

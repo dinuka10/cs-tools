@@ -25,6 +25,7 @@ import (
 	"net/http"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
 // entityScheduleClient abstracts the entity service Team Schedule operations.
@@ -359,4 +360,54 @@ func (h *ScheduleHandler) GetScheduleEditMarkers(w http.ResponseWriter, r *http.
 	}
 
 	writeJSON(w, http.StatusOK, result)
+}
+
+// viewerScheduleClient abstracts the ServiceNow ABT team schedule operation
+// used by ViewerScheduleHandler.
+type viewerScheduleClient interface {
+	GetABTTeamSchedule(ctx context.Context, from, duration, teamID, eventType, teamScheduleURL string) (servicenow.ABTTeamScheduleData, error)
+}
+
+// ViewerScheduleHandler handles HTTP requests for the ABT team schedule,
+// delegating to the ServiceNow service.
+type ViewerScheduleHandler struct {
+	servicenow      viewerScheduleClient
+	accessGuard     *AccessGuard
+	teamScheduleURL string
+}
+
+// NewViewerScheduleHandler creates a ViewerScheduleHandler backed by the given
+// ServiceNow client. accessGuard enforces PermViewerAccess, SupportPortalLite's
+// blanket audience gate; teamScheduleURL is the static URL echoed back in
+// every response (TEAM_SCHEDULE_URL).
+func NewViewerScheduleHandler(sn viewerScheduleClient, accessGuard *AccessGuard, teamScheduleURL string) *ViewerScheduleHandler {
+	return &ViewerScheduleHandler{servicenow: sn, accessGuard: accessGuard, teamScheduleURL: teamScheduleURL}
+}
+
+// GetABTTeamSchedule handles GET /abt-team-schedule. All query
+// parameters are optional, mirroring the Ballerina resource function's
+// `string?` parameters.
+func (h *ViewerScheduleHandler) GetABTTeamSchedule(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
+	if !ok {
+		return
+	}
+
+	q := r.URL.Query()
+	from, duration, teamID, eventType := q.Get("from"), q.Get("duration"), q.Get("teamId"), q.Get("eventType")
+	if teamID != "" {
+		if err := servicenow.SanitizeQueryValue(teamID); err != nil {
+			writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+			return
+		}
+	}
+
+	schedule, err := h.servicenow.GetABTTeamSchedule(r.Context(), from, duration, teamID, eventType, h.teamScheduleURL)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "servicenow GetABTTeamSchedule failed", "userID", user.UserID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to retrieve team schedule.")
+		return
+	}
+
+	writeJSONValue(w, http.StatusOK, schedule)
 }

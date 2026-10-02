@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/servicenow"
 )
 
 var uuidRe = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
@@ -84,6 +85,9 @@ type entityCaseClient interface {
 	SearchFeedback(ctx context.Context, body []byte) ([]byte, error)
 	AggregateFeedback(ctx context.Context, body []byte) ([]byte, error)
 	GetCase(ctx context.Context, caseID string) ([]byte, error)
+	// GetProductRepoMapping calls GET /products/github-repo?name= on the
+	// entity service. The response is the GitHub repository for that product.
+	GetProductRepoMapping(ctx context.Context, name string) ([]byte, error)
 	CreateCaseAttachment(ctx context.Context, body []byte) ([]byte, error)
 	SearchCaseAttachments(ctx context.Context, body []byte) ([]byte, error)
 	GetCaseAttachmentContent(ctx context.Context, attachmentID string) ([]byte, string, error)
@@ -444,9 +448,46 @@ func (h *CaseHandler) CreateCaseComment(w http.ResponseWriter, r *http.Request) 
 
 	// Work notes are internal-only and exempt from the state gate.
 	var reqMeta struct {
-		Type string `json:"type"`
+		Type    string `json:"type"`
+		Content string `json:"content"`
 	}
 	_ = json.Unmarshal(body, &reqMeta) // body is already validated JSON
+
+	// The route's own permission (PermCreateWorkNote) is deliberately
+	// broader than this: it also admits a worknote_creator-only caller, who
+	// must NOT be able to post anything but a work_note. Narrow back down
+	// to full PermWrite for every other type -- see PermCreateWorkNote's
+	// own doc comment.
+	hasFullWrite := h.access != nil && h.access.Permits(PermWrite, user.Roles)
+	if reqMeta.Type != "work_note" && !hasFullWrite {
+		writeError(w, http.StatusForbidden, ErrMsgForbidden)
+		return
+	}
+
+	// A worknote-creator-only caller is only ever allowed to reach here with
+	// type=work_note (just checked above) -- but body is still the
+	// caller-supplied raw bytes, forwarded to the entity service unchanged
+	// below. encoding/json's handling of a duplicate "type" key (last one
+	// wins) is an implementation detail, not a wire-format guarantee the
+	// entity service is bound by; if it parses the same bytes differently,
+	// a body like {"type":"comment","type":"work_note"} could pass this
+	// check yet be stored as a customer-visible comment. Rebuild the body
+	// from what THIS check actually approved rather than forwarding the
+	// ambiguous original, so there is no decoder for the two services to
+	// disagree on. Full-PermWrite callers are unaffected: they may post any
+	// type, so there is nothing narrower here to enforce for them.
+	if !hasFullWrite {
+		rebuilt, err := json.Marshal(struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		}{Type: "work_note", Content: reqMeta.Content})
+		if err != nil {
+			slog.ErrorContext(r.Context(), "failed to rebuild work-note comment body", "userID", user.UserID, "caseID", caseID, "err", err)
+			writeError(w, http.StatusInternalServerError, ErrMsgInternal)
+			return
+		}
+		body = rebuilt
+	}
 
 	if reqMeta.Type != "work_note" {
 		current, err := h.entity.GetCase(r.Context(), caseID)
@@ -1910,4 +1951,66 @@ func (h *CaseHandler) CreateCaseGithubIssue(w http.ResponseWriter, r *http.Reque
 	}
 
 	writeJSON(w, http.StatusCreated, result)
+}
+
+// viewerCaseClient abstracts the ServiceNow operations used by ViewerCaseHandler.
+// GetCases/GetCaseByNumber/GetCommentsAndWorknotes used to live here too,
+// backed first by ServiceNow and later by a Postgres translation layer --
+// both removed in favor of calling CS Portal's own POST /cases/search,
+// GET /cases/{id}, and POST /cases/{id}/comments/search directly (worknote
+// creation similarly merged onto POST /cases/{id}/comments, using the same
+// entity-service CommentType distinction CS Portal's own comment handler
+// already exposes -- see splWorknotesHandler's removal). Attachments have no
+// entity-service equivalent at all yet (no Postgres storage/backfill path),
+// so that one stays here, ServiceNow-backed, unmerged.
+type viewerCaseClient interface {
+	GetAttachmentsInfo(ctx context.Context, caseNumber string, offset, limit int) ([]servicenow.AttachmentInfo, error)
+}
+
+// ViewerCaseHandler handles HTTP requests for SupportPortalLite's case-
+// attachments endpoint -- the one piece of the case domain with no
+// Postgres/entity-service equivalent to merge onto (see viewerCaseClient's own
+// doc comment). Reading, searching, and commenting on cases now goes
+// through CS Portal's own /cases routes directly.
+type ViewerCaseHandler struct {
+	sn          viewerCaseClient
+	accessGuard *AccessGuard
+}
+
+// NewViewerCaseHandler creates a ViewerCaseHandler.
+func NewViewerCaseHandler(sn viewerCaseClient, accessGuard *AccessGuard) *ViewerCaseHandler {
+	return &ViewerCaseHandler{sn: sn, accessGuard: accessGuard}
+}
+
+// GetAttachmentsInfo handles GET /cases/{caseId}/attachments-info.
+func (h *ViewerCaseHandler) GetAttachmentsInfo(w http.ResponseWriter, r *http.Request) {
+	user, ok := requireViewerAccess(w, r, h.accessGuard)
+	if !ok {
+		return
+	}
+	caseID := r.PathValue("caseId")
+	if caseID == "" {
+		writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+		return
+	}
+	offset, limit, ok := parsePaginationParams(w, r)
+	if !ok {
+		return
+	}
+
+	result, err := h.sn.GetAttachmentsInfo(r.Context(), caseID, offset, limit)
+	if err != nil {
+		if errors.Is(err, servicenow.ErrCaseNotFound) {
+			writeError(w, http.StatusNotFound, ErrMsgNotFound)
+			return
+		}
+		if isUnsafeQueryValue(err) {
+			writeError(w, http.StatusBadRequest, ErrMsgBadRequest)
+			return
+		}
+		slog.ErrorContext(r.Context(), "servicenow GetAttachmentsInfo failed", "userID", user.UserID, "caseID", caseID, "err", err)
+		mapUpstreamErrorGeneric(w, err, "Failed to retrieve case attachments.")
+		return
+	}
+	writeJSONValue(w, http.StatusOK, result)
 }

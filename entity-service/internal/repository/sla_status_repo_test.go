@@ -33,6 +33,8 @@ type fakeSLAStatusScanRow struct {
 	caseNumber, wso2CaseID, caseTitle *string
 	fixedCaseType                     string
 	product, severity, state          *string
+	team, onboardingStatus            *string
+	isEvaluation                      bool
 }
 
 func (f fakeSLAStatusScanRow) Scan(dest ...any) error {
@@ -49,6 +51,9 @@ func (f fakeSLAStatusScanRow) Scan(dest ...any) error {
 	*dest[10].(**string) = f.product
 	*dest[11].(*string) = strOrEmpty(f.severity)
 	*dest[12].(**string) = f.state
+	*dest[13].(**string) = f.team
+	*dest[14].(**string) = f.onboardingStatus
+	*dest[15].(*bool) = f.isEvaluation
 	return nil
 }
 
@@ -67,6 +72,7 @@ func TestScanSLAStatus(t *testing.T) {
 			workItemID: "case-1", target: "RESOLUTION", elapsedPercent: 260.44, hasBreached: true, stage: "IN_PROGRESS",
 			startedOn: &now, caseNumber: strPtr("CS0001"), wso2CaseID: strPtr("SUB-1"), caseTitle: strPtr("Title"),
 			fixedCaseType: "CASE", product: strPtr("API Manager"), severity: strPtr("S1"),
+			team: strPtr("Castor"), onboardingStatus: strPtr("IN_PROGRESS"), isEvaluation: true,
 		}
 		got, err := scanSLAStatus(row)
 		if err != nil {
@@ -83,6 +89,26 @@ func TestScanSLAStatus(t *testing.T) {
 		}
 		if got.State != "" {
 			t.Errorf("State = %q, want empty (nil state column)", got.State)
+		}
+		if got.Team != "Castor" {
+			t.Errorf("Team = %q, want %q", got.Team, "Castor")
+		}
+		if got.ProjectOnboardingStatus != "IN_PROGRESS" {
+			t.Errorf("ProjectOnboardingStatus = %q, want %q", got.ProjectOnboardingStatus, "IN_PROGRESS")
+		}
+		if !got.IsEvaluationAccount {
+			t.Error("IsEvaluationAccount = false, want true")
+		}
+	})
+
+	t.Run("no account/project row leaves team/onboarding/evaluation at zero value", func(t *testing.T) {
+		row := fakeSLAStatusScanRow{workItemID: "case-5", target: "RESPONSE", fixedCaseType: "CASE"}
+		got, err := scanSLAStatus(row)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.Team != "" || got.ProjectOnboardingStatus != "" || got.IsEvaluationAccount {
+			t.Errorf("got Team=%q ProjectOnboardingStatus=%q IsEvaluationAccount=%v, want all zero values", got.Team, got.ProjectOnboardingStatus, got.IsEvaluationAccount)
 		}
 	})
 

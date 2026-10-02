@@ -27,21 +27,16 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-RUN corepack enable && corepack prepare pnpm@9 --activate
+RUN corepack enable && corepack prepare pnpm@10 --activate
 
-COPY apps/customer-portal/webapp/package.json apps/customer-portal/webapp/pnpm-lock.yaml ./
+# The lockfile was resolved by pnpm 10 with the dompurify/fflate `overrides` and
+# allowBuilds living in pnpm-workspace.yaml (a pnpm 10 feature; pnpm 9 ignores
+# them and --frozen-lockfile aborts with ERR_PNPM_LOCKFILE_CONFIG_MISMATCH), so
+# use pnpm 10 and copy the workspace file into the install layer.
+COPY apps/customer-portal/webapp/package.json apps/customer-portal/webapp/pnpm-lock.yaml apps/customer-portal/webapp/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
 COPY apps/customer-portal/webapp/ .
-# This repo's pnpm-workspace.yaml here has no `packages:` key (it exists only
-# for its allowBuilds/minimumReleaseAgeExclude settings), which the pnpm
-# version pnpm-lock.yaml pins (9.15.x) refuses to run a build under
-# ("packages field missing or empty") -- a real upstream pnpm/config
-# incompatibility, not something this Dockerfile should paper over in the
-# actual repo file. It is only ever needed for pnpm's own workspace
-# resolution, which this single-package image build doesn't use, so it is
-# safe to drop inside the image.
-RUN rm -f pnpm-workspace.yaml
 RUN pnpm build
 
 FROM nginx:1.27-alpine

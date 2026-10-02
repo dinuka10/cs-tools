@@ -25,7 +25,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -108,11 +107,14 @@ type TimeCardRepository interface {
 }
 
 type timeCardRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
-// NewTimeCardRepository constructs a TimeCardRepository backed by the given connection pool.
-func NewTimeCardRepository(db *pgxpool.Pool) TimeCardRepository {
+// NewTimeCardRepository constructs a TimeCardRepository backed by the given
+// Scoped connection. time_card's project-membership visibility (migration
+// 0144) is enforced entirely by Postgres RLS now -- this repository
+// applies no project filtering of its own.
+func NewTimeCardRepository(db *Scoped) TimeCardRepository {
 	return &timeCardRepo{db: db}
 }
 
@@ -514,12 +516,20 @@ func (r *timeCardRepo) SearchCaseTimeCards(ctx context.Context, req domain.Searc
 
 // CreateTimeCard implements TimeCardRepository.
 func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTimeCardRequest, userID string) (domain.TimeCardView, error) {
-	tx, err := r.db.Begin(ctx)
+	id, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) (string, error) {
+		return createTimeCardTx(ctx, tx, req, userID)
+	})
 	if err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("create time card: begin tx: %w", err)
+		return domain.TimeCardView{}, err
 	}
-	defer tx.Rollback(ctx)
+	return r.getTimeCardByID(ctx, id)
+}
 
+// createTimeCardTx is CreateTimeCard's body, run inside the transaction
+// Scoped.InTx opens and sets identity on -- factored out so early returns
+// stay plain `return "", err` instead of needing a second err-only variable
+// alongside the id this method must also hand back to its caller.
+func createTimeCardTx(ctx context.Context, tx pgx.Tx, req domain.CreateTimeCardRequest, userID string) (string, error) {
 	// The case's own project is work_item.project_id -- case_id now
 	// references work_item(id) generically (migration 0041's most recent
 	// revision), not "case"(id) specifically, so this looks up work_item
@@ -537,15 +547,15 @@ func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTime
 	// case/engagement/service_request/security_report_analysis/announcement
 	// set every other case-scoped query in this codebase restricts to.
 	var caseProjectID *string
-	err = tx.QueryRow(ctx, `SELECT project_id FROM work_item WHERE id = $1 AND type = ANY(`+caseLikeWorkItemTypes+`)`, req.CaseID).Scan(&caseProjectID)
+	err := tx.QueryRow(ctx, `SELECT project_id FROM work_item WHERE id = $1 AND type = ANY(`+caseLikeWorkItemTypes+`)`, req.CaseID).Scan(&caseProjectID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.TimeCardView{}, &apierror.ValidationError{Msg: "case not found: " + req.CaseID}
+		return "", &apierror.NotFoundError{Msg: "case not found"}
 	}
 	if err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("look up case project: %w", err)
+		return "", fmt.Errorf("look up case project: %w", err)
 	}
 	if req.ProjectID != "" && (caseProjectID == nil || *caseProjectID != req.ProjectID) {
-		return domain.TimeCardView{}, &apierror.ValidationError{Msg: "projectId must match the case's own project"}
+		return "", &apierror.ValidationError{Msg: "projectId must match the case's own project"}
 	}
 
 	// 'SUBMITTED' (not 'submitted') and issue_complexity's ::text::enum cast:
@@ -555,6 +565,18 @@ func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTime
 	// codec issue this file's date fields already work around: once the
 	// server infers a parameter's OID as a custom enum type, pgx has no
 	// binary encode plan for a raw Go string.
+	// $1 is the same userID value bound into three different-typed columns
+	// (created_by/updated_by are VARCHAR, user_id is UUID). Postgres unifies
+	// a parameter's type across EVERY one of its usages in a statement, not
+	// per-usage -- casting only one occurrence still left the other two
+	// bare and in conflict ("inconsistent types deduced for parameter $1:
+	// character varying versus uuid"), confirmed against a real connection.
+	// Every usage needs its own explicit cast for each to independently
+	// resolve, which is also why $1::text (not left bare) appears on the
+	// created_by/updated_by usages here even though VARCHAR is the column's
+	// native type. This was never caught before because every existing
+	// test doubles CreateTimeCard's repository, never exercising this SQL
+	// against real Postgres.
 	const insertQuery = `
 		INSERT INTO time_card (
 			id, created_on, updated_on, created_by, updated_by,
@@ -563,8 +585,8 @@ func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTime
 			analyzing_minutes, setting_up_minutes, reproducing_debugging_minutes,
 			providing_solution_minutes, patching_minutes
 		) VALUES (
-			gen_random_uuid(), NOW(), NOW(), $1, $1,
-			$2, $3, $1, $4::text::date, $5, 'SUBMITTED',
+			gen_random_uuid(), NOW(), NOW(), $1::text, $1::text,
+			$2, $3, $1::text::uuid, $4::text::date, $5, 'SUBMITTED',
 			$6::text::time_card_issue_complexity_enum, $7, $8, $9, $10, $11, $12
 		) RETURNING id`
 
@@ -582,9 +604,17 @@ func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTime
 	).Scan(&id)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
-			return domain.TimeCardView{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
+			return "", &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
 		}
-		return domain.TimeCardView{}, fmt.Errorf("insert time card: %w", err)
+		if IsRLSPolicyViolation(err) {
+			// NotFoundError, not ValidationError, and no UUID echoed back --
+			// matching call_request_repo.go's identical RLS-violation
+			// mapping (and this whole PR's own convention throughout):
+			// existence of a case outside the caller's project is never
+			// revealed by the error's shape.
+			return "", &apierror.NotFoundError{Msg: "case not found"}
+		}
+		return "", fmt.Errorf("insert time card: %w", err)
 	}
 
 	for _, approverID := range req.ApproverIDs {
@@ -594,17 +624,13 @@ func (r *timeCardRepo) CreateTimeCard(ctx context.Context, req domain.CreateTime
 			userID, id, approverID,
 		); err != nil {
 			if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
-				return domain.TimeCardView{}, &apierror.ValidationError{Msg: "one or more approver IDs do not exist: " + pgErr.Detail}
+				return "", &apierror.ValidationError{Msg: "one or more approver IDs do not exist: " + pgErr.Detail}
 			}
-			return domain.TimeCardView{}, fmt.Errorf("insert time card approver: %w", err)
+			return "", fmt.Errorf("insert time card approver: %w", err)
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("create time card: commit tx: %w", err)
-	}
-
-	return r.getTimeCardByID(ctx, id)
+	return id, nil
 }
 
 // UpdateTimeCardFields implements TimeCardRepository.
@@ -653,12 +679,6 @@ func (r *timeCardRepo) UpdateTimeCardFields(ctx context.Context, req domain.Upda
 		add("patching_minutes = $%d", *req.TimePatching)
 	}
 
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("update time card: begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
 	args = append(args, req.ID)
 	// user_id = $actorArg is the ownership check: without it, any
 	// authenticated caller could edit any other user's submitted time card
@@ -668,37 +688,38 @@ func (r *timeCardRepo) UpdateTimeCardFields(ctx context.Context, req domain.Upda
 	query := fmt.Sprintf(`UPDATE time_card SET %s WHERE id = $%d AND user_id = $%d AND state = 'SUBMITTED' RETURNING id`, strings.Join(sets, ", "), argIdx, actorArg)
 
 	var id string
-	err = tx.QueryRow(ctx, query, args...).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.TimeCardView{}, &apierror.ConflictError{Msg: "time card is not editable (it may not exist, may not belong to you, or is no longer in the submitted state)"}
-	}
-	if err != nil {
-		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
-			return domain.TimeCardView{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, query, args...).Scan(&id); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return &apierror.ConflictError{Msg: "time card is not editable (it may not exist, may not belong to you, or is no longer in the submitted state)"}
+			}
+			if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
+				return &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
+			}
+			return fmt.Errorf("update time card fields: %w", err)
 		}
-		return domain.TimeCardView{}, fmt.Errorf("update time card fields: %w", err)
-	}
 
-	if req.ApproverIDs != nil {
-		if _, err := tx.Exec(ctx, `DELETE FROM time_card_approver WHERE time_card_id = $1`, id); err != nil {
-			return domain.TimeCardView{}, fmt.Errorf("clear time card approvers: %w", err)
-		}
-		for _, approverID := range req.ApproverIDs {
-			if _, err := tx.Exec(ctx,
-				`INSERT INTO time_card_approver (id, created_on, updated_on, created_by, updated_by, time_card_id, approver_id)
-				 VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, $2, $3)`,
-				actorID, id, approverID,
-			); err != nil {
-				if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
-					return domain.TimeCardView{}, &apierror.ValidationError{Msg: "one or more approver IDs do not exist: " + pgErr.Detail}
+		if req.ApproverIDs != nil {
+			if _, err := tx.Exec(ctx, `DELETE FROM time_card_approver WHERE time_card_id = $1`, id); err != nil {
+				return fmt.Errorf("clear time card approvers: %w", err)
+			}
+			for _, approverID := range req.ApproverIDs {
+				if _, err := tx.Exec(ctx,
+					`INSERT INTO time_card_approver (id, created_on, updated_on, created_by, updated_by, time_card_id, approver_id)
+					 VALUES (gen_random_uuid(), NOW(), NOW(), $1, $1, $2, $3)`,
+					actorID, id, approverID,
+				); err != nil {
+					if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
+						return &apierror.ValidationError{Msg: "one or more approver IDs do not exist: " + pgErr.Detail}
+					}
+					return fmt.Errorf("insert time card approver: %w", err)
 				}
-				return domain.TimeCardView{}, fmt.Errorf("insert time card approver: %w", err)
 			}
 		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("update time card: commit tx: %w", err)
+		return nil
+	})
+	if err != nil {
+		return domain.TimeCardView{}, err
 	}
 
 	return r.getTimeCardByID(ctx, id)
@@ -706,71 +727,70 @@ func (r *timeCardRepo) UpdateTimeCardFields(ctx context.Context, req domain.Upda
 
 // TransitionTimeCardState implements TimeCardRepository.
 func (r *timeCardRepo) TransitionTimeCardState(ctx context.Context, id string, state domain.TimeCardState, leadComment *string, actorID string) (domain.TimeCardView, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("transition time card state: begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	// Lock the row and check eligibility AND current state before writing
-	// anything: only an approver on this specific card, other than its own
-	// submitter, may transition it, and only while it is still "submitted"
-	// -- without that state check, an eligible approver could re-approve/
-	// reject an already approved/rejected/processed/recalled card. FOR
-	// UPDATE holds the lock across both statements in this transaction,
-	// closing the gap a plain check-then-UPDATE would leave for a
-	// concurrent approver-list edit (or a second transition attempt) to
-	// race through.
-	var submitterID string
-	var currentState *string
-	var isApprover bool
-	err = tx.QueryRow(ctx, `
-		SELECT tc.user_id, tc.state::TEXT, EXISTS (
-			SELECT 1 FROM time_card_approver tca WHERE tca.time_card_id = tc.id AND tca.approver_id = $2
-		)
-		FROM time_card tc WHERE tc.id = $1 FOR UPDATE`, id, actorID,
-	).Scan(&submitterID, &currentState, &isApprover)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.TimeCardView{}, &apierror.NotFoundError{Msg: "time card not found"}
-	}
-	if err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("check time card approver eligibility: %w", err)
-	}
-	if !isApprover || submitterID == actorID {
-		return domain.TimeCardView{}, &apierror.ForbiddenError{Msg: "only an eligible approver, other than the submitter, may approve or reject this time card"}
-	}
-	// time_card_state_enum is UPPER_SNAKE_CASE; domain.TimeCardStateSubmitted
-	// is lowercase.
-	if currentState == nil || strings.ToUpper(*currentState) != strings.ToUpper(string(domain.TimeCardStateSubmitted)) {
-		return domain.TimeCardView{}, &apierror.ConflictError{Msg: "time card is not in the submitted state (it may already have been approved, rejected, processed, or recalled)"}
-	}
-
-	// $2's ::text::enum cast on SET (not a direct ::enum cast) avoids the
-	// same pgx v5 codec issue this file's date fields already work around
-	// -- see CreateTimeCard's own comment on this. The CASE WHEN comparison
-	// stays a bare text comparison against the same (already-uppercased)
-	// $2 value, matching case_repo.go's updateCaseQuery's identical pattern
-	// for case_state_enum.
-	const query = `
-		UPDATE time_card
-		SET state = $2::text::time_card_state_enum,
-		    lead_comment = COALESCE($3, lead_comment),
-		    approved_by_id = CASE WHEN $2 = 'APPROVED' THEN $4::uuid ELSE approved_by_id END,
-		    updated_on = NOW(),
-		    updated_by = $4
-		WHERE id = $1
-		RETURNING id`
-
 	var returnedID string
-	if err := tx.QueryRow(ctx, query, id, strings.ToUpper(string(state)), leadComment, actorID).Scan(&returnedID); err != nil {
-		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
-			return domain.TimeCardView{}, &apierror.ValidationError{Msg: pgErr.Detail}
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		// Lock the row and check eligibility AND current state before writing
+		// anything: only an approver on this specific card, other than its own
+		// submitter, may transition it, and only while it is still "submitted"
+		// -- without that state check, an eligible approver could re-approve/
+		// reject an already approved/rejected/processed/recalled card. FOR
+		// UPDATE holds the lock across both statements in this transaction,
+		// closing the gap a plain check-then-UPDATE would leave for a
+		// concurrent approver-list edit (or a second transition attempt) to
+		// race through. Postgres applies both the SELECT and UPDATE policies
+		// to a FOR UPDATE lock -- time_card's RLS policies (migration 0144)
+		// use the same is_project_member condition for both, so a legitimate
+		// caller's own row satisfies both together.
+		var submitterID string
+		var currentState *string
+		var isApprover bool
+		err := tx.QueryRow(ctx, `
+			SELECT tc.user_id, tc.state::TEXT, EXISTS (
+				SELECT 1 FROM time_card_approver tca WHERE tca.time_card_id = tc.id AND tca.approver_id = $2
+			)
+			FROM time_card tc WHERE tc.id = $1 FOR UPDATE`, id, actorID,
+		).Scan(&submitterID, &currentState, &isApprover)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return &apierror.NotFoundError{Msg: "time card not found"}
 		}
-		return domain.TimeCardView{}, fmt.Errorf("transition time card state: %w", err)
-	}
+		if err != nil {
+			return fmt.Errorf("check time card approver eligibility: %w", err)
+		}
+		if !isApprover || submitterID == actorID {
+			return &apierror.ForbiddenError{Msg: "only an eligible approver, other than the submitter, may approve or reject this time card"}
+		}
+		// time_card_state_enum is UPPER_SNAKE_CASE; domain.TimeCardStateSubmitted
+		// is lowercase.
+		if currentState == nil || strings.ToUpper(*currentState) != strings.ToUpper(string(domain.TimeCardStateSubmitted)) {
+			return &apierror.ConflictError{Msg: "time card is not in the submitted state (it may already have been approved, rejected, processed, or recalled)"}
+		}
 
-	if err := tx.Commit(ctx); err != nil {
-		return domain.TimeCardView{}, fmt.Errorf("transition time card state: commit tx: %w", err)
+		// $2's ::text::enum cast on SET (not a direct ::enum cast) avoids the
+		// same pgx v5 codec issue this file's date fields already work around
+		// -- see CreateTimeCard's own comment on this. The CASE WHEN comparison
+		// stays a bare text comparison against the same (already-uppercased)
+		// $2 value, matching case_repo.go's updateCaseQuery's identical pattern
+		// for case_state_enum.
+		const query = `
+			UPDATE time_card
+			SET state = $2::text::time_card_state_enum,
+			    lead_comment = COALESCE($3, lead_comment),
+			    approved_by_id = CASE WHEN $2 = 'APPROVED' THEN $4::uuid ELSE approved_by_id END,
+			    updated_on = NOW(),
+			    updated_by = $4
+			WHERE id = $1
+			RETURNING id`
+
+		if err := tx.QueryRow(ctx, query, id, strings.ToUpper(string(state)), leadComment, actorID).Scan(&returnedID); err != nil {
+			if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) && pgErr.Code == "23503" {
+				return &apierror.ValidationError{Msg: pgErr.Detail}
+			}
+			return fmt.Errorf("transition time card state: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return domain.TimeCardView{}, err
 	}
 
 	return r.getTimeCardByID(ctx, returnedID)

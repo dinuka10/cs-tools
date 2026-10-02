@@ -14,14 +14,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// POST /spl/customer-health/summary is a search endpoint (POST verb, but a
+// POST /customer-health/summary is a search endpoint (POST verb, but a
 // read, triggered by filter changes) — modeled as a useQuery keyed on the
 // payload, same as this app's other POST-as-search endpoints, rather than a
 // useMutation fired from an effect (the source app's own useSplApi-based
 // pattern, which this rewrite intentionally does not carry over).
 import { useQuery, type UseQueryResult } from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
-import type { AccountSummary } from "./splCustomerHealthTypes";
+import type { AccountSummary } from "./customerHealthTypes";
 
 export interface CustomerHealthSummaryPayload {
   offset: number;
@@ -48,7 +48,7 @@ export function useCustomerHealthSummary(
     queryKey: ["spl-customer-health-summary", payload],
     queryFn: () =>
       backendApi.post<CustomerHealthSummaryPayload, CustomerHealthSummaryResponse>(
-        "/spl/customer-health/summary",
+        "/customer-health/summary",
         payload,
       ),
   });
@@ -60,7 +60,7 @@ export function fetchCustomerHealthSummaryPage(
   payload: CustomerHealthSummaryPayload,
 ): Promise<CustomerHealthSummaryResponse> {
   return backendApi.post<CustomerHealthSummaryPayload, CustomerHealthSummaryResponse>(
-    "/spl/customer-health/summary",
+    "/customer-health/summary",
     payload,
   );
 }

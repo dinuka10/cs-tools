@@ -41,6 +41,9 @@ type EmailConfig struct {
 	// It is a config value rather than a SendEmail argument so that all
 	// portal-originated emails come from a single, pre-approved sender.
 	FromAddress string
+
+	// ReplyTo is EMAIL_REPLY_TO. Only callers that opt in pass it on.
+	ReplyTo []string
 }
 
 // EmailClient is an HTTP client for an internal email notification service,
@@ -56,6 +59,7 @@ type EmailClient struct {
 	http        *http.Client
 	baseURL     string
 	fromAddress string
+	replyTo     []string
 }
 
 // NewEmailClient constructs an EmailClient that authenticates against the
@@ -72,6 +76,7 @@ func NewEmailClient(cfg EmailConfig) *EmailClient {
 		http:        httpClient,
 		baseURL:     strings.TrimRight(cfg.BaseURL, "/"),
 		fromAddress: cfg.FromAddress,
+		replyTo:     nonEmpty(cfg.ReplyTo),
 	}
 }
 
@@ -163,6 +168,9 @@ type sendEmailRequest struct {
 // address guaranteed to be valid and to reveal nothing about the recipients.
 func (c *EmailClient) FromAddress() string { return c.fromAddress }
 
+// ReplyTo is the configured Reply-To list, or nil when none is set.
+func (c *EmailClient) ReplyTo() []string { return c.replyTo }
+
 func (c *EmailClient) SendEmail(ctx context.Context, to, cc, bcc, replyTo []string, subject, htmlBody string, attachments []EmailAttachment) error {
 	return c.SendEmailFrom(ctx, c.fromAddress, to, cc, bcc, replyTo, subject, htmlBody, attachments)
 }
@@ -198,4 +206,15 @@ func (c *EmailClient) SendEmailFrom(ctx context.Context, from string, to, cc, bc
 
 	_, err = c.do(ctx, http.MethodPost, "/send-email", reqBody)
 	return err
+}
+
+// nonEmpty trims each address and drops blanks; nil when nothing is left.
+func nonEmpty(addrs []string) []string {
+	var out []string
+	for _, a := range addrs {
+		if a = strings.TrimSpace(a); a != "" {
+			out = append(out, a)
+		}
+	}
+	return out
 }

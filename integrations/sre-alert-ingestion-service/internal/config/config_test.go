@@ -19,6 +19,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -67,7 +68,6 @@ func TestLoad_RejectsInvalidValues(t *testing.T) {
 	cases := map[string]string{
 		"zero batch":        "[allocator]\nmax_batch = 0\n",
 		"negative timeout":  "[store]\nquery_timeout = \"-1s\"\n",
-		"empty auth mode":   "[auth]\nmode = \"\"\n",
 		"bad duration":      "[wake]\ntimeout = \"soon\"\n",
 		"zero idle":         "[server]\nidle_timeout = \"0s\"\n",
 		"zero drain delay":  "[server]\ndrain_delay = \"0s\"\n",
@@ -93,7 +93,7 @@ func TestLoad_RejectsInvalidValues(t *testing.T) {
 
 func TestLoadEnv(t *testing.T) {
 	t.Setenv("PORT", "")
-	t.Setenv("ALERT_CORE_WAKE_URL", " http://core/alert ")
+	t.Setenv("ALERT_CORE_WAKE_URL", " http://core/alertz ")
 	t.Setenv("FALLBACK_CHAT_WEBHOOK_URLS", "https://a, ,https://b ")
 	e, err := LoadEnv()
 	if err != nil {
@@ -102,10 +102,61 @@ func TestLoadEnv(t *testing.T) {
 	if e.Port != "8080" {
 		t.Errorf("Port = %q, want 8080 default", e.Port)
 	}
-	if e.WakeURL != "http://core/alert" {
+	if e.WakeURL != "http://core/alertz" {
 		t.Errorf("WakeURL = %q", e.WakeURL)
 	}
 	if len(e.ChatWebhookURLs) != 2 || e.ChatWebhookURLs[0] != "https://a" || e.ChatWebhookURLs[1] != "https://b" {
 		t.Errorf("ChatWebhookURLs = %q", e.ChatWebhookURLs)
+	}
+}
+
+func TestLoadEnv_AuthSwitches(t *testing.T) {
+	for _, tc := range []struct {
+		enabled, auditOnly     string
+		wantEnabled, wantAudit bool
+	}{
+		{"", "", false, false}, // unset: auth off
+		{"true", "", true, false},
+		{"true", "true", true, true},
+		{"false", "true", false, true}, // main ignores audit-only when auth is off
+		{" TRUE ", "", true, false},    // a console paste can carry case and spaces
+		{"1", "0", true, false},
+	} {
+		t.Setenv("AUTH_ENABLED", tc.enabled)
+		t.Setenv("AUTH_AUDIT_ONLY", tc.auditOnly)
+		e, err := LoadEnv()
+		if err != nil {
+			t.Fatalf("AUTH_ENABLED=%q AUTH_AUDIT_ONLY=%q: %v", tc.enabled, tc.auditOnly, err)
+		}
+		if e.AuthEnabled != tc.wantEnabled || e.AuthAuditOnly != tc.wantAudit {
+			t.Errorf("AUTH_ENABLED=%q AUTH_AUDIT_ONLY=%q: got (%v, %v), want (%v, %v)",
+				tc.enabled, tc.auditOnly, e.AuthEnabled, e.AuthAuditOnly, tc.wantEnabled, tc.wantAudit)
+		}
+	}
+}
+
+// A typo in a security switch must fail at startup, not silently leave auth off.
+func TestLoadEnv_RejectsAmbiguousAuthSwitch(t *testing.T) {
+	for _, v := range []string{"ture", "enabled", "2"} {
+		t.Setenv("AUTH_ENABLED", v)
+		if _, err := LoadEnv(); err == nil || !strings.Contains(err.Error(), "AUTH_ENABLED") {
+			t.Errorf("AUTH_ENABLED=%q: err = %v, want an error naming AUTH_ENABLED", v, err)
+		}
+	}
+}
+
+// A config.toml still carrying [auth] is flagged, so it can't silently switch auth off.
+func TestLoad_FlagsLegacyAuthSection(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "legacy.toml")
+	os.WriteFile(legacy, []byte("[auth]\nmode = \"integration_users\"\n"), 0o644)
+	clean := filepath.Join(dir, "clean.toml")
+	os.WriteFile(clean, []byte("[server]\nmax_body_bytes = 2097152\n"), 0o644)
+
+	if cfg, err := Load(legacy); err != nil || !cfg.LegacyAuthSection {
+		t.Errorf("legacy [auth]: LegacyAuthSection = %v, err = %v; want true", cfg.LegacyAuthSection, err)
+	}
+	if cfg, err := Load(clean); err != nil || cfg.LegacyAuthSection {
+		t.Errorf("no [auth]: LegacyAuthSection = %v, err = %v; want false", cfg.LegacyAuthSection, err)
 	}
 }

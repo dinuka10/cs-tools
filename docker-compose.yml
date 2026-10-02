@@ -42,14 +42,22 @@ networks:
     name: csm-platform-net
 
 volumes:
-  csm-pgdata:
+  # Named for the major version on purpose. postgres:18 images keep data under
+  # /var/lib/postgresql/18/docker and refuse to start if they find an older
+  # cluster's PG_VERSION at the mount root or any mount at
+  # /var/lib/postgresql/data -- which is exactly what a csm-pgdata volume
+  # from the postgres:16 era contains. A fresh volume name sidesteps that;
+  # the old csm-pgdata volume is left untouched (remove it with
+  # `docker volume rm csm-platform_csm-pgdata` once it is no longer wanted).
+  # Everything in it is rebuilt by migrate + seed on first `up`.
+  csm-pgdata-18:
   csm-dev-certs:
 
 services:
   # ── Data plane ────────────────────────────────────────────────────────────
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: devpassword
@@ -57,7 +65,7 @@ services:
     ports:
       - "127.0.0.1:5433:5432"
     volumes:
-      - csm-pgdata:/var/lib/postgresql/data
+      - csm-pgdata-18:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 3s
@@ -68,7 +76,7 @@ services:
   # up a migration tool) and loads dummy seed data. Every service that reads
   # from Postgres waits on this completing.
   migrate:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,7 +101,7 @@ services:
   # entity-service's database, on top of migrate's fixed single-case seed --
   # see scripts/csm-compose/seed-generator's doc comment. Deliberately its
   # own one-shot service, not an extra step appended to migrate-and-seed.sh:
-  # migrate's image (postgres:16-alpine) has no Go toolchain to build or run
+  # migrate's image (postgres:18-alpine) has no Go toolchain to build or run
   # this program inside that container, so it gets its own image, built the
   # same way mock-oidc and gateway-shim already are, and chains off
   # migrate's completion the same way kafka-topics-init chains off kafka's.
@@ -166,10 +174,17 @@ services:
     ports:
       - "19094:9094"
     healthcheck:
+      # Each probe starts a whole JVM (kafka-broker-api-versions.sh), which on a
+      # laptop-sized Docker VM pins several cores while it JIT-compiles. So probe
+      # quickly only while starting up (start_interval, within start_period), then
+      # rarely once healthy, or the healthcheck itself becomes the stack's largest
+      # steady CPU consumer and starves the UI under test.
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
-      interval: 5s
-      timeout: 10s
-      retries: 20
+      interval: 60s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+      start_interval: 5s
 
   # One-shot: creates the topics this stack needs (auto-create is enabled
   # above too, but explicit creation makes first-boot deterministic).
@@ -283,6 +298,10 @@ services:
       AUTH_ADMIN_ROLES: cs_admin
       AUTH_TIMECARD_APPROVER_ROLES: cs_timecard_approver
       AUTH_DASHBOARD_DESIGNER_ROLES: cs_dashboard_designer
+      # Marker role, not a capability tier like the ones above -- picks the
+      # Sales/Solutions-Architecture (SPL) nav over CS Portal's own (see
+      # usePortalView.ts and internal/handler/access.go's AccessConfig.SalesSolutions).
+      AUTH_SALES_SOLUTIONS_ROLES: cs_sales_solutions
       CORS_ALLOWED_ORIGINS: http://localhost:3001
       PORT: "8080"
       DASHBOARDS_DIR: ./dashboards.example

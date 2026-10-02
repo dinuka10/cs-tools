@@ -91,7 +91,7 @@ func TestUpsertOnboardingStep_Errors(t *testing.T) {
 	}
 
 	// Service ValidationError maps to 400.
-	svc = &stubOnboardingStepService{err: &apierror.ValidationError{Msg: "step must be one of IDENTITY, DATABASE, EMAIL, REGISTRATION"}}
+	svc = &stubOnboardingStepService{err: &apierror.ValidationError{Msg: "step must be one of IDENTITY, DATABASE, EMAIL, REGISTRATION, WELCOME_EMAIL"}}
 	req = httptest.NewRequest(http.MethodPut, "/onboarding-steps/a0e1/PAYMENT", strings.NewReader(`{"status":"SUCCEEDED","eventType":"x","eventModifiedOn":"2026-09-18T06:37:07Z","email":"e"}`))
 	rec = httptest.NewRecorder()
 	newOnboardingStepMux(svc).ServeHTTP(rec, req)

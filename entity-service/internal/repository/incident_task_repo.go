@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -67,11 +66,11 @@ type IncidentTaskRepository interface {
 }
 
 type incidentTaskRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewIncidentTaskRepository constructs an IncidentTaskRepository backed by the given connection pool.
-func NewIncidentTaskRepository(db *pgxpool.Pool) IncidentTaskRepository {
+func NewIncidentTaskRepository(db *Scoped) IncidentTaskRepository {
 	return &incidentTaskRepo{db: db}
 }
 

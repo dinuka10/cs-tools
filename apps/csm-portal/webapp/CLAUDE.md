@@ -41,10 +41,31 @@ gating on top of a real server-side gate, by explicit choice rather than by the 
 default. If a future admin-only action is added, default to the show-and-reject norm unless there's a
 specific reason (as here) to also hide it.
 
-`AddUserDialog.tsx` deliberately has no role picker: the backend's `POST /users` accepts an optional
-`roles` array end-to-end (entity-service → `apps/csm-portal/backend` → here), but there is no
-Asgardeo-backed way to browse/assign roles at account-creation time yet, so the field is simply
-omitted from the form for now rather than half-built.
+`AddUserDialog.tsx` deliberately has no general role picker — there is still no Asgardeo-backed way
+to browse/assign a fuller role set at account-creation time. It does have one narrower, required
+control: **"User type" (Internal/External)**. entity-service's `user_type` has no plain settable
+column — it's derived by a DB trigger from role membership (`recompute_user_type`, migration 0011) —
+so this selector works by sending exactly one of `roles: ["internal"]`/`["external"]` on submit, not a
+`type` field on the wire; `external` (not `customer`/`partner`/...) is the role every
+externally-onboarded contact actually holds, so that's the one this form sends for "External" rather
+than a finer-grained refinement it has no way to know at creation time. This was added because the
+form previously sent no `roles` at all, so every user it created resolved to `user_type =
+NOT_AVAILABLE` (entity-service's trigger fallback) — a real, silent data-quality gap, not a
+hypothetical one.
+
+**Selecting "Internal" requires a `@wso2.com` email** — the form blocks submission and shows the
+constraint inline (`internalEmailViolation` in `AddUserDialog.tsx`) rather than letting the request
+round-trip to find out. This is a display-consistency check only, the same relationship the inline-image
+redaction section below describes for its own frontend mitigation: entity-service's `userService.CreateUser`
+enforces the identical rule server-side (see that repo's own `CLAUDE.md`), and is what actually
+protects the database regardless of what this form does or doesn't check.
+
+**"External" is temporarily disabled** (`USER_TYPE_OPTIONS`'s own `disabled: true`, rendered via
+`MenuItem`'s `disabled` prop with "— currently unavailable" appended to the label) — both
+entity-service and `apps/csm-portal/backend` reject creating an external-type user regardless of what
+this form sends, so there is currently only one real, selectable choice in this dropdown. This is
+meant to come out once external-type creation is ready; see entity-service's own `CLAUDE.md` for the
+full reasoning.
 
 ## Code organization
 

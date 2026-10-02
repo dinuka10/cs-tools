@@ -17,11 +17,11 @@
 import { useQuery, useMutation, useQueryClient, type UseQueryResult } from "@tanstack/react-query";
 import { useBackendApi } from "@api/backend/client";
 import { BackendApiError } from "@api/backend/client";
-import type { AccountDetail, ProjectHealthStatus } from "./splCustomerHealthTypes";
+import type { AccountDetail, ProjectHealthStatus } from "./customerHealthTypes";
 
-// GET /spl/customer-health/accounts/{accountId} — 404 (not the old
+// GET /customer-health/accounts/{accountId} — 404 (not the old
 // Ballerina backend's 500) on an unknown account. See
-// SplCustomerHealthDetailTable's own 404-check for why this matters.
+// CustomerHealthDetailTable's own 404-check for why this matters.
 export function useAccountHealthDetail(
   accountId: string | undefined,
 ): UseQueryResult<AccountDetail | null, Error> {
@@ -29,7 +29,7 @@ export function useAccountHealthDetail(
   return useQuery<AccountDetail | null, Error>({
     queryKey: ["spl-customer-health-account-detail", accountId],
     enabled: Boolean(accountId),
-    queryFn: () => backendApi.get<AccountDetail>(`/spl/customer-health/accounts/${accountId}`),
+    queryFn: () => backendApi.get<AccountDetail>(`/customer-health/accounts/${encodeURIComponent(accountId ?? "")}`),
   });
 }
 
@@ -37,7 +37,7 @@ export function isNotFoundError(error: unknown): boolean {
   return error instanceof BackendApiError && error.status === 404;
 }
 
-// GET /spl/customer-health/accounts/{accountSysId}/health-status
+// GET /customer-health/accounts/{accountSysId}/health-status
 export function useAccountHealthStatus(
   accountId: string | undefined,
 ): UseQueryResult<ProjectHealthStatus[], Error> {
@@ -47,14 +47,14 @@ export function useAccountHealthStatus(
     enabled: Boolean(accountId),
     queryFn: async () =>
       (await backendApi.get<ProjectHealthStatus[]>(
-        `/spl/customer-health/accounts/${accountId}/health-status`,
+        `/customer-health/accounts/${encodeURIComponent(accountId ?? "")}/health-status`,
       )) ?? [],
   });
 }
 
-// POST /spl/customer-health/accounts/{accountSysId}/init-health-tracking —
+// POST /customer-health/accounts/{accountSysId}/init-health-tracking —
 // idempotent (existing rows untouched), fired once the project list is
-// known. Confirmed against the Go handler (spl_customer_health.go's
+// known. Confirmed against the Go handler (customer_health.go's
 // InitHealthTracking): returns 202 Accepted with NO body at all — plain
 // `backendApi.post()` would throw trying to `.json()` an empty response, so
 // this calls `.post<..., unknown>()` and treats a JSON-parse failure on an
@@ -69,7 +69,7 @@ export function useInitHealthTracking() {
     mutationFn: async ({ accountId, projectSysIds }) => {
       try {
         await backendApi.post<{ projectSysIds: string[] }, unknown>(
-          `/spl/customer-health/accounts/${accountId}/init-health-tracking`,
+          `/customer-health/accounts/${encodeURIComponent(accountId)}/init-health-tracking`,
           { projectSysIds },
         );
       } catch (err) {

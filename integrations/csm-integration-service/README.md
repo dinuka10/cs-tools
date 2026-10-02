@@ -128,9 +128,9 @@ csm-integration-service/
 │       ├── projects.go           # HTTP handlers for project endpoints
 │       ├── cases.go              # HTTP handlers for case endpoints
 │       ├── vulnerabilities.go    # HTTP handler for the product-vulnerability sync endpoint
-│       ├── opportunities.go      # HTTP handlers for opportunity endpoints (ServiceNow data source only)
-│       ├── invoices.go           # HTTP handlers for invoice endpoints (ServiceNow data source only)
-│       └── project_opportunity_links.go  # HTTP handler for project-opportunity link search (ServiceNow data source only)
+│       ├── opportunities.go      # HTTP handlers for opportunity endpoints
+│       ├── invoices.go           # HTTP handlers for invoice endpoints
+│       └── project_opportunity_links.go  # HTTP handler for project-opportunity link search
 ├── .choreo/component.yaml
 ├── openapi.yaml
 └── .env.example
@@ -153,11 +153,11 @@ csm-integration-service/
 - `POST /incidents/search` — search incidents (same conditional-401 behavior as `POST /incidents`, see `CLAUDE.md`)
 - `POST /services/search` — search CMDB IT services (same conditional-401 behavior as `POST /incidents`, see `CLAUDE.md`)
 - `POST /vulnerabilities/sync` — full-replace sync of product-vulnerability records (submit the complete current set on every call, not a delta)
-- `GET /opportunities/{id}` — get an opportunity by ID (ServiceNow data source only)
-- `POST /opportunities/search` — search opportunities (ServiceNow data source only)
-- `GET /invoices/{id}` — get an invoice by ID (ServiceNow data source only)
-- `POST /invoices/search` — search invoices (ServiceNow data source only)
-- `POST /project-opportunity-links/search` — search project-opportunity links (ServiceNow data source only; no by-id fetch — the underlying data has no single-record endpoint)
+- `GET /opportunities/{id}` — get an opportunity by ID
+- `POST /opportunities/search` — search opportunities
+- `GET /invoices/{id}` — get an invoice by ID
+- `POST /invoices/search` — search invoices
+- `POST /project-opportunity-links/search` — search project-opportunity links (no by-id fetch — the underlying data has no single-record endpoint)
 
 All responses are raw JSON passthrough from the entity service — this service does not
 reshape upstream response bodies.

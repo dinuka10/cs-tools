@@ -19,6 +19,7 @@ package service
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -139,6 +140,13 @@ func boolOrFalse(b *bool) bool {
 	return b != nil && *b
 }
 
+// accountIsPartner applies the Salesforce membership mapping's partner rule
+// (classification "Partner") to the account row.
+func accountIsPartner(classification *string) *bool {
+	v := classification != nil && strings.EqualFold(strings.TrimSpace(*classification), salesforceAccountClassificationPartner)
+	return &v
+}
+
 // accountRowCommonFields maps the fields shared between the search view and
 // the account detail response. SupportTier and ArrToday are not available
 // in the Postgres schema and are always nil.
@@ -185,6 +193,8 @@ func accountRowToView(row repository.AccountRow) domain.AccountView {
 		CreatedOn:              row.CreatedOn.Format(time.RFC3339),
 		CreatedBy:              &createdBy,
 		UpdatedOn:              row.UpdatedOn.Format(time.RFC3339),
+		IsPartner:              accountIsPartner(row.Classification),
+		HasPrimaryPartner:      &row.HasPartner,
 	}
 }
 
@@ -218,5 +228,7 @@ func accountRowToDetail(row repository.AccountRow) domain.AccountDetail {
 		CreatedOn:              row.CreatedOn.Format(time.RFC3339),
 		CreatedBy:              &createdBy,
 		UpdatedOn:              row.UpdatedOn.Format(time.RFC3339),
+		IsPartner:              accountIsPartner(row.Classification),
+		HasPrimaryPartner:      &row.HasPartner,
 	}
 }

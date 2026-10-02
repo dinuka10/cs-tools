@@ -69,7 +69,10 @@ func main() {
 	// change-request activity to the linked issue. Same gate as the webhook --
 	// one switch turns the whole integration on or off, so it can never run
 	// half-connected.
-	githubCtx, stopGithub := context.WithCancel(context.Background())
+	// WithSystemIdentity: same reasoning as slaEngineCtx/crNoticeCtx below -- the
+	// outbound repo is a plain pool today, but stamping it now means migrating it
+	// to Scoped later cannot silently fail every tick with ErrNoCallerIdentity.
+	githubCtx, stopGithub := context.WithCancel(repository.WithSystemIdentity(context.Background()))
 	defer stopGithub()
 	if cfg.HasGithubIntegration() {
 		if pool == nil {
@@ -92,10 +95,15 @@ func main() {
 	// 000088) — see service.SLAEngineRecomputeWorker's own doc comment.
 	// Gated on pool the same way the GitHub outbound worker above is:
 	// nowhere to read/write a clock at all with no database configured.
-	slaEngineCtx, stopSLAEngine := context.WithCancel(context.Background())
+	// WithSystemIdentity: this worker runs on its own process-startup
+	// context, never an HTTP request, so there is no caller identity to
+	// inherit. sla no longer has RLS (migration 0153), but this worker still
+	// writes through the Scoped repository, which requires an identity on ctx;
+	// it is genuinely internal.
+	slaEngineCtx, stopSLAEngine := context.WithCancel(repository.WithSystemIdentity(context.Background()))
 	defer stopSLAEngine()
 	if pool != nil {
-		slaEngineWorker := service.NewSLAEngineRecomputeWorker(repository.NewSLAEngineRepository(pool), cfg.SLARecomputeInterval)
+		slaEngineWorker := service.NewSLAEngineRecomputeWorker(repository.NewSLAEngineRepository(repository.NewScoped(pool)), cfg.SLARecomputeInterval)
 		go slaEngineWorker.Run(slaEngineCtx)
 		log.Printf("sla engine recompute worker enabled (every %s)", cfg.SLARecomputeInterval)
 	}
@@ -110,7 +118,10 @@ func main() {
 	// consumer read and discard every change-request record and vice versa —
 	// a separate topic is what isolates the two volumes, where a separate
 	// consumer group would only isolate the processing.
-	crNoticeCtx, stopCRNotices := context.WithCancel(context.Background())
+	// WithSystemIdentity: same reasoning as slaEngineCtx above -- this
+	// drainer runs on its own process-startup context, never an HTTP
+	// request, and CRNoticeRepository's writes are Scoped-wrapped now too.
+	crNoticeCtx, stopCRNotices := context.WithCancel(repository.WithSystemIdentity(context.Background()))
 	defer stopCRNotices()
 	var crPublisher service.EventPublisherService
 	if cfg.CRNoticesEnabled {
@@ -130,7 +141,7 @@ func main() {
 				}),
 				service.NewEventPublishFailureService(repository.NewEventPublishFailureRepository(pool)),
 			)
-			crRepo := repository.NewCRNoticeRepository(pool)
+			crRepo := repository.NewCRNoticeRepository(repository.NewScoped(pool))
 			drainer := service.NewCRNoticeDrainer(
 				crRepo,
 				service.NewCRNoticeService(crRepo, crPublisher),
@@ -139,6 +150,35 @@ func main() {
 			go drainer.Run(crNoticeCtx)
 			log.Printf("change-request notices enabled: publishing to topic %q every %s", cfg.CREventHubTopic, cfg.CRNoticePollInterval)
 		}
+	}
+
+	// Cloud status: the record-triggered path. Started whenever the scope is
+	// configured, because it is only useful when there is a scope to decide
+	// against -- and harmless without one, since HandleOutages returns early.
+	//
+	// Not gated on the delivery side's CLOUD_STATUS_ENABLED: nothing leaves
+	// the estate until csm-scheduled-tasks posts it, and that is where the
+	// double-fire guard belongs.
+	//
+	// It IS gated on its own CLOUD_STATUS_DRAINER_ENABLED, off by default,
+	// because this drainer rewrites cloud_monitor.status -- a column
+	// csm-sync-service also writes while its one-time bulk migration is
+	// still running. Clearing CLOUD_STATUS_SERVICE_IDS would stop the
+	// drainer but take the sweep endpoint and the dashboard reads with it,
+	// so the write needs a switch that does not.
+	if cfg.CloudStatusDrainerEnabled && cfg.DataSource != config.DataSourceServiceNow &&
+		len(cfg.CloudStatusServiceIDs) > 0 {
+		cloudStatusCtx, stopCloudStatus := context.WithCancel(context.Background())
+		defer stopCloudStatus()
+		cloudStatusRepo := repository.NewCloudStatusRepository(pool)
+		cloudStatusDrainer := service.NewCloudStatusDrainer(
+			cloudStatusRepo,
+			service.NewCloudStatusService(cloudStatusRepo, cfg.CloudStatusServiceIDs),
+			cfg.CloudStatusPollInterval,
+		)
+		go cloudStatusDrainer.Run(cloudStatusCtx)
+		log.Printf("cloud status notices enabled: draining every %s across %d services",
+			cfg.CloudStatusPollInterval, len(cfg.CloudStatusServiceIDs))
 	}
 
 	// The health probe listens separately, on its own port, so that only its

@@ -23,7 +23,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // RepoMapping is a GitHub repository and the account it belongs to.
@@ -93,15 +92,16 @@ type GithubSyncRepository interface {
 }
 
 type githubSyncRepository struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewGithubSyncRepository constructs the GitHub sync reader/writer.
-func NewGithubSyncRepository(db *pgxpool.Pool) GithubSyncRepository {
+func NewGithubSyncRepository(db *Scoped) GithubSyncRepository {
 	return &githubSyncRepository{db: db}
 }
 
 func (r *githubSyncRepository) RepoMapping(ctx context.Context, owner, repository string) (*RepoMapping, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	// Lower-cased on both sides: GitHub routes case-insensitively while
 	// preserving the case a repository was created with, so "Choreo" and
 	// "choreo" are the same repository. ServiceNow compared exactly and every
@@ -130,6 +130,7 @@ func (r *githubSyncRepository) RepoMapping(ctx context.Context, owner, repositor
 }
 
 func (r *githubSyncRepository) ChangeRequestByGitReference(ctx context.Context, issueURL string) (*GithubChangeRequest, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `
 		SELECT cr.id::text, wi.number, COALESCE(cr.state::text, '')
 		FROM change_request cr
@@ -148,6 +149,7 @@ func (r *githubSyncRepository) ChangeRequestByGitReference(ctx context.Context, 
 }
 
 func (r *githubSyncRepository) ClaimDelivery(ctx context.Context, deliveryID, event, action string) error {
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `
 		INSERT INTO github_webhook_delivery (delivery_id, event, action)
 		VALUES ($1, $2, NULLIF($3, ''))
@@ -170,6 +172,7 @@ func (r *githubSyncRepository) ClaimDelivery(ctx context.Context, deliveryID, ev
 }
 
 func (r *githubSyncRepository) ReleaseDelivery(ctx context.Context, deliveryID string) error {
+	ctx = withGithubSystemIdentity(ctx)
 	_, err := r.db.Exec(ctx, `DELETE FROM github_webhook_delivery WHERE delivery_id = $1`, deliveryID)
 	if err != nil {
 		return fmt.Errorf("github: release delivery %s: %w", deliveryID, err)
@@ -178,6 +181,7 @@ func (r *githubSyncRepository) ReleaseDelivery(ctx context.Context, deliveryID s
 }
 
 func (r *githubSyncRepository) LinkDelivery(ctx context.Context, deliveryID, changeRequestID string) error {
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `
 		UPDATE github_webhook_delivery
 		SET change_request_id = $2::uuid
@@ -190,6 +194,7 @@ func (r *githubSyncRepository) LinkDelivery(ctx context.Context, deliveryID, cha
 
 // RepoForAccount implements GithubSyncRepository.
 func (r *githubSyncRepository) RepoForAccount(ctx context.Context, accountID string) (*RepoMapping, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `
 		SELECT agr.account_id::text, a.name, COALESCE(agr.credential_ref, ''),
 		       agr.owner, agr.repository
@@ -213,6 +218,7 @@ func (r *githubSyncRepository) RepoForAccount(ctx context.Context, accountID str
 
 // AccountForCase implements GithubSyncRepository.
 func (r *githubSyncRepository) AccountForCase(ctx context.Context, caseID string) (string, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	const query = `SELECT COALESCE(account_id::text, '') FROM work_item WHERE id = $1::uuid`
 	var accountID string
 	err := r.db.QueryRow(ctx, query, caseID).Scan(&accountID)
@@ -227,6 +233,7 @@ func (r *githubSyncRepository) AccountForCase(ctx context.Context, caseID string
 
 // SetCaseGithubIssueNumber implements GithubSyncRepository.
 func (r *githubSyncRepository) SetCaseGithubIssueNumber(ctx context.Context, caseID string, issueNumber int) (bool, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	// IS DISTINCT FROM, matching SetState: re-linking a case to the issue it
 	// already points at should write nothing.
 	const query = `
@@ -242,6 +249,7 @@ func (r *githubSyncRepository) SetCaseGithubIssueNumber(ctx context.Context, cas
 
 // CaseByIssueNumber implements GithubSyncRepository.
 func (r *githubSyncRepository) CaseByIssueNumber(ctx context.Context, accountID string, issueNumber int) (string, error) {
+	ctx = withGithubSystemIdentity(ctx)
 	// Scoped to the account as well as the issue number: two accounts can each
 	// have an issue #23, in different repositories.
 	const query = `

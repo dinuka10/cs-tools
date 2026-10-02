@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/entity"
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/middleware"
 )
 
@@ -35,6 +36,20 @@ type entityAnnouncementRegistryClient interface {
 	SearchCases(ctx context.Context, body []byte) ([]byte, error)
 	SearchAnnouncementRequests(ctx context.Context, body []byte) ([]byte, error)
 }
+
+// registryOneShotCasesClient is implemented by an entity client that can read
+// every matching announcement case in a single call. It is deliberately a
+// separate, optional interface: a client without it (or an entity service
+// without the route) simply keeps using the paged /cases/search loop below,
+// exactly as before.
+type registryOneShotCasesClient interface {
+	SearchAnnouncementRegistryCases(ctx context.Context, body []byte) ([]byte, error)
+}
+
+// The assertion in fetchAllMatchingCases is a runtime one, so a rename or a
+// changed signature on the real client would silently send every registry load
+// back through the slow paged loop. This makes that a compile error instead.
+var _ registryOneShotCasesClient = (*entity.CustomerEntityClient)(nil)
 
 // AnnouncementRegistryHandler backs the Announcements tab's registry list —
 // see SearchAnnouncementRegistry's own doc comment for what it actually does
@@ -317,6 +332,22 @@ func (h *AnnouncementRegistryHandler) fetchAllMatchingCases(ctx context.Context,
 		fieldFilters = append(fieldFilters, map[string]any{"field": "projectId", "op": "in", "values": req.ProjectIDs})
 	}
 
+	// Fast path: one call returns every matching case. Any failure (route
+	// missing on an older entity service, a bound exceeded, an upstream
+	// error, an undecodable body) falls back to the paged loop below, which
+	// is the behaviour this handler had before the fast path existed. A
+	// cancelled request is not retried.
+	if oneShot, ok := h.entity.(registryOneShotCasesClient); ok {
+		cases, err := fetchAllMatchingCasesOneShot(ctx, oneShot, fieldFilters, req.Search)
+		if err == nil {
+			return cases, nil
+		}
+		if ctx.Err() != nil {
+			return nil, err
+		}
+		slog.WarnContext(ctx, "announcement registry one-shot case read failed, falling back to paged search", "err", summarizeErr(err))
+	}
+
 	fetchPage := func(ctx context.Context, offset int) ([]registryCaseView, int, error) {
 		payload := map[string]any{
 			"pagination": map[string]int{"offset": offset, "limit": registryPageLimit},
@@ -348,6 +379,35 @@ func (h *AnnouncementRegistryHandler) fetchAllMatchingCases(ctx context.Context,
 	return fetchAllPagesConcurrently(ctx, registryPageLimit, maxRegistryPages, fetchPage, func() error {
 		return fmt.Errorf("too many matching cases to build the registry safely (exceeded %d pages of %d)", maxRegistryPages, registryPageLimit)
 	})
+}
+
+// fetchAllMatchingCasesOneShot reads every announcement case matching the
+// filters in a single entity-service call. The entity service orders them
+// newest-updated first, same as the paged loop, so the grouping that follows
+// is unchanged.
+func fetchAllMatchingCasesOneShot(ctx context.Context, client registryOneShotCasesClient, fieldFilters []map[string]any, search string) ([]registryCaseView, error) {
+	filters := map[string]any{"filters": fieldFilters}
+	if search != "" {
+		filters["searchQuery"] = search
+	}
+	body, err := json.Marshal(map[string]any{"filters": filters})
+	if err != nil {
+		return nil, fmt.Errorf("marshal registry case request: %w", err)
+	}
+	raw, err := client.SearchAnnouncementRegistryCases(ctx, body)
+	if err != nil {
+		return nil, err
+	}
+	var resp registryCaseSearchResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("decode registry case response: %w", err)
+	}
+	// The entity service reports the count of what it returned; a mismatch
+	// means the body is not what this code expects, so do not trust it.
+	if resp.Total != len(resp.Cases) {
+		return nil, fmt.Errorf("registry case response is inconsistent: total=%d, cases=%d", resp.Total, len(resp.Cases))
+	}
+	return resp.Cases, nil
 }
 
 // fetchAllPublishedRequests pages through every published announcement

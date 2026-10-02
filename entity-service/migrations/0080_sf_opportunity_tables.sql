@@ -6,9 +6,9 @@
 -- You may not alter or remove any copyright or other notice from copies of this content.
 
 -- The Salesforce opportunity tables, mirrored so query-hour ENTITLEMENT can be
--- computed in Postgres. Consumption already can be (time_card); entitlement
--- cannot, because it is derived from opportunity product lines and nothing
--- here carries them. That gap is what blocks the port of ServiceNow's
+-- computed in Postgres. Consumption already can be (time_card, migration 0041);
+-- entitlement cannot, because it is derived from opportunity product lines and
+-- nothing here carries them. That gap is what blocks the port of ServiceNow's
 -- `[Query Hour] Update Opportunity Line`.
 --
 -- Names drop the `u_`/`u_sf_` shape of the source per this repo's convention.
@@ -17,10 +17,11 @@
 -- (u_deployment_meta_information -> deployment_node,
 --  u_product_vulnerabilities -> product_vulnerability).
 
--- Choice values confirmed on u_sf_opportunity.u_query_hour_state: 1 = Notified
--- (75%), 2 = Notified (90%), 3 = Closure Notice (100%/Exceed). There is no
--- explicit "under 75%" choice -- the field is simply empty until a threshold
--- is crossed, so the enum has no NORMAL member and the column stays nullable.
+-- Choice values confirmed on u_sf_opportunity.u_query_hour_state (DEV,
+-- 2026-09-23): 1 = Notified (75%), 2 = Notified (90%),
+-- 3 = Closure Notice (100%/Exceed). There is no explicit "under 75%" choice —
+-- the field is simply empty until a threshold is crossed, so the enum has no
+-- NORMAL member and the column stays nullable.
 DO $$ BEGIN
     CREATE TYPE query_hour_state_enum AS ENUM (
         'NOTIFIED_75', 'NOTIFIED_90', 'CLOSURE_NOTICE_100'
@@ -33,7 +34,7 @@ CREATE TABLE IF NOT EXISTS sf_opportunity (
     updated_on TIMESTAMPTZ NOT NULL,
     created_by VARCHAR(255) NOT NULL,
     updated_by VARCHAR(255) NOT NULL,
-    -- u_opportunity_id: the Salesforce Opportunity id (006E...). Distinct from
+    -- u_opportunity_id: the Salesforce Opportunity id (006E…). Distinct from
     -- `id`, which is the ServiceNow sys_id rewritten as a UUID.
     sf_id VARCHAR(40),
     name VARCHAR(200),
@@ -61,7 +62,7 @@ CREATE TABLE IF NOT EXISTS sf_opportunity_product (
     updated_on TIMESTAMPTZ NOT NULL,
     created_by VARCHAR(255) NOT NULL,
     updated_by VARCHAR(255) NOT NULL,
-    -- u_id: the Salesforce OpportunityLineItem id (00kE...), used in the
+    -- u_id: the Salesforce OpportunityLineItem id (00kE…), used in the
     -- lightning deep-links ServiceNow builds into its emails.
     line_item_sf_id VARCHAR(40),
     name VARCHAR(200),
@@ -100,15 +101,15 @@ CREATE INDEX IF NOT EXISTS idx_sf_opportunity_product_opportunity_id
 CREATE INDEX IF NOT EXISTS idx_sf_opportunity_product_entitlement
     ON sf_opportunity_product (product_name, service_start_date, service_end_date);
 
--- The opportunity <-> project join. It is the only path from a project to the
--- product lines that fund it.
+-- The opportunity <-> project join. Only 34 rows on DEV, but it is the only
+-- path from a project to the product lines that fund it.
 CREATE TABLE IF NOT EXISTS sf_opportunity_link (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,
     updated_on TIMESTAMPTZ NOT NULL,
     created_by VARCHAR(255) NOT NULL,
     updated_by VARCHAR(255) NOT NULL,
-    -- u_id: the Salesforce record id for the link itself (a3UE...).
+    -- u_id: the Salesforce record id for the link itself (a3UE…).
     link_sf_id VARCHAR(40),
     -- u_name is a human-readable code (LO-26-09-N-00034824), not a title.
     number VARCHAR(40),

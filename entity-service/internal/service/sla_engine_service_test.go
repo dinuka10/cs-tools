@@ -163,6 +163,38 @@ func TestSLAEngineService_CompleteResponseClock(t *testing.T) {
 	}
 }
 
+func TestSLAEngineService_CompleteWorkaroundClock(t *testing.T) {
+	repo := newRecordingSLAEngineRepo()
+	svc := NewSLAEngineService(repo, nil)
+
+	svc.CompleteWorkaroundClock(context.Background(), "case-5")
+
+	if len(repo.completed) != 1 || repo.completed[0] != "case-5|WORKAROUND" {
+		t.Errorf("completed = %v, want [case-5|WORKAROUND]", repo.completed)
+	}
+}
+
+// TestSLAEngineService_CompleteFixEtaSharedClocks verifies sharing a fix ETA
+// with the customer completes BOTH the workaround and resolution clocks --
+// unlike CompleteWorkaroundClock/CompleteResponseClock, which each complete
+// exactly one target.
+func TestSLAEngineService_CompleteFixEtaSharedClocks(t *testing.T) {
+	repo := newRecordingSLAEngineRepo()
+	svc := NewSLAEngineService(repo, nil)
+
+	svc.CompleteFixEtaSharedClocks(context.Background(), "case-5")
+
+	want := []string{"case-5|WORKAROUND", "case-5|RESOLUTION"}
+	if len(repo.completed) != len(want) {
+		t.Fatalf("completed = %v, want %v", repo.completed, want)
+	}
+	for i, w := range want {
+		if repo.completed[i] != w {
+			t.Errorf("completed[%d] = %q, want %q", i, repo.completed[i], w)
+		}
+	}
+}
+
 func TestSLAEngineService_ApplyCaseStateEffects(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -183,10 +215,10 @@ func TestSLAEngineService_ApplyCaseStateEffects(t *testing.T) {
 			nil,
 		},
 		{
-			"closed resumes+completes resolution, pauses workaround only",
+			"closed resumes+completes all three clocks",
 			domain.CaseStateClosed,
-			[]string{"case-6|RESOLUTION|false", "case-6|WORKAROUND|true"},
-			[]string{"case-6|RESOLUTION"},
+			[]string{"case-6|RESOLUTION|false", "case-6|WORKAROUND|false"},
+			[]string{"case-6|RESOLUTION", "case-6|WORKAROUND", "case-6|RESPONSE"},
 		},
 		{
 			"work in progress resumes both",

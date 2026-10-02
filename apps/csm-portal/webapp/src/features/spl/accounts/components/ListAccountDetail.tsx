@@ -34,9 +34,9 @@ import {
 } from "@wso2/oxygen-ui";
 import { AlertTriangleIcon, FileTextIcon } from "@wso2/oxygen-ui-icons-react";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
-import { useSplPermissions } from "@features/spl/api/splPermissionsContext";
-import { useGetAccount } from "../api/useSplAccountsApi";
-import type { AccountDetails } from "../api/splAccountTypes";
+import { usePermissions } from "@features/spl/api/permissionsContext";
+import { useGetSplAccount } from "../api/useAccountsApi";
+import type { AccountDetails } from "../api/accountTypes";
 import ListAccountProjects from "./ListAccountProjects";
 import ListAccountEscalations from "./ListAccountEscalations";
 import ListAccountSolutionDocument from "./ListAccountSolutionDocument";
@@ -54,7 +54,7 @@ function TabPanel({ children, value, index }: { children: ReactNode; value: numb
 
 export default function ListAccountDetail({ id }: { id: string }) {
   const [value, setTabValue] = useState(0);
-  const { data, isLoading, error } = useGetAccount(id);
+  const { data, isLoading, error } = useGetSplAccount(id);
 
   return (
     <>
@@ -102,7 +102,7 @@ function AccountHeading({ data, showViewOnDriveButton }: { data: AccountDetails;
   const name = data.name || "Loading...";
   const number = data.number || " Account ";
   const [openEscalate, setOpenEscalate] = useState(false);
-  const permissions = useSplPermissions();
+  const permissions = usePermissions();
   const { showError } = useErrorBanner();
 
   const goToGoogleDrive = () => {

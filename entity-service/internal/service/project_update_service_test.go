@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
@@ -88,26 +89,104 @@ func testProjectUserRepo() stubUserRepo {
 	}
 }
 
-// TestPgProjectUpdateService_RejectsSuspensionProcessState locks in that
-// suspensionProcessState is rejected with a ValidationError rather than
-// silently dropped -- it has no Postgres column anywhere for project (see
-// pgProjectUpdateService's own doc comment) -- and that the repository is
-// never called in that case.
-func TestPgProjectUpdateService_RejectsSuspensionProcessState(t *testing.T) {
+// TestPgProjectUpdateService_IgnoresSuspensionProcessState pins that the parked field is
+// accepted but never handed to the repository, alone or alongside a stored field.
+func TestPgProjectUpdateService_IgnoresSuspensionProcessState(t *testing.T) {
+	open := "Open"
+	for name, req := range map[string]domain.ProjectUpdateRequest{
+		"alone":            {SuspensionProcessState: []byte(`{"a":1}`)},
+		"with a sub-state": {SuspensionProcessState: []byte(`{"a":1}`), EndDateClosureState: &open},
+	} {
+		t.Run(name, func(t *testing.T) {
+			repo := &stubProjectUpdateRepo{}
+			svc := NewProjectUpdateService(repo, testProjectUserRepo(), alwaysUnrestrictedAccess{})
+			ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+			if _, err := svc.UpdateProject(ctx, "11111111-1111-1111-1111-111111111111", req); err != nil {
+				t.Fatalf("UpdateProject() error = %v, want success", err)
+			}
+			if !repo.called || repo.gotReq.SuspensionProcessState != nil {
+				t.Fatalf("repo called = %v with suspensionProcessState %s, want called without it", repo.called, repo.gotReq.SuspensionProcessState)
+			}
+		})
+	}
+}
+
+// TestPgProjectUpdateService_CallerResolution pins decision 4: an allow-listed internal
+// client may PATCH without a user token; any other tokenless caller is refused.
+func TestPgProjectUpdateService_CallerResolution(t *testing.T) {
+	open := "Open"
+	m2mCtx := auth.WithIdentity(context.Background(), auth.Identity{Validated: true, ClientID: "csm-integration"})
+	cases := []struct {
+		name    string
+		ctx     context.Context
+		access  AccessService
+		wantBy  string
+		wantErr bool
+	}{
+		{"internal client without token", m2mCtx, stubAccess{scope: AccessScope{Unrestricted: true}}, "csm-integration", false},
+		// ProjectIDs deliberately includes the project this test actually
+		// requests, so this case reaches (and still exercises) the
+		// identity-resolution check this test is named for, rather than
+		// being rejected earlier by authorizeProject's own project-scope
+		// check for an unrelated reason.
+		{"restricted caller without token", m2mCtx, stubAccess{scope: AccessScope{ProjectIDs: []string{"11111111-1111-1111-1111-111111111111"}}}, "", true},
+		{"no access service wired", m2mCtx, nil, "", true},
+		// access IS now consulted here too -- authorizeProject runs for every
+		// caller, token or not (that's the whole point of the IDOR fix this
+		// pins). What this case still proves: resolveUpdatedBy itself
+		// resolves identity from the user token, not from access -- gotBy
+		// comes back as the token's own email regardless of what access's
+		// scope contains, as long as it's broad enough to authorize the
+		// project at all.
+		{"user token unchanged", contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com")), stubAccess{scope: AccessScope{Unrestricted: true}}, "jane.doe@example.com", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &stubProjectUpdateRepo{}
+			svc := NewProjectUpdateService(repo, testProjectUserRepo(), tc.access)
+			_, err := svc.UpdateProject(tc.ctx, "11111111-1111-1111-1111-111111111111", domain.ProjectUpdateRequest{EndDateClosureState: &open})
+			if tc.wantErr {
+				var unauth *apierror.UnauthorizedError
+				if !errors.As(err, &unauth) || repo.called {
+					t.Fatalf("err = %v, repo.called = %v; want UnauthorizedError and no write", err, repo.called)
+				}
+				return
+			}
+			if err != nil || repo.gotByWhom != tc.wantBy {
+				t.Fatalf("err = %v, updatedBy = %q; want nil, %q", err, repo.gotByWhom, tc.wantBy)
+			}
+		})
+	}
+}
+
+// TestPgProjectUpdateService_RejectsCallerOutsideProjectScope is the
+// regression guard for a real IDOR caught in review: granting a
+// user-token-authenticated caller (customer_admin, specifically) the
+// projects:update permission meant they could update ANY project's
+// settings just by knowing its UUID, since nothing checked whether the
+// caller actually belonged to that project -- a write has no WHERE-clause
+// scope predicate the way a scoped list/by-id read does, so this has to be
+// checked explicitly (see authorizeProject's own doc comment). A caller
+// restricted to a different project must be refused as NotFoundError
+// (never Forbidden, matching every other by-id authorization check in this
+// codebase -- a 403 would confirm the project exists to someone not
+// entitled to know that), and the repository must never be reached.
+func TestPgProjectUpdateService_RejectsCallerOutsideProjectScope(t *testing.T) {
+	open := "Open"
 	repo := &stubProjectUpdateRepo{}
-	svc := NewProjectUpdateService(repo, testProjectUserRepo())
+	access := stubAccess{scope: AccessScope{ProjectIDs: []string{"22222222-2222-2222-2222-222222222222"}}}
+	svc := NewProjectUpdateService(repo, testProjectUserRepo(), access)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
-	_, err := svc.UpdateProject(ctx, "11111111-1111-1111-1111-111111111111", domain.ProjectUpdateRequest{
-		SuspensionProcessState: []byte(`{"a":1}`),
-	})
+	_, err := svc.UpdateProject(ctx, "11111111-1111-1111-1111-111111111111", domain.ProjectUpdateRequest{EndDateClosureState: &open})
 
-	var valErr *apierror.ValidationError
-	if !errors.As(err, &valErr) {
-		t.Fatalf("UpdateProject() error = %v, want *apierror.ValidationError", err)
+	var notFound *apierror.NotFoundError
+	if !errors.As(err, &notFound) {
+		t.Fatalf("UpdateProject() error = %v, want *apierror.NotFoundError", err)
 	}
 	if repo.called {
-		t.Fatal("UpdateProject() called the repository despite an unsupported field")
+		t.Fatal("UpdateProject() reached the repository for a project outside the caller's scope")
 	}
 }
 
@@ -115,7 +194,7 @@ func TestPgProjectUpdateService_RejectsSuspensionProcessState(t *testing.T) {
 // ServiceNow-mode contract's own "at least one field must be provided" rule.
 func TestPgProjectUpdateService_RequiresAtLeastOneField(t *testing.T) {
 	repo := &stubProjectUpdateRepo{}
-	svc := NewProjectUpdateService(repo, testProjectUserRepo())
+	svc := NewProjectUpdateService(repo, testProjectUserRepo(), alwaysUnrestrictedAccess{})
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	_, err := svc.UpdateProject(ctx, "11111111-1111-1111-1111-111111111111", domain.ProjectUpdateRequest{})
@@ -146,7 +225,7 @@ func TestPgProjectUpdateService_PlainPostgresUpdatesFieldsAndNeverCallsSN(t *tes
 			return wantResult, nil
 		},
 	}
-	svc := NewProjectUpdateService(repo, testProjectUserRepo())
+	svc := NewProjectUpdateService(repo, testProjectUserRepo(), alwaysUnrestrictedAccess{})
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	resp, err := svc.UpdateProject(ctx, wantResult.ID, domain.ProjectUpdateRequest{
@@ -186,7 +265,7 @@ func TestPgProjectUpdateService_DualWriteDispatchesExactlyOneMirrorCallOnSuccess
 	mirror := &stubProjectMirror{err: errors.New("sn unreachable")}
 	failures := &recordingSNWritebackFailures{}
 	dispatcher := NewSNWritebackDispatcher(failures)
-	svc := NewProjectUpdateServiceWithSNWriteback(repo, testProjectUserRepo(), dispatcher, mirror)
+	svc := NewProjectUpdateServiceWithSNWriteback(repo, testProjectUserRepo(), alwaysUnrestrictedAccess{}, dispatcher, mirror)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 
 	id := "11111111-1111-1111-1111-111111111111"

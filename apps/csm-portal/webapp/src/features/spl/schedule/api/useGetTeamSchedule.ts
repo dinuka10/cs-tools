@@ -26,7 +26,7 @@ export interface TeamScheduleParams {
 }
 
 /**
- * `GET /spl/abt-team-schedule` — see internal/servicenow/schedule.go. All
+ * `GET /abt-team-schedule` — see internal/servicenow/schedule.go. All
  * query params are optional on the backend; empty strings are sent as-is
  * (matching the source app's own behavior) rather than omitted.
  */
@@ -41,7 +41,7 @@ export function useGetTeamSchedule(
     queryFn: async () => {
       const query = new URLSearchParams({ teamId, from, duration, eventType });
       const result = await api.get<ABTTeamScheduleData>(
-        `/spl/abt-team-schedule?${query.toString()}`,
+        `/abt-team-schedule?${query.toString()}`,
       );
       // GET never 404s on this endpoint (empty filters just return an empty
       // list), so a null here would only mean an unexpected 204 — treat it

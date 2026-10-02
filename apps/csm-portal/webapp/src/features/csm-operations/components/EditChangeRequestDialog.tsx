@@ -42,11 +42,14 @@ import type {
 import AsyncEntitySelect from "@components/AsyncEntitySelect";
 import Editor from "@components/rich-text-editor/Editor";
 import {
+  backendUtcToZonedInput,
   formatDateTimeLocal,
-  isPastDateTime,
+  isPastZonedInput,
   parseDateTimeLocal,
+  zonedInputToBackendUtc,
 } from "@utils/dateTime";
 import { isBlankHtml, sanitizeRichTextHtml } from "@utils/sanitizeHtml";
+import { userLabel } from "@features/csm-operations/utils/incidentFormOptions";
 
 const { DateTimePicker, LocalizationProvider } = DatePickers;
 
@@ -64,26 +67,6 @@ interface EditChangeRequestDialogProps {
   onClose: () => void;
   /** Submit only the changed fields (`PATCH /change-requests/{id}`). */
   onSave: (patch: BePatchChangeRequestPayload) => void;
-}
-
-/**
- * Convert a backend timestamp (`YYYY-MM-DD HH:MM:SS`, or ISO `T`-separated) to
- * the `YYYY-MM-DDTHH:MM` shape this form's state (and the DateTimePicker via
- * {@link parseDateTimeLocal}) uses. The value is treated as plain wall-clock
- * text so no timezone shift is applied.
- */
-function toDateTimeLocal(raw?: string | null): string {
-  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/.exec(raw?.trim() ?? "");
-  return m ? `${m[1]}T${m[2]}` : "";
-}
-
-/** Convert a `datetime-local` value back to the BE's `YYYY-MM-DD HH:MM:SS`. */
-function toBackendDateTime(local: string): string {
-  return `${local.replace("T", " ")}:00`;
-}
-
-function userLabel(u: BeUser): string {
-  return [u.firstName, u.lastName].filter(Boolean).join(" ").trim() || u.email || u.id || "";
 }
 
 /** One long-form plan field, edited as rich text. */
@@ -199,11 +182,11 @@ export default function EditChangeRequestDialog({
   onSave,
 }: EditChangeRequestDialogProps): JSX.Element {
   const initialPlannedStart = useMemo(
-    () => toDateTimeLocal(cr.plannedStartOn),
+    () => backendUtcToZonedInput(cr.plannedStartOn),
     [cr.plannedStartOn],
   );
   const initialPlannedEnd = useMemo(
-    () => toDateTimeLocal(cr.plannedEndOn),
+    () => backendUtcToZonedInput(cr.plannedEndOn),
     [cr.plannedEndOn],
   );
   const initialAssignedTeamId = cr.assignedTeam?.id ?? "";
@@ -239,11 +222,15 @@ export default function EditChangeRequestDialog({
 
   const patch = useMemo<BePatchChangeRequestPayload>(() => {
     const next: BePatchChangeRequestPayload = {};
+    // The form holds wall-clock values in the user's timezone (seeded from the
+    // record's UTC value above); the BE takes UTC.
     if (plannedStart !== initialPlannedStart && plannedStart) {
-      next.plannedStartOn = toBackendDateTime(plannedStart);
+      const utc = zonedInputToBackendUtc(plannedStart);
+      if (utc) next.plannedStartOn = utc;
     }
     if (plannedEnd !== initialPlannedEnd && plannedEnd) {
-      next.plannedEndOn = toBackendDateTime(plannedEnd);
+      const utc = zonedInputToBackendUtc(plannedEnd);
+      if (utc) next.plannedEndOn = utc;
     }
     if (assignedTeamId !== initialAssignedTeamId && assignedTeamId) {
       next.assignedTeamId = assignedTeamId;
@@ -306,7 +293,7 @@ export default function EditChangeRequestDialog({
   // Non-blocking: editing a CR's planned start to a past instant is unusual
   // but not forbidden (e.g. recording when it actually started), so this
   // only warns.
-  const plannedStartIsPast = isPastDateTime(startDate);
+  const plannedStartIsPast = isPastZonedInput(plannedStart);
 
   // Rich-text plan field. The editor takes no `id`/native label, so the
   // visible label is a separate Typography tied to the control via
@@ -413,7 +400,7 @@ export default function EditChangeRequestDialog({
             getId={(g) => g.id}
             getLabel={(g) => g.name}
             knownLabel={cr.assignedTeam?.name}
-            helperText="Required before approval can be requested."
+            helperText="Required before moving to Assess — its members become the Assess-stage approvers."
           />
           <AsyncEntitySelect<BeUser>
             id="cr-edit-assigned-engineer"

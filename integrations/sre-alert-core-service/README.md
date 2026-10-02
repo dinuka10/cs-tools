@@ -11,7 +11,7 @@ notifications independently until they're actually delivered.
 
 - **Alert discovery.** A poller compares the `alert_seq` counter against its own
   persisted `alert_cursor`, so it never needs CDC or a message queue to know what's
-  new. `alert-ingestion` also posts to `POST /alert` to wake it early; a fixed
+  new. `alert-ingestion` also posts to `POST /alertz` to wake it early; a fixed
   interval is the backstop if that ping never arrives.
 - **Deduplication by fingerprint.** Every alert is normalized (severity label,
   category, defaults from `CORE_ALERT_DEFAULTS`) and folded into an incident keyed
@@ -72,10 +72,13 @@ expires and resumes from the same durable cursor. Leadership and progress
 both live in Cassandra rather than in-memory, so replicas can be added,
 removed, or restarted freely, but note that duplicate or dropped alerts are
 not fully impossible: lease handoff, CSM's own dedup-by-tag lookup (used
-before every incident create), and the shutdown drain sequence all narrow
-those windows significantly, they don't eliminate them under every failure
-mode (e.g. clock skew between replicas). See the lease and notify packages'
-own doc comments for the specific tradeoffs.
+before every incident create), the shutdown drain sequence, and a `version`
+column that fences every mutating write on `incidents_processed` (`IF version
+= <value just read>`, so a replica whose lease already expired can't silently
+overwrite a newer leader's update) all narrow those windows significantly,
+they don't eliminate them under every failure mode (e.g. clock skew between
+replicas). See the lease and notify packages' own doc comments for the
+specific tradeoffs.
 
 ## Package layout
 
@@ -92,11 +95,14 @@ own doc comments for the specific tradeoffs.
   decides where each incident needs to go next.
 - `internal/model`: the `Alert`/`Incident` shapes, severity/fingerprint
   normalization, and HTML work note formatting.
-- `internal/hub`: the `/alert` HTTP handler that just wakes the poller early.
+- `internal/hub`: the `/alertz` HTTP handler that just wakes the poller early.
 - `internal/cassandra`: connection setup and the CAS-based sequence counter
   helpers the poller and lease both build on.
 - `internal/config`: loads and validates `config.toml`.
+- `internal/auth`: PBKDF2 hashing/verification, the `integration_users`
+  Cassandra repository, and the `RequireAuth` middleware (not currently applied to any route).
 - `cmd/server`: wires everything together and manages startup/shutdown.
+- `cmd/user`: CLI to create/rotate, list, enable, and disable `integration_users` rows.
 
 ## Running it
 
@@ -120,6 +126,9 @@ defaults this service falls back to on its own.
 ```bash
 cp config.toml.example config.toml
 ```
+
+Internal API users (`integration_users`) are documented separately in
+[`PROVISION.md`](PROVISION.md).
 
 ## Choreo Deployment
 

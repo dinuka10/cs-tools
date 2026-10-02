@@ -35,7 +35,7 @@ import {
 } from "@wso2/oxygen-ui";
 import { useColorScheme } from "@mui/material/styles";
 import { ChevronsLeftIcon, ChevronsRightIcon, ChevronLeftIcon, ChevronRightIcon } from "@wso2/oxygen-ui-icons-react";
-import type { DataStruct } from "../api/splAccountTypes";
+import type { DataStruct } from "../api/accountTypes";
 import NoDataAvailable from "./NoDataAvailable";
 
 export interface AccountsDataTableProps {

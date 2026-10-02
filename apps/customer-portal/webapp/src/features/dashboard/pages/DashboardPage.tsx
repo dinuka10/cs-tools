@@ -398,7 +398,8 @@ export default function DashboardPage(): JSX.Element {
     permissions,
   ]);
 
-  // outstanding engagements — grouped into 4 display categories, Services = Follow Up + Consultancy
+  // outstanding engagements — one slice per engagement type, matched by
+  // display name against OUTSTANDING_ENGAGEMENTS_CATEGORY_CHART_DATA
   const outstandingEngagements = useMemo(() => {
     const outstanding = engagementStats?.outstandingEngagementTypeCount ?? [];
 

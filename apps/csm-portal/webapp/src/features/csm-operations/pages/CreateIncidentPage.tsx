@@ -480,6 +480,7 @@ export default function CreateIncidentPage(): JSX.Element {
               <AsyncEntitySelect<BeUser>
                 id="incident-caller"
                 label="Caller"
+                required
                 placeholder="Search people…"
                 value={callerId}
                 onChange={(v) => {
@@ -504,6 +505,7 @@ export default function CreateIncidentPage(): JSX.Element {
               <AsyncEntitySelect<BeItService>
                 id="incident-service"
                 label="Service"
+                required
                 placeholder="Search services…"
                 value={serviceId}
                 onChange={(next, service) => {

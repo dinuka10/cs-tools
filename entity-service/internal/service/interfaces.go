@@ -497,7 +497,7 @@ type AccountContactService interface {
 }
 
 // OpportunityService defines the operations available on the opportunity entity.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// Postgres modes read sf_opportunity, internal callers only.
 type OpportunityService interface {
 	// SearchOpportunities returns a paginated list of opportunities matching the
 	// filters in req.
@@ -508,7 +508,7 @@ type OpportunityService interface {
 }
 
 // InvoiceService defines the operations available on the invoice entity.
-// All methods require the ServiceNow data source; there is no Postgres fallback.
+// Postgres modes read sf_invoice, internal callers only.
 type InvoiceService interface {
 	// SearchInvoices returns a paginated list of invoices matching the filters in req.
 	SearchInvoices(ctx context.Context, req domain.SearchInvoicesRequest) (domain.SearchInvoicesResponse, error)
@@ -518,9 +518,8 @@ type InvoiceService interface {
 }
 
 // ProjectOpportunityLinkService defines the operations available on
-// project-opportunity links. ServiceNow data source only; there is no Postgres
-// fallback, and no by-id fetch -- the underlying ServiceNow data has no
-// single-record endpoint for this resource (search only).
+// project-opportunity links. Postgres modes read sf_opportunity_link, internal
+// callers only. No by-id fetch -- ServiceNow has no single-record endpoint for it.
 type ProjectOpportunityLinkService interface {
 	// SearchProjectOpportunityLinks returns a paginated list of project-opportunity
 	// links matching the filters in req.
@@ -635,17 +634,23 @@ type CaseService interface {
 	// case there simply falls back to the account's default watchers, same
 	// as an empty real result.
 	ProjectContactEmailsByRole(ctx context.Context, projectID, role string) ([]string, error)
-	// ProjectAudienceFacts returns projectID's onboarding_status (raw enum
-	// label) and whether its project type is Evaluation Subscription -- see
-	// CaseRepository.ProjectAudienceFacts' own doc comment for the full
-	// reasoning. Used by publishCaseCreatedEvent to populate
-	// events.CaseCreatedPayload.ProjectOnboardingStatus/IsEvaluationAccount
-	// for csm-notification-service's own case.created Chat audience
-	// resolution. A deployment with no Postgres access at all (a pure
-	// ServiceNow data source with no pgFallback configured) returns the
-	// zero value ("", false) and no error -- same "Postgres-only schema,
-	// degrade gracefully" posture as ProjectContactEmailsByRole above.
-	ProjectAudienceFacts(ctx context.Context, projectID string) (onboardingStatus string, isEvaluationSubscription bool, err error)
+	// AccountDefaultWatcherEmails returns the account owning projectID's four
+	// named stakeholders' email addresses (technical owner, secondary
+	// technical owner, account manager, renewal account manager) -- see
+	// CaseRepository.AccountDefaultWatcherEmails' own doc comment for why
+	// these are resolved fresh at publish time rather than read from a
+	// persisted watch list. A project with no linked account, or no Postgres
+	// access at all (a pure ServiceNow data source with no pgFallback
+	// configured), returns an empty slice and no error.
+	AccountDefaultWatcherEmails(ctx context.Context, projectID string) ([]string, error)
+	// GetCaseEtaSharedOn returns work_item.eta_shared_on for caseID -- see
+	// CaseRepository.GetCaseEtaSharedOn's own doc comment. Lets the plain
+	// ServiceNow data source's own GetCaseByID (which has no Postgres row of
+	// its own to read this from, unlike BestCaseFixEta/etc., which ARE real
+	// ServiceNow fields) merge in the one fix-ETA-related fact that only
+	// ever lives in Postgres. A deployment with no Postgres access at all
+	// (pgFallback nil) returns nil and no error.
+	GetCaseEtaSharedOn(ctx context.Context, caseID string) (*time.Time, error)
 	// SearchCases returns a paginated list of cases filtered by optional project IDs,
 	// deployment IDs, deployed product IDs, state keys, severity keys, and search query.
 	// A ValidationError is returned for invalid input; any other error indicates an
@@ -1215,6 +1220,17 @@ type InstanceService interface {
 
 // OutageService defines the operations available on the outages entity. All
 // methods require the ServiceNow data source; there is no Postgres fallback.
+// OutageNotificationService decides which internal-stakeholder outage emails
+// are due and records that they were reported. It does not send them — see
+// Sweep's own doc comment for why delivery belongs to the caller.
+type OutageNotificationService interface {
+	// Sweep evaluates every outage awaiting notification, records the sends,
+	// and returns what the caller should deliver. Internal callers only.
+	Sweep(ctx context.Context, limit int) (domain.OutageNotificationSweepResponse, error)
+	// State returns what has already been sent for one outage.
+	State(ctx context.Context, outageID string) (domain.OutageNotificationState, error)
+}
+
 type OutageService interface {
 	// CreateOutage creates a new outage. Type, Begin, and ShortDescription are
 	// required. AcknowledgePublicPublication is required when the resolved
@@ -1249,4 +1265,67 @@ type OutageService interface {
 	// GetOutageMetadata returns the live choice lists (types, statuses,
 	// channels, monitored clouds) needed to render an outage create/edit form.
 	GetOutageMetadata(ctx context.Context) (domain.OutageMetadataResponse, error)
+}
+
+// CloudStatusDashboardService serves what the public cloud status dashboard
+// renders, replacing five ServiceNow Scripted REST APIs with Postgres reads.
+// Read-only: the dashboard must never be able to change what it shows.
+type CloudStatusDashboardService interface {
+	// Monitors returns the per-region, per-group monitor view for one cloud.
+	Monitors(ctx context.Context, cloud string) (domain.CloudStatusMonitorsResponse, error)
+	// Incidents returns six months of incident history for one cloud, with
+	// every month key present whether or not it has incidents.
+	Incidents(ctx context.Context, cloud string) (domain.CloudStatusIncidentsResponse, error)
+	// Availabilities returns one weighted uptime figure per region per
+	// window: the port of the /availabilities resource.
+	Availabilities(ctx context.Context, cloud string) (domain.CloudAvailabilitiesResponse, error)
+	// AvailabilityHistory returns the 90-day daily uptime chart, nested
+	// region -> group -> monitor: the port of the /history resource.
+	AvailabilityHistory(ctx context.Context, cloud string) (domain.CloudAvailabilityHistoryResponse, error)
+	// IncidentDetail returns one outage's public detail view, or nil when no
+	// outage with that id belongs to that cloud. The concrete type varies:
+	// a full detail object, or an attachments-only one when the outage's
+	// incident does not qualify -- both are the source's shapes.
+	IncidentDetail(ctx context.Context, id, cloud string) (any, error)
+}
+
+// CloudStatusService decides which outages owe the public status dashboard a
+// webhook, and records what was delivered.
+//
+// The port of ServiceNow's `Cloud Status Event Notification Flow`. It decides
+// and records only; the posting is done by csm-scheduled-tasks, the same
+// division the outage and query-hour notices use.
+type CloudStatusService interface {
+	// Sweep records a webhook for every in-scope outage transition not
+	// already recorded. It is idempotent: a sweep that finds nothing new
+	// records nothing, which is the steady state.
+	Sweep(ctx context.Context) (domain.CloudStatusSweepResponse, error)
+
+	// PendingWebhooks returns the webhooks still owed to the dashboard, with
+	// their cloud already translated to the dashboard's slug.
+	PendingWebhooks(ctx context.Context) (domain.PendingCloudStatusWebhooksResponse, error)
+
+	// RecordDelivery stamps the outcome of one attempt. A ValidationError is
+	// returned when a failure is reported without an error message.
+	RecordDelivery(ctx context.Context, req domain.RecordCloudStatusDeliveryRequest) error
+
+	// HandleOutages re-derives the current transition for the named outages.
+	// The record-triggered counterpart to Sweep, reaching the same conclusions
+	// by the same code -- see CloudStatusDrainer.
+	HandleOutages(ctx context.Context, outageIDs []string) error
+}
+
+// OutageCommunicationService is the port of ServiceNow's `Outage
+// Communication` flow: the SRE-facing declaration and resolution emails.
+//
+// Distinct from OutageNotificationService, which ports the internal
+// STAKEHOLDER notifier. Different flow, different audience, different
+// idempotency mechanism — this one keys on its own communication log
+// because ServiceNow's version relies on "Run Trigger: Once" and writes no
+// state to the outage at all.
+type OutageCommunicationService interface {
+	// Sweep returns the emails owed, recording each before returning it.
+	Sweep(ctx context.Context, limit int) (domain.OutageCommunicationSweepResponse, error)
+	// Log returns one outage's communication history, newest first.
+	Log(ctx context.Context, number string) ([]domain.OutageCommunicationLogEntry, error)
 }

@@ -32,11 +32,26 @@ import (
 
 // testUser is the authenticated user injected into request contexts. UserID is
 // the identity provider's user id carried on the gateway-validated token — it
-// is NOT the platform's own user record id (see testPlatformUserID).
+// is NOT the platform's own user record id (see testPlatformUserID). Roles
+// holds every test role testAccessConfig() (access_test.go) grants a
+// permission for, so testUser passes every /spl/* handler's gates by
+// default (PermViewerAccess plus every sub-permission) — a test needing to
+// exercise a denial builds its own narrower *middleware.UserInfo instead
+// (see e.g. spl_accounts_test.go's TestSplEscalateCase_RequiresEscalation).
 var testUser = &middleware.UserInfo{
 	Email:  "agent@example.com",
 	UserID: "f2d9bf5b-7067-43dc-8578-802c8623af5d",
+	Roles: []string{
+		"test-sales-solutions", "test-escalator", "test-attachment-downloader",
+		"test-usage-metrics-viewer", "test-viewer",
+	},
 }
+
+// viewerAccessGuard is the shared AccessGuard every /spl/* handler test wires
+// its handler with, built from the same testAccessConfig() (access_test.go)
+// every non-SPL handler test already uses — one guard, one set of test role
+// names, for the whole package.
+var viewerAccessGuard = NewAccessGuard(testAccessConfig())
 
 // testPlatformUserID is the id GET /users/me resolves for testUser: the
 // platform's own user record id, from a different id space than
@@ -48,6 +63,40 @@ const testPlatformUserID = "94a1b01b-1b3c-f050-cb68-98aebd4bcb27"
 // withUser returns r with testUser stored in its context.
 func withUser(r *http.Request) *http.Request {
 	return r.WithContext(middleware.WithUserInfo(r.Context(), testUser))
+}
+
+// testCsEngineerUser holds PermWrite (test-cs-engineer) -- unlike testUser
+// (deliberately SPL-only, see its own doc comment), for CreateCaseComment
+// subtests exercising the PermWrite narrowing PermCreateWorkNote's own doc
+// comment describes: a non-work_note (customer-visible) comment needs full
+// PermWrite, which testUser doesn't hold. Identity resolution for the
+// ownership check (resolveCurrentUserID) goes through the mocked entity
+// client's GetUserMe, not this struct's own fields, so which UserInfo is
+// injected doesn't affect it.
+var testCsEngineerUser = &middleware.UserInfo{
+	Email:  "engineer@example.com",
+	UserID: "f2d9bf5b-7067-43dc-8578-802c8623af5e",
+	Roles:  []string{"test-cs-engineer"},
+}
+
+// withCsEngineerUser returns r with testCsEngineerUser stored in its context.
+func withCsEngineerUser(r *http.Request) *http.Request {
+	return r.WithContext(middleware.WithUserInfo(r.Context(), testCsEngineerUser))
+}
+
+// testWorknoteCreatorUser holds ONLY PermCreateWorkNote (test-worknote-creator)
+// -- not PermWrite -- for CreateCaseComment subtests pinning the boundary
+// PermCreateWorkNote's own doc comment describes: this caller may post a
+// work_note, never anything else.
+var testWorknoteCreatorUser = &middleware.UserInfo{
+	Email:  "worknote-creator@example.com",
+	UserID: "f2d9bf5b-7067-43dc-8578-802c8623af5f",
+	Roles:  []string{"test-worknote-creator"},
+}
+
+// withWorknoteCreatorUser returns r with testWorknoteCreatorUser stored in its context.
+func withWorknoteCreatorUser(r *http.Request) *http.Request {
+	return r.WithContext(middleware.WithUserInfo(r.Context(), testWorknoteCreatorUser))
 }
 
 // ----- assertion helpers -----
@@ -107,6 +156,7 @@ type mockEntityCaseClient struct {
 	searchFeedbackFn           func(ctx context.Context, body []byte) ([]byte, error)
 	aggregateFeedbackFn        func(ctx context.Context, body []byte) ([]byte, error)
 	getCaseFn                  func(ctx context.Context, caseID string) ([]byte, error)
+	getProductRepoMappingFn    func(ctx context.Context, name string) ([]byte, error)
 	createCaseAttachmentFn     func(ctx context.Context, body []byte) ([]byte, error)
 	searchCaseAttachmentsFn    func(ctx context.Context, body []byte) ([]byte, error)
 	getCaseAttachmentContentFn func(ctx context.Context, attachmentID string) ([]byte, string, error)
@@ -235,6 +285,13 @@ func (m *mockEntityCaseClient) AggregateFeedback(ctx context.Context, body []byt
 func (m *mockEntityCaseClient) GetCase(ctx context.Context, caseID string) ([]byte, error) {
 	if m.getCaseFn != nil {
 		return m.getCaseFn(ctx, caseID)
+	}
+	return []byte(`{}`), nil
+}
+
+func (m *mockEntityCaseClient) GetProductRepoMapping(ctx context.Context, name string) ([]byte, error) {
+	if m.getProductRepoMappingFn != nil {
+		return m.getProductRepoMappingFn(ctx, name)
 	}
 	return []byte(`{}`), nil
 }
@@ -376,6 +433,7 @@ type mockSCIMClient struct {
 	searchUserFn         func(ctx context.Context, email string) (*scim.UserInfo, error)
 	searchExternalUserFn func(ctx context.Context, email string) (*scim.ExternalUserInfo, error)
 	updateUserPhoneFn    func(ctx context.Context, userID, mobile string) (*string, error)
+	getRoleFn            func(ctx context.Context, roleID string) ([]scim.RoleMember, error)
 }
 
 func (m *mockSCIMClient) SearchUser(ctx context.Context, email string) (*scim.UserInfo, error) {
@@ -395,6 +453,13 @@ func (m *mockSCIMClient) SearchExternalUser(ctx context.Context, email string) (
 func (m *mockSCIMClient) UpdateUserPhone(ctx context.Context, userID, mobile string) (*string, error) {
 	if m.updateUserPhoneFn != nil {
 		return m.updateUserPhoneFn(ctx, userID, mobile)
+	}
+	return nil, nil
+}
+
+func (m *mockSCIMClient) GetRole(ctx context.Context, roleID string) ([]scim.RoleMember, error) {
+	if m.getRoleFn != nil {
+		return m.getRoleFn(ctx, roleID)
 	}
 	return nil, nil
 }
@@ -615,6 +680,7 @@ func (m *mockEntityOnboardingStepClient) SearchOnboardingSteps(ctx context.Conte
 type mockEntityProductClient struct {
 	searchProductsFn        func(ctx context.Context, body []byte) ([]byte, error)
 	searchProductVersionsFn func(ctx context.Context, productID string, body []byte) ([]byte, error)
+	getProductRepoMappingFn func(ctx context.Context, name string) ([]byte, error)
 }
 
 func (m *mockEntityProductClient) SearchProducts(ctx context.Context, body []byte) ([]byte, error) {
@@ -627,6 +693,13 @@ func (m *mockEntityProductClient) SearchProducts(ctx context.Context, body []byt
 func (m *mockEntityProductClient) SearchProductVersions(ctx context.Context, productID string, body []byte) ([]byte, error) {
 	if m.searchProductVersionsFn != nil {
 		return m.searchProductVersionsFn(ctx, productID, body)
+	}
+	return []byte(`{}`), nil
+}
+
+func (m *mockEntityProductClient) GetProductRepoMapping(ctx context.Context, name string) ([]byte, error) {
+	if m.getProductRepoMappingFn != nil {
+		return m.getProductRepoMappingFn(ctx, name)
 	}
 	return []byte(`{}`), nil
 }
@@ -1176,6 +1249,54 @@ func (m *mockEntityTaskClient) UpdateTask(ctx context.Context, id string, body [
 		return m.updateTaskFn(ctx, id, body)
 	}
 	return []byte(`{"id":"11111111-1111-1111-1111-111111111111"}`), nil
+}
+
+// ----- mock sales entity / entity-service scan clients (user_scan.go) -----
+
+type mockSalesEntityClient struct {
+	getContactByEmailFn    func(ctx context.Context, email string) (*entity.Contact, error)
+	getSubscriptionByKeyFn func(ctx context.Context, subscriptionKey string) (*entity.Subscription, error)
+}
+
+func (m *mockSalesEntityClient) GetContactByEmail(ctx context.Context, email string) (*entity.Contact, error) {
+	if m.getContactByEmailFn != nil {
+		return m.getContactByEmailFn(ctx, email)
+	}
+	return nil, nil
+}
+
+func (m *mockSalesEntityClient) GetSubscriptionByKey(ctx context.Context, subscriptionKey string) (*entity.Subscription, error) {
+	if m.getSubscriptionByKeyFn != nil {
+		return m.getSubscriptionByKeyFn(ctx, subscriptionKey)
+	}
+	return nil, nil
+}
+
+type mockEntityScanClient struct {
+	searchUsersFn                    func(ctx context.Context, body []byte) ([]byte, error)
+	searchProjectsFn                 func(ctx context.Context, body []byte) ([]byte, error)
+	resendProjectContactInvitationFn func(ctx context.Context, projectID, email string) ([]byte, error)
+}
+
+func (m *mockEntityScanClient) SearchUsers(ctx context.Context, body []byte) ([]byte, error) {
+	if m.searchUsersFn != nil {
+		return m.searchUsersFn(ctx, body)
+	}
+	return []byte(`{"users":[]}`), nil
+}
+
+func (m *mockEntityScanClient) SearchProjects(ctx context.Context, body []byte) ([]byte, error) {
+	if m.searchProjectsFn != nil {
+		return m.searchProjectsFn(ctx, body)
+	}
+	return []byte(`{"projects":[]}`), nil
+}
+
+func (m *mockEntityScanClient) ResendProjectContactInvitation(ctx context.Context, projectID, email string) ([]byte, error) {
+	if m.resendProjectContactInvitationFn != nil {
+		return m.resendProjectContactInvitationFn(ctx, projectID, email)
+	}
+	return nil, nil
 }
 
 // ----- mock entity comment client -----

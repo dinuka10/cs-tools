@@ -43,6 +43,7 @@ var validOnboardingStepName = map[domain.OnboardingStepName]bool{
 	domain.OnboardingStepDatabase:     true,
 	domain.OnboardingStepEmail:        true,
 	domain.OnboardingStepRegistration: true,
+	domain.OnboardingStepWelcomeEmail: true,
 }
 
 var validOnboardingStepStatus = map[domain.OnboardingStepStatus]bool{
@@ -67,14 +68,7 @@ func NewOnboardingStepService(repo repository.OnboardingStepRepository, access A
 // requireInternalCaller rejects anyone whose AccessScope is not Unrestricted,
 // i.e. every caller that is not an allow-listed internal service.
 func (s *onboardingStepService) requireInternalCaller(ctx context.Context) error {
-	scope, err := s.access.ResolveScope(ctx)
-	if err != nil {
-		return err
-	}
-	if !scope.Unrestricted {
-		return &apierror.ForbiddenError{Msg: "onboarding steps are only available to internal services"}
-	}
-	return nil
+	return RequireInternalCaller(ctx, s.access, "onboarding steps are only available to internal services")
 }
 
 // Upsert implements OnboardingStepService.
@@ -88,7 +82,7 @@ func (s *onboardingStepService) Upsert(ctx context.Context, req domain.UpsertOnb
 	}
 	req.Step = domain.OnboardingStepName(strings.ToUpper(strings.TrimSpace(string(req.Step))))
 	if !validOnboardingStepName[req.Step] {
-		return domain.OnboardingStep{}, &apierror.ValidationError{Msg: "step must be one of IDENTITY, DATABASE, EMAIL, REGISTRATION"}
+		return domain.OnboardingStep{}, &apierror.ValidationError{Msg: "step must be one of IDENTITY, DATABASE, EMAIL, REGISTRATION, WELCOME_EMAIL"}
 	}
 	req.Status = domain.OnboardingStepStatus(strings.ToUpper(strings.TrimSpace(string(req.Status))))
 	if !validOnboardingStepStatus[req.Status] {

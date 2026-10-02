@@ -25,13 +25,17 @@ import (
 )
 
 type projectContactService struct {
-	repo repository.ProjectContactRepository
+	repo   repository.ProjectContactRepository
+	access AccessService
 }
 
 // NewProjectContactService constructs a ProjectContactService backed by Postgres.
-func NewProjectContactService(repo repository.ProjectContactRepository) ProjectContactService {
-	return &projectContactService{repo: repo}
+func NewProjectContactService(repo repository.ProjectContactRepository, access AccessService) ProjectContactService {
+	return &projectContactService{repo: repo, access: access}
 }
+
+// registeredProjectContactState is the state the access check requires.
+const registeredProjectContactState = "REGISTERED"
 
 func projectContactRowToDomain(row repository.ProjectContactRow) domain.ProjectContact {
 	pc := domain.ProjectContact{
@@ -65,14 +69,15 @@ func projectContactRowToDomain(row repository.ProjectContactRow) domain.ProjectC
 		// account_contact.user_name at all -- see ProjectContactRow's own
 		// doc comment.
 		pc.CustomerContactPresent = true
-		// GrantsCaseAccess: that resolved identity's own email matches the
-		// address this row was invited under, case-insensitively -- the
-		// access rule domain.ProjectContact.GrantsCaseAccess's own doc
-		// comment describes. Deliberately not just CustomerContactPresent:
-		// a row invited under one address but linked to a contact whose own
-		// address differs is invisible to both.
-		if row.ResolvedEmail != nil && strings.EqualFold(*row.ResolvedEmail, row.Email) {
+		// GrantsCaseAccess mirrors AccessRepository.RegisteredProjectIDs: the
+		// user's email matches the invited address and the row is REGISTERED.
+		if row.ResolvedEmail != nil && strings.EqualFold(*row.ResolvedEmail, row.Email) &&
+			row.RegistrationState == registeredProjectContactState {
 			pc.GrantsCaseAccess = true
+		}
+		// Email is the linked user's address, else the invited one (as on ServiceNow).
+		if row.ResolvedEmail != nil && *row.ResolvedEmail != "" {
+			pc.Email = *row.ResolvedEmail
 		}
 	}
 	return pc
@@ -90,7 +95,7 @@ func (s *projectContactService) SearchProjectContacts(ctx context.Context, proje
 		return domain.SearchProjectContactsResponse{}, err
 	}
 
-	callerEmail, err := resolveCallerEmail(ctx)
+	callerEmail, err := resolveContactCaller(ctx, s.access)
 	if err != nil {
 		return domain.SearchProjectContactsResponse{}, err
 	}
@@ -122,7 +127,7 @@ func (s *projectContactService) GetProjectContact(ctx context.Context, projectID
 		return domain.ProjectContact{}, err
 	}
 
-	callerEmail, err := resolveCallerEmail(ctx)
+	callerEmail, err := resolveContactCaller(ctx, s.access)
 	if err != nil {
 		return domain.ProjectContact{}, err
 	}

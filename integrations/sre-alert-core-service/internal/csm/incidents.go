@@ -33,16 +33,8 @@ type CreateIncidentRequest struct {
 	Urgency   string  `json:"urgency"` // "HIGH" | "MEDIUM" | "LOW"
 	Subject   string  `json:"subject"`
 	WorkNotes *string `json:"workNotes,omitempty"`
-	// CorrelationID is the dedup fingerprint tag, stored on ServiceNow's own
-	// correlation_id field so SearchIncidentByCorrelationID can find a prior
-	// create by exact match, without needing the tag visible in Subject or
-	// WorkNotes.
+	// CorrelationID is the dedup fingerprint tag on ServiceNow's own correlation_id field, so SearchIncidentByCorrelationID finds a prior create by exact match.
 	CorrelationID *string `json:"correlationId,omitempty"`
-	// Environment is the source alert's environment label (e.g. "Staging",
-	// "Production"). entity-service persists it on its own incident row and
-	// forwards it to ServiceNow's custom incident.u_enviroment field
-	// (max length 40).
-	Environment *string `json:"environment,omitempty"`
 }
 
 // createdIncident is the subset of the response's nested "incident" object this service actually reads.
@@ -159,11 +151,7 @@ func (c *Client) IncidentState(ctx context.Context, number string) (open bool, f
 	return openIncidentStates[*resp.Incidents[0].State], true, nil
 }
 
-// SearchIncidentByCorrelationID is the pre-create dedup check: a lost CreateIncident response must not
-// cause a duplicate on retry. Matches on ServiceNow's own correlation_id field (exact match) rather than
-// free-text search, so the dedup tag never needs to appear in Subject or WorkNotes. Falls back to the
-// legacy free-text search when no correlationId hit is found, since incidents created before correlationId
-// was wired in only have the tag in Subject/WorkNotes.
+// SearchIncidentByCorrelationID is the pre-create dedup check (a lost create response must not cause a duplicate on retry), matching correlation_id exactly, falling back to legacy free-text search for pre-correlationId incidents.
 func (c *Client) SearchIncidentByCorrelationID(ctx context.Context, correlationID string) (id, number string, found bool, err error) {
 	hit, err := c.searchIncidents(ctx, searchIncidentsFilters{CorrelationID: correlationID})
 	if err != nil {

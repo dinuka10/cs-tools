@@ -25,7 +25,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -111,13 +110,10 @@ type ProblemRepository interface {
 	// precisely rather than as an opaque infrastructure error if it ever
 	// does.
 	//
-	// Only fields with an unambiguous, already-established column mapping
-	// are written: req.Category/req.Subcategory are deliberately NOT
-	// resolved to problem.category/problem.subcategory_id here, for the
-	// same reason IncidentRepository.CreateIncidentFromServiceNow's own doc
-	// comment already gives for incident's Subcategory -- ServiceNow's own
-	// free-text choice-list spelling has no established mapping back to
-	// problem_category_enum or problem_subcategory's lookup rows.
+	// req.Category is normalized to uppercase and written to
+	// problem.category. req.Subcategory is matched case-insensitively against
+	// problem_subcategory.value within that category; unmatched values remain
+	// NULL.
 	CreateProblemFromServiceNow(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error)
 
 	// UpdateProblemFields writes any subset of the PATCH /problems/{id}
@@ -144,11 +140,11 @@ type ProblemRepository interface {
 }
 
 type problemRepo struct {
-	db *pgxpool.Pool
+	db *Scoped
 }
 
 // NewProblemRepository constructs a ProblemRepository backed by the given connection pool.
-func NewProblemRepository(db *pgxpool.Pool) ProblemRepository {
+func NewProblemRepository(db *Scoped) ProblemRepository {
 	return &problemRepo{db: db}
 }
 
@@ -457,38 +453,55 @@ const createProblemFromServiceNowQuery = `
 	WITH inserted_work_item AS (
 		INSERT INTO work_item (
 			id, created_on, updated_on, created_by, updated_by,
-			number, subject, type, parent_id
+			number, subject, description, type, parent_id
 		)
 		VALUES (
 			$1, NOW(), NOW(), $2, $2,
-			$3, $4, 'PROBLEM'::work_item_type_enum, $5::uuid
+			$3, $4, $8, 'PROBLEM'::work_item_type_enum, $5::uuid
 		)
-		RETURNING id, number, subject, created_on, updated_on, created_by
+		RETURNING id, number, subject, description, created_on, updated_on, created_by
 	),
 	inserted_problem AS (
 		INSERT INTO problem (
-			id, state, incident_id, opened_on
+			id, state, incident_id, opened_on, category, subcategory_id
 		)
 		VALUES (
-			$1, $6::problem_state_enum, $7::uuid, NOW()
+			$1, $6::problem_state_enum, $7::uuid, NOW(), $9::problem_category_enum,
+			-- subcategory is matched on problem_subcategory.value (lower-case
+			-- free text) within the chosen category; an unmatched value stays NULL.
+			(SELECT id FROM problem_subcategory WHERE category = $9::problem_category_enum AND value = LOWER($10::text))
 		)
 		RETURNING id
 	)
-	SELECT iwi.id, iwi.number, iwi.subject, iwi.created_on, iwi.updated_on, iwi.created_by
+	SELECT iwi.id, iwi.number, iwi.subject, iwi.description, iwi.created_on, iwi.updated_on, iwi.created_by
 	FROM inserted_work_item iwi
 	JOIN inserted_problem ip ON ip.id = iwi.id`
 
 // CreateProblemFromServiceNow implements ProblemRepository.
 func (r *problemRepo) CreateProblemFromServiceNow(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error) {
+	// WithSystemIdentity: this insert never sets a project_id on the new
+	// work_item row at all (problems have no project concept, same as
+	// incidents -- see this file's own package doc comment), so work_item's
+	// INSERT policy (migration 0147) can only be satisfied by is_internal.
+	// Same reasoning as IncidentRepository.CreateIncidentFromServiceNow's
+	// own identical stamp.
+	ctx = WithSystemIdentity(ctx)
+	var category *string
+	if req.Category != nil && strings.TrimSpace(*req.Category) != "" {
+		v := strings.ToUpper(strings.TrimSpace(*req.Category))
+		category = &v
+	}
 	var (
 		outID, outNumber, outSubject, outCreatedBy string
+		outDescription                             *string
 		outCreatedOn, outUpdatedOn                 time.Time
 	)
 	err := r.db.QueryRow(ctx, createProblemFromServiceNowQuery,
 		id, createdBy,
 		number, req.Subject, req.OriginCaseID,
-		state, req.PrimaryIncidentID,
-	).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
+		state, req.PrimaryIncidentID, req.Description,
+		category, req.Subcategory,
+	).Scan(&outID, &outNumber, &outSubject, &outDescription, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
 	if err != nil {
 		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
 			switch pgErr.Code {
@@ -496,6 +509,8 @@ func (r *problemRepo) CreateProblemFromServiceNow(ctx context.Context, req domai
 				return domain.ProblemDetail{}, &apierror.ConflictError{Msg: "a problem already exists for this ServiceNow id/number: " + pgErr.Detail}
 			case "22P02": // invalid_text_representation -- id (or state) was not a valid UUID/enum label
 				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "id is not a valid UUID, or state is not a valid problem state: " + id}
+			case "22001": // string_data_right_truncation -- e.g. subject over work_item.subject's VARCHAR(512)
+				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "a field value is too long: " + pgErr.Message}
 			case "23503": // foreign_key_violation -- one of the referenced IDs does not exist
 				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
 			case "P0001": // raise_exception from integrity triggers
@@ -506,10 +521,11 @@ func (r *problemRepo) CreateProblemFromServiceNow(ctx context.Context, req domai
 	}
 
 	return domain.ProblemDetail{
-		ID:      &outID,
-		Number:  &outNumber,
-		Subject: &outSubject,
-		State:   state,
+		ID:          &outID,
+		Number:      &outNumber,
+		Subject:     &outSubject,
+		Description: outDescription,
+		State:       state,
 	}, nil
 }
 
@@ -524,12 +540,14 @@ func (r *problemRepo) CreateProblemFromServiceNow(ctx context.Context, req domai
 // extension table uses). Same overall shape as
 // CaseRepository.UpdateCaseFields.
 func (r *problemRepo) UpdateProblemFields(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error) {
-	tx, err := r.db.Begin(ctx)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("update problem fields: begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
+	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (time.Time, error) {
+		return updateProblemFieldsTx(ctx, tx, req, actorEmail)
+	})
+}
 
+// updateProblemFieldsTx is UpdateProblemFields' body, extracted so it can
+// run inside r.db.InTx's closure.
+func updateProblemFieldsTx(ctx context.Context, tx pgx.Tx, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error) {
 	var problemSets []string
 	problemArgs := []any{req.ID}
 	idx := 2
@@ -580,7 +598,7 @@ func (r *problemRepo) UpdateProblemFields(ctx context.Context, req domain.Update
 	}
 
 	var updatedOn time.Time
-	err = tx.QueryRow(ctx, `UPDATE work_item SET `+strings.Join(wiSets, ", ")+` WHERE id = $1 AND type = 'PROBLEM' RETURNING updated_on`, wiArgs...).Scan(&updatedOn)
+	err := tx.QueryRow(ctx, `UPDATE work_item SET `+strings.Join(wiSets, ", ")+` WHERE id = $1 AND type = 'PROBLEM' RETURNING updated_on`, wiArgs...).Scan(&updatedOn)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, &apierror.NotFoundError{Msg: "problem not found"}
 	}
@@ -591,8 +609,5 @@ func (r *problemRepo) UpdateProblemFields(ctx context.Context, req domain.Update
 		return time.Time{}, fmt.Errorf("update problem fields: work_item: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return time.Time{}, fmt.Errorf("update problem fields: commit tx: %w", err)
-	}
 	return updatedOn, nil
 }

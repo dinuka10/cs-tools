@@ -26,6 +26,20 @@ import (
 
 type catalogService struct {
 	repo repository.CatalogRepository
+	// snMirror is set only under DATA_SOURCE=postgres-servicenow-dual-write
+	// (see NewCatalogServiceWithSNFallback) -- every method reads from it
+	// instead of repo when non-nil. sr_category/catalog_item exist and are
+	// populated in Postgres (99/312 rows respectively, checked live), but
+	// SearchCatalogs' own availability check requires a matching
+	// sr_category_routing_rule row (0 rows) and, more fundamentally, the
+	// deployed_product row itself: a deployed product that predates
+	// dual-write (or was never touched through this service's own SN-first
+	// write paths) has no row in Postgres' deployed_product table at all --
+	// the same "Postgres was never backfilled with ServiceNow's existing
+	// history" gap documented on deploymentService.SearchDeployments,
+	// causing SearchCatalogs' own existence check to fail outright with
+	// NotFoundError before the catalog data is even considered.
+	snMirror CatalogService
 }
 
 // NewCatalogService constructs a CatalogService backed by Postgres
@@ -35,8 +49,20 @@ func NewCatalogService(repo repository.CatalogRepository) CatalogService {
 	return &catalogService{repo: repo}
 }
 
+// NewCatalogServiceWithSNFallback constructs a CatalogService for
+// DATA_SOURCE=postgres-servicenow-dual-write -- see the snMirror field's own
+// doc comment for why every read goes to ServiceNow rather than Postgres
+// under this mode.
+func NewCatalogServiceWithSNFallback(repo repository.CatalogRepository, snMirror CatalogService) CatalogService {
+	return &catalogService{repo: repo, snMirror: snMirror}
+}
+
 // SearchCatalogs implements CatalogService.
 func (s *catalogService) SearchCatalogs(ctx context.Context, req domain.SearchCatalogsRequest) (domain.SearchCatalogsResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.SearchCatalogs(ctx, req)
+	}
+
 	if req.DeployedProductID == "" {
 		return domain.SearchCatalogsResponse{}, &apierror.ValidationError{Msg: "deployedProductId is required"}
 	}
@@ -61,6 +87,10 @@ func (s *catalogService) SearchCatalogs(ctx context.Context, req domain.SearchCa
 
 // GetCatalogItemVariables implements CatalogService.
 func (s *catalogService) GetCatalogItemVariables(ctx context.Context, catalogID, catalogItemID string) (domain.GetCatalogItemVariablesResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.GetCatalogItemVariables(ctx, catalogID, catalogItemID)
+	}
+
 	if catalogID == "" {
 		return domain.GetCatalogItemVariablesResponse{}, &apierror.ValidationError{Msg: "catalogId is required"}
 	}

@@ -77,3 +77,30 @@ func TestAccountRowToView_NilTeamsWhenUnset(t *testing.T) {
 		t.Fatalf("view.SreTeam = %+v, want nil", view.SreTeam)
 	}
 }
+
+// TestAccountRow_PartnerFlags pins isPartner (classification "Partner") and the
+// hasPrimaryPartner approximation (any partner relationship) on both shapes.
+func TestAccountRow_PartnerFlags(t *testing.T) {
+	partner, customer := " partner ", "Customer"
+	cases := []struct {
+		name           string
+		classification *string
+		hasPartner     bool
+		wantIsPartner  bool
+	}{
+		{"partner, case and space insensitive", &partner, false, true},
+		{"customer with a partner", &customer, true, false},
+		{"no classification", nil, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			row := repository.AccountRow{Classification: tc.classification, HasPartner: tc.hasPartner}
+			view, detail := accountRowToView(row), accountRowToDetail(row)
+			for _, got := range [][2]*bool{{view.IsPartner, view.HasPrimaryPartner}, {detail.IsPartner, detail.HasPrimaryPartner}} {
+				if got[0] == nil || *got[0] != tc.wantIsPartner || got[1] == nil || *got[1] != tc.hasPartner {
+					t.Fatalf("isPartner/hasPrimaryPartner = %v/%v, want %v/%v", got[0], got[1], tc.wantIsPartner, tc.hasPartner)
+				}
+			}
+		})
+	}
+}

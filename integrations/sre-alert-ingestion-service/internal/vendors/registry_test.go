@@ -31,7 +31,7 @@ import (
 
 var allVendors = []string{
 	"aws", "azure", "datadog", "elasticsearch", "gcp",
-	"icinga", "openobserve", "opensearch", "prometheus", "site24x7",
+	"icinga", "openobserve", "opensearch", "prometheus", "servicenow", "site24x7",
 }
 
 // newTestRegistry clears every <VENDOR>_ALERT_CONFIG so tests run on built-in defaults, except

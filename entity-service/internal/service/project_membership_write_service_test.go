@@ -67,6 +67,9 @@ type fakeWriteSalesEntity struct {
 	searchErr                error
 	createErr                error
 	updateErr                error
+	// savedState, when set, is the state Salesforce's automation stores (and
+	// the create/PATCH re-read returns) instead of the one requested.
+	savedState string
 }
 
 type writeUpdateCall struct {
@@ -140,7 +143,11 @@ func (f *fakeWriteSalesEntity) CreateProjectContact(_ context.Context, in salese
 	if f.createErr != nil {
 		return salesentity.ProjectContact{}, f.createErr
 	}
-	pc := salesentity.ProjectContact{ID: writeMembershipID, Email: writeEmail, State: sampleStr(in.State), Roles: in.Role}
+	state := in.State
+	if f.savedState != "" {
+		state = f.savedState
+	}
+	pc := salesentity.ProjectContact{ID: writeMembershipID, Email: writeEmail, State: sampleStr(state), Roles: in.Role}
 	f.membership = &pc
 	return pc, nil
 }
@@ -153,6 +160,9 @@ func (f *fakeWriteSalesEntity) UpdateProjectContact(_ context.Context, id string
 	// The PATCH answers 200 with an EMPTY body when its own re-read failed:
 	// a zero record and no error. Modelled here so the caller is exercised
 	// against the harder of the two shapes.
+	if f.savedState != "" {
+		return salesentity.ProjectContact{ID: id, State: sampleStr(f.savedState)}, nil
+	}
 	return salesentity.ProjectContact{}, nil
 }
 
@@ -174,7 +184,7 @@ func (f *fakeWriteMembershipRepo) Upsert(context.Context, domain.SalesforceMembe
 	return domain.SalesforceMembershipUpsertResult{}, errors.New("the portal writes use UpsertWithin")
 }
 
-func (f *fakeWriteMembershipRepo) DeactivateBySfID(context.Context, string) (bool, error) {
+func (f *fakeWriteMembershipRepo) DeactivateBySfID(context.Context, string, repository.AdminRoleBasisFunc) (bool, error) {
 	return false, errors.New("not used by the portal writes")
 }
 
@@ -295,35 +305,6 @@ func existingSalesforceContact() *salesentity.Contact {
 
 // ---- authorization -------------------------------------------------------
 
-// TestMembershipWrite_RejectsNonInternalCallers pins that every one of the
-// four operations is refused for a caller that is not an allow-listed
-// internal service, BEFORE anything downstream is touched -- no Salesforce
-// call, no transaction, no event.
-func TestMembershipWrite_RejectsNonInternalCallers(t *testing.T) {
-	h := newWriteHarness(t, stubAccess{scope: AccessScope{ProjectIDs: []string{writeProjectID}}})
-	ctx := context.Background()
-
-	_, inviteErr := h.svc.Invite(ctx, writeProjectID, inviteReq("Portal user"))
-	_, rolesErr := h.svc.UpdateRoles(ctx, writeProjectID, writeEmail, domain.UpdateProjectMembershipRolesRequest{Roles: []string{"Admin"}})
-	deactivateErr := h.svc.Deactivate(ctx, writeProjectID, writeEmail)
-	resendErr := h.svc.ResendInvitation(ctx, writeProjectID, writeEmail)
-
-	for name, err := range map[string]error{
-		"Invite": inviteErr, "UpdateRoles": rolesErr, "Deactivate": deactivateErr, "ResendInvitation": resendErr,
-	} {
-		var fe *apierror.ForbiddenError
-		if !errors.As(err, &fe) {
-			t.Errorf("%s: err = %v, want ForbiddenError", name, err)
-		}
-	}
-	if len(h.se.contactSearchs)+len(h.se.createdContact)+len(h.se.createdPC)+len(h.se.updates) != 0 {
-		t.Error("Salesforce must not be touched for a caller that is refused")
-	}
-	if len(h.repo.upserts) != 0 || len(h.pub.published) != 0 {
-		t.Error("nothing may be written or published for a caller that is refused")
-	}
-}
-
 // ---- invite --------------------------------------------------------------
 
 func TestMembershipWrite_InviteCreatesBothSides(t *testing.T) {
@@ -421,7 +402,7 @@ func TestMembershipWrite_InviteAdoptsExistingSalesforceContact(t *testing.T) {
 func TestMembershipWrite_InviteAdoptsExistingSalesforceMembership(t *testing.T) {
 	h := newInternalWriteHarness(t)
 	h.se.contact = existingSalesforceContact()
-	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, Email: writeEmail, State: sampleStr("INVITED")}
+	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, Email: writeEmail, State: sampleStr("INVITED"), Roles: []string{"Portal user"}}
 
 	if _, err := h.svc.Invite(context.Background(), writeProjectID, inviteReq("Portal user", "Lead")); err != nil {
 		t.Fatalf("Invite: %v", err)
@@ -570,7 +551,7 @@ func TestMembershipWrite_InviteReactivatesADeactivatedMembership(t *testing.T) {
 		Email: writeEmail, State: domain.MembershipStateDeactivated,
 	}
 	h.se.contact = existingSalesforceContact()
-	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID}
+	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, Roles: []string{"Portal user"}}
 
 	got, err := h.svc.Invite(context.Background(), writeProjectID, inviteReq("Portal user"))
 	if err != nil {
@@ -581,6 +562,36 @@ func TestMembershipWrite_InviteReactivatesADeactivatedMembership(t *testing.T) {
 	}
 	if len(h.pub.published) != 1 {
 		t.Error("a re-invitation still sends the invitation e-mail")
+	}
+}
+
+// TestMembershipWrite_InviteOfASignedInContactStoresRegisteredAndPublishes:
+// Salesforce saves REGISTERED for an unlocked contact; CSM stores that and the
+// existing-account invitation is still published, for a new or reactivated row.
+func TestMembershipWrite_InviteOfASignedInContactStoresRegisteredAndPublishes(t *testing.T) {
+	for _, reactivate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reactivate=%v", reactivate), func(t *testing.T) {
+			h := newInternalWriteHarness(t)
+			h.se.contact = existingSalesforceContact()
+			h.se.savedState = domain.MembershipStateRegistered
+			if reactivate {
+				h.repo.existing = &domain.ProjectMembershipRow{
+					ProjectContactID: "pc-1", MembershipSfID: writeMembershipID, ContactSfID: writeContactSfID,
+					Email: writeEmail, State: domain.MembershipStateDeactivated,
+				}
+				h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, Roles: []string{"Portal user"}}
+			}
+			got, err := h.svc.Invite(context.Background(), writeProjectID, inviteReq("Portal user"))
+			if err != nil {
+				t.Fatalf("Invite: %v", err)
+			}
+			if got.State != domain.MembershipStateRegistered || h.repo.upserts[0].State != domain.MembershipStateRegistered {
+				t.Errorf("state = %q / %q, want REGISTERED (what Salesforce stored)", got.State, h.repo.upserts[0].State)
+			}
+			if len(h.pub.published) != 1 || h.pub.published[0].Type != events.TypeProjectContactInvited {
+				t.Fatalf("published = %+v, want one project_contact.invited", h.pub.published)
+			}
+		})
 	}
 }
 
@@ -605,7 +616,7 @@ func TestMembershipWrite_ReinviteVersionIsNewerThanThePreWriteOne(t *testing.T) 
 			}
 			h.se.contact = existingSalesforceContact()
 			pre := tt.pre
-			h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, LastModifiedDate: &pre}
+			h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, LastModifiedDate: &pre, Roles: []string{"Portal user"}}
 
 			if _, err := h.svc.Invite(context.Background(), writeProjectID, inviteReq("Portal user")); err != nil {
 				t.Fatalf("Invite: %v", err)
@@ -639,7 +650,7 @@ func TestMembershipWrite_UpdateRolesReplacesThem(t *testing.T) {
 		ProjectGroups: []string{projectGroupGeneralAccess, projectGroupAdmin},
 	}
 	h.se.contact = existingSalesforceContact()
-	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID}
+	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, Roles: []string{"Portal user", "Admin"}}
 
 	got, err := h.svc.UpdateRoles(context.Background(), writeProjectID, writeEmail,
 		domain.UpdateProjectMembershipRolesRequest{Roles: []string{"Portal user"}})
@@ -666,6 +677,126 @@ func TestMembershipWrite_UpdateRolesReplacesThem(t *testing.T) {
 	}
 	if len(h.pub.published) != 0 {
 		t.Error("a role change sends no invitation")
+	}
+}
+
+// A portal role edit owns only the four portal labels. Every other label on
+// the Salesforce membership -- Business Contact, the D2 labels, anything
+// unknown -- was set in Salesforce and must survive the PATCH, and the stored
+// groups follow what Salesforce now holds.
+func TestMembershipWrite_UpdateRolesPreservesUnmanagedSalesforceRoles(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		current salesentity.ProjectContact
+	}{
+		{"raw role string", salesentity.ProjectContact{ID: writeMembershipID, Role: sampleStr("Portal user;Business Contact;Technical Champion")}},
+		{"split roles list", salesentity.ProjectContact{ID: writeMembershipID, Roles: []string{"Portal user", "Business Contact", "Technical Champion"}}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newInternalWriteHarness(t)
+			h.repo.existing = &domain.ProjectMembershipRow{
+				ProjectContactID: "pc-1", MembershipSfID: writeMembershipID, ContactSfID: writeContactSfID,
+				Email: writeEmail, State: domain.MembershipStateRegistered,
+				ProjectGroups: []string{projectGroupGeneralAccess, projectGroupBusinessContact},
+			}
+			h.se.contact = existingSalesforceContact()
+			current := tt.current
+			h.se.membership = &current
+
+			got, err := h.svc.UpdateRoles(context.Background(), writeProjectID, writeEmail,
+				domain.UpdateProjectMembershipRolesRequest{Roles: []string{"Portal user", "Security Contact"}})
+			if err != nil {
+				t.Fatalf("UpdateRoles: %v", err)
+			}
+			want := []string{"Portal user", "Security Contact", "Business Contact", "Technical Champion"}
+			if u := h.se.updates[0]; u.roles == nil || !reflect.DeepEqual(*u.roles, want) {
+				t.Errorf("PATCHed roles = %v, want %v", u.roles, want)
+			}
+			if g := h.repo.upserts[0].ProjectGroups; !reflect.DeepEqual(g, []string{projectGroupFullAccess, projectGroupBusinessContact}) {
+				t.Errorf("groups = %v, want Full Access + Business Contact  Group", g)
+			}
+			// The response answers with what the caller manages.
+			if !reflect.DeepEqual(got.Roles, []string{"Portal user", "Security Contact"}) {
+				t.Errorf("response roles = %v", got.Roles)
+			}
+		})
+	}
+}
+
+// A re-invitation PATCHes Role__c too, so it keeps the Salesforce-only
+// labels the same way a role edit does.
+func TestMembershipWrite_ReinvitePreservesUnmanagedSalesforceRoles(t *testing.T) {
+	h := newInternalWriteHarness(t)
+	h.repo.existing = &domain.ProjectMembershipRow{
+		ProjectContactID: "pc-1", MembershipSfID: writeMembershipID, ContactSfID: writeContactSfID,
+		Email: writeEmail, State: domain.MembershipStateDeactivated,
+	}
+	h.se.contact = existingSalesforceContact()
+	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID, Roles: []string{"Admin", "Business Owner", "Some Future Label"}}
+
+	if _, err := h.svc.Invite(context.Background(), writeProjectID, inviteReq("Portal user")); err != nil {
+		t.Fatalf("Invite: %v", err)
+	}
+	want := []string{"Portal user", "Business Owner", "Some Future Label"}
+	if u := h.se.updates[0]; u.roles == nil || !reflect.DeepEqual(*u.roles, want) {
+		t.Errorf("PATCHed roles = %v, want %v (Admin dropped, the rest kept)", u.roles, want)
+	}
+}
+
+// When the fetched membership carries neither role nor roles, its current
+// labels are unknown: the write fails before any PATCH rather than replacing
+// Role__c blind, and no row is written.
+func TestMembershipWrite_UpdateRolesRefusesWhenCurrentRolesUnreadable(t *testing.T) {
+	h := newInternalWriteHarness(t)
+	h.repo.existing = &domain.ProjectMembershipRow{
+		ProjectContactID: "pc-1", MembershipSfID: writeMembershipID, ContactSfID: writeContactSfID,
+		Email: writeEmail, State: domain.MembershipStateRegistered,
+	}
+	h.se.contact = existingSalesforceContact()
+	h.se.membership = &salesentity.ProjectContact{ID: writeMembershipID}
+
+	_, err := h.svc.UpdateRoles(context.Background(), writeProjectID, writeEmail,
+		domain.UpdateProjectMembershipRolesRequest{Roles: []string{"Portal user"}})
+	var sue *apierror.ServiceUnavailableError
+	if !errors.As(err, &sue) {
+		t.Fatalf("err = %v, want ServiceUnavailableError", err)
+	}
+	if len(h.se.updates) != 0 || len(h.repo.upserts) != 0 {
+		t.Errorf("updates = %d, upserts = %d; want nothing written", len(h.se.updates), len(h.repo.upserts))
+	}
+}
+
+func TestMergePortalManagedRoles(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		requested []string
+		current   salesentity.ProjectContact
+		want      []string
+	}{
+		{"no current roles (empty list)", []string{"Portal user"}, salesentity.ProjectContact{Roles: []string{}}, []string{"Portal user"}},
+		{"empty raw role", []string{"Lead"}, salesentity.ProjectContact{Role: sampleStr("")}, []string{"Lead"}},
+		{"managed labels are replaced, case-insensitively", []string{"Security Contact"},
+			salesentity.ProjectContact{Roles: []string{"portal user", "ADMIN", "Lead"}}, []string{"Security Contact"}},
+		{"every unmanaged label is kept in stored order", []string{"Portal user"},
+			salesentity.ProjectContact{Role: sampleStr("Technical Detractor; Business Promoter;Business Detractor;Technical Owner;Business Contact;Business Owner;Technical Champion")},
+			[]string{"Portal user", "Technical Detractor", "Business Promoter", "Business Detractor", "Technical Owner", "Business Contact", "Business Owner", "Technical Champion"}},
+		{"clearing the portal roles keeps the rest", nil,
+			salesentity.ProjectContact{Roles: []string{"Portal user", "Business Contact"}}, []string{"Business Contact"}},
+		{"roles wins over role; duplicates collapse", []string{"Portal user"},
+			salesentity.ProjectContact{Role: sampleStr("ignored"), Roles: []string{"Business Contact", "business contact", " "}}, []string{"Portal user", "Business Contact"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := mergePortalManagedRoles(tt.requested, tt.current)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if _, err := mergePortalManagedRoles([]string{"Portal user"}, salesentity.ProjectContact{}); err == nil {
+		t.Error("unreadable current roles must be an error")
 	}
 }
 

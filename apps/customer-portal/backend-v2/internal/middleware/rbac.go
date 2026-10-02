@@ -137,7 +137,13 @@ var permissionMatrix = map[Module]map[Action][]CanonicalRole{
 	ModuleProjects: {
 		ActionCreate: {RoleAdmin},
 		ActionRead:   {RoleAdmin, RoleAgent, RoleInternal, RoleCustomerAdmin, RoleCustomerUser, RolePartnerAdmin, RolePartnerUser},
-		ActionUpdate: {RoleAdmin, RoleAgent, RoleInternal},
+		// RoleCustomerAdmin was deliberately re-added here: PATCH /projects/{id}
+		// (the only route gated by ModuleProjects/ActionUpdate) is narrowly
+		// scoped to exactly two AI-assistant settings (hasAgent/hasKbReferences
+		// -- see entity.UpdateProjectRequest), not general project data, so
+		// this doesn't reopen the broader write access this permission used
+		// to (over-)grant before RoleCustomerAdmin was first removed here.
+		ActionUpdate: {RoleAdmin, RoleAgent, RoleInternal, RoleCustomerAdmin},
 		ActionDelete: {RoleAdmin},
 	},
 	ModuleChangeRequests: {

@@ -32,6 +32,11 @@ export const PORTAL_ROLE = {
   timecardApprover: "timecard_approver",
   dashboardDesigner: "dashboard_designer",
   admin: "admin",
+  // Grants PermCreateWorkNote on the backend (internal/handler/access.go) --
+  // posting a work_note-type comment on a case, nothing else. See
+  // PermissionProvider.tsx's canAddWorkNotes for the one capability this
+  // backs.
+  worknoteCreator: "worknote_creator",
 } as const;
 
 const ALL_PORTAL_ROLES: readonly string[] = Object.values(PORTAL_ROLE);
@@ -81,6 +86,23 @@ export interface PortalAccess {
    * timecard_approver/dashboard_designer do not hold.
    */
   canUseSecurityCenter: boolean;
+  /**
+   * The PLG Customer Success Portal section. `admin` and `cs_engineer` only —
+   * mirrors the backend's `PermUsePlg`, which (unlike `PermView`) the view-only
+   * roles do not hold. PLG is a worklist staff act on, so a role that could open
+   * it but not use it would meet a 403 on every control.
+   */
+  canUsePlg: boolean;
+  /**
+   * Authoring a PLG playbook template: creating one, editing it, changing its
+   * tasks, deleting it. `admin` only, mirroring the backend's
+   * `PermManagePlaybooks`.
+   *
+   * A `cs_engineer` holds `canUsePlg` without this: they browse templates and
+   * assign them to a pairing, but the Manage Playbooks page renders read-only
+   * for them.
+   */
+  canManagePlaybooks: boolean;
 }
 
 /**
@@ -113,6 +135,8 @@ export function getPortalAccess(roles: string[] | undefined): PortalAccess {
       canWrite: true,
       canCreateUser: true,
       canUseSecurityCenter: true,
+      canUsePlg: true,
+      canManagePlaybooks: true,
     };
   }
   const held = new Set((roles ?? []).map((r) => r.toLowerCase()));
@@ -130,5 +154,7 @@ export function getPortalAccess(roles: string[] | undefined): PortalAccess {
     canWrite: full,
     canCreateUser: isAdmin,
     canUseSecurityCenter: full,
+    canUsePlg: full,
+    canManagePlaybooks: isAdmin,
   };
 }

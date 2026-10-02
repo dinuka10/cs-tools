@@ -314,6 +314,7 @@ export function buildServiceRequestsPageCaseSearchRequest(
         : undefined,
       searchQuery: searchTerm.trim() || undefined,
       createdByMe: createdByMe || undefined,
+      createdBy: filters.createdBy as string[] | undefined,
       startCreatedDate: filters.startCreatedDate,
       endCreatedDate: filters.endCreatedDate,
       startUpdatedDate: filters.startUpdatedDate,

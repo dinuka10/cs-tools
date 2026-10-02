@@ -174,6 +174,9 @@ func descriptionForType(wtype string) string {
 // problem -- see entity-service/migrations 000018, 000019, 000047, 000058,
 // 000059). Every enum value used below is copied from the corresponding
 // migration's CREATE TYPE list, not invented.
+// ongoingByEngineer tracks which assignees already have an ONGOING case in this run.
+var ongoingByEngineer = map[string]bool{}
+
 func insertWorkItemExtension(
 	ctx context.Context, tx pgx.Tx, wtype, id string, updatedOn time.Time, assignedTo string,
 	openedBy *string, incidentSubcats, problemSubcats []genSubcategory, serviceIDs, offeringIDs []string,
@@ -183,7 +186,18 @@ func insertWorkItemExtension(
 		severity := pick([]string{"S0", "S1", "S2", "S3", "S4"})
 		issueType := pick([]string{"TOTAL_OUTAGE", "PARTIAL_OUTAGE", "PERFORMANCE_DEGRADATION", "QUESTION", "SECURITY_OR_COMPLIANCE", "ERROR"})
 		state := pick([]string{"WORK_IN_PROGRESS", "AWAITING_INFO", "SOLUTION_PROPOSED", "CLOSED", "OPEN", "WAITING_ON_WSO2", "REOPENED"})
-		workState := pick([]string{"ONGOING", "PAUSED"})
+		// work_state only means something for a case an engineer is working: NULL otherwise
+		// (a fresh or closed case has none), and at most one ONGOING case per engineer
+		// (the API rejects a second with 409 "already has an Ongoing case").
+		var workState *string
+		if state == "WORK_IN_PROGRESS" {
+			ws := "PAUSED"
+			if !ongoingByEngineer[assignedTo] {
+				ws = "ONGOING"
+				ongoingByEngineer[assignedTo] = true
+			}
+			workState = &ws
+		}
 		var closedBy *string
 		var closedOn, resolvedOn *time.Time
 		var resolutionCode *string
@@ -385,6 +399,18 @@ func genTimeCards(ctx context.Context, tx pgx.Tx, workItems []genWorkItem, proje
 			}
 			summary.timeCards++
 
+			if state == "SUBMITTED" {
+				// A submitted card is waiting on an approver; leave none and it can never be reviewed.
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO time_card_approver (id, created_on, updated_on, created_by, updated_by,
+						time_card_id, approver_id)
+					VALUES ($1,$2,$2,'seed-generator','seed-generator',$3,md5('seed-manager-1')::uuid)
+					ON CONFLICT (id) DO NOTHING`,
+					newUUID(), createdOn, id); err != nil {
+					return err
+				}
+				summary.timeCardApprovers++
+			}
 			if approvedBy != nil && randBool(0.5) {
 				if _, err := tx.Exec(ctx, `
 					INSERT INTO time_card_approver (id, created_on, updated_on, created_by, updated_by,

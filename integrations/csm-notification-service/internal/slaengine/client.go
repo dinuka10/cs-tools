@@ -144,6 +144,27 @@ type SLAStatus struct {
 	Team                   string     `json:"team,omitempty"`
 	Priority               string     `json:"priority,omitempty"`
 	State                  string     `json:"state,omitempty"`
+	// ProjectOnboardingStatus/IsEvaluationAccount exist purely for this
+	// engine's own Chat-audience routing (see chataudience.Resolve, called
+	// from Engine.sendBreachAlert) — the same team/onboarding/evaluation
+	// facts entity-service resolves for its own project. Best-effort
+	// display/routing enrichment, not part of the SLA clock itself; see
+	// entity-service's own domain.SLAStatus doc comment for exactly how
+	// each is derived.
+	ProjectOnboardingStatus string `json:"projectOnboardingStatus,omitempty"`
+	IsEvaluationAccount     bool   `json:"isEvaluationAccount,omitempty"`
+	// AssigneeName/AssigneeEmail/TeamEmail/TeamLeadName exist purely for
+	// this engine's own SLA breach EMAIL reaction (see sendBreachEmails) —
+	// entity-service resolves all four the same way it resolves Team; see
+	// that service's own domain.SLAStatus doc comment for exactly how each
+	// is derived (AssigneeEmail from work_item.assigned_to_id, TeamEmail/
+	// TeamLeadName from the same "group" row Team comes from). "" when not
+	// resolvable (no assignee, no team, or the team has no group_email/
+	// manager_id set).
+	AssigneeName  string `json:"assigneeName,omitempty"`
+	AssigneeEmail string `json:"assigneeEmail,omitempty"`
+	TeamEmail     string `json:"teamEmail,omitempty"`
+	TeamLeadName  string `json:"teamLeadName,omitempty"`
 }
 
 // searchSLAStatusResponse mirrors entity-service's domain.SearchSLAStatusResponse.

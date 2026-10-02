@@ -6,7 +6,8 @@
 -- You may not alter or remove any copyright or other notice from copies of this content.
 
 -- Mirror ServiceNow's Skills Management plugin tables (cmn_skill*,
--- sys_user_has_skill, sys_user_skill_history).
+-- sys_user_has_skill, sys_user_skill_history) - see configs/mappings/
+-- cmn_skill*.yaml, sys_user_has_skill.yaml, sys_user_skill_history.yaml.
 CREATE TABLE IF NOT EXISTS skill_level_type (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,
@@ -78,7 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_skill_category_link_category_id ON skill_category
 
 -- inherited_from_group_id deliberately has no FK: this table is migrated
 -- unscoped (every WSO2 user), so it can point at any SN group, most of
--- which are never migrated into team.
+-- which are never migrated into team - see sys_user_has_skill.yaml.
 CREATE TABLE IF NOT EXISTS user_skill (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,

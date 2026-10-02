@@ -15,8 +15,7 @@
 -- under the License.
 
 -- Enum constants are SNAKE_UPPER_CASE of ServiceNow's choice LABEL text, not the
--- underlying value, same convention as sla_policy_target_enum (see
--- 000051_sla_policy_table.up.sql).
+-- underlying value, same convention as sla_policy_target_enum (see 0047).
 DO $$ BEGIN
     CREATE TYPE sla_stage_enum AS ENUM (
         'PAUSED', 'IN_PROGRESS', 'COMPLETED', 'ACHIEVED', 'BREACHED', 'CANCELLED'
@@ -25,7 +24,7 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 -- schedule is dot-walked to schedule.name at extraction time (see sla.yaml) and
 -- stored as a plain display string, not an FK - same convention as
--- sla_policy.schedule (see 000051_sla_policy_table.up.sql).
+-- sla_policy.schedule (see 0047_sla_policy_table.sql).
 CREATE TABLE IF NOT EXISTS sla (
     id UUID PRIMARY KEY,
     created_on TIMESTAMPTZ NOT NULL,
