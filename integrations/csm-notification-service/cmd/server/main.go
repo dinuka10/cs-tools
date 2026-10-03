@@ -42,7 +42,6 @@ import (
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/recipientlinks"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/scim"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/slaengine"
-	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/timecardengine"
 )
 
 func main() {
@@ -464,19 +463,6 @@ func main() {
 		go slaEngine.RunTicker(ctx, tickInterval)
 	}
 
-	// timecardengine has no Redis/state dependency at all (unlike slaEngine
-	// above) — it's a plain Kafka consumer, so it's started unconditionally,
-	// not gated behind the REDIS_URL/REDIS_ADDR check. Its own dedicated
-	// consumer group, not dispatcher's — see that package's own doc comment
-	// for why. Its Handle is currently log-only (see the package doc
-	// comment): entity-service's own Publish call for events.
-	// TypeCaseBillableStatusChanged is itself still commented out, so this
-	// consumer group exists ahead of having anything to actually do yet.
-	timeCardEngine := timecardengine.NewEngine()
-	timeCardConsumerGroup := envOrDefault("TIME_CARD_CONSUMER_GROUP", "csm-notification-service-time-card")
-	timeCardConsumerCount := envInt("TIME_CARD_CONSUMER_COUNT", 1)
-	timeCardConsumers := startConsumers(ctx, "time-card", eventBusCfg, timeCardConsumerGroup, timeCardConsumerCount, timeCardEngine.Handle, toDeadLetter)
-
 	<-ctx.Done()
 	stop()
 
@@ -496,9 +482,6 @@ func main() {
 		c.Close()
 	}
 	for _, c := range projectDLQConsumers {
-		c.Close()
-	}
-	for _, c := range timeCardConsumers {
 		c.Close()
 	}
 	if slaProducer != nil {

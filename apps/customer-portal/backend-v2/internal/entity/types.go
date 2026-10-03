@@ -292,6 +292,8 @@ type ProjectMetadataResponse struct {
 	CaseTypes                   []ReferenceTableItem `json:"caseTypes"`
 	EngagementTypes             []ChoiceListItem     `json:"engagementTypes"`
 	EngagementPaymentTypes      []ChoiceListItem     `json:"engagementPaymentTypes"`
+	ResolutionCodes             []ChoiceListItem     `json:"resolutionCodes"`
+	Causes                      []ChoiceListItem     `json:"causes"`
 	Features                    ProjectFeatures      `json:"features"`
 }
 

@@ -113,6 +113,27 @@ func TestMapProjectFilterOptions_ExcludesInternalChangeRequestStatesByIDOrLabel(
 	}
 }
 
+// TestMapProjectFilterOptions_ExposesResolutionCodesAndCauses is the
+// regression test for a real, reported bug: closing a case requires
+// resolutionCode/cause/closeNotes, but the webapp had no choice lists to
+// build a close dialog from at all -- GET /projects/{id}/filters simply
+// never carried either field. Confirms both now pass through unchanged.
+func TestMapProjectFilterOptions_ExposesResolutionCodesAndCauses(t *testing.T) {
+	resp := entity.ProjectMetadataResponse{
+		ResolutionCodes: []entity.ChoiceListItem{{ID: "SOLVED_WORKAROUND_PROVIDED", Label: "Solved Workaround Provided"}},
+		Causes:          []entity.ChoiceListItem{{ID: "PRODUCT_BUG", Label: "Product Bug"}},
+	}
+
+	got := MapProjectFilterOptions(resp)
+
+	if len(got.ResolutionCodes) != 1 || got.ResolutionCodes[0].ID != "SOLVED_WORKAROUND_PROVIDED" {
+		t.Fatalf("ResolutionCodes = %+v", got.ResolutionCodes)
+	}
+	if len(got.Causes) != 1 || got.Causes[0].ID != "PRODUCT_BUG" {
+		t.Fatalf("Causes = %+v", got.Causes)
+	}
+}
+
 // GET /projects/{id}/stats/change-requests feeds the Operations page's
 // Upcoming Changes / Action Required Changes cards, which find their counts by
 // display label ("Scheduled", "Customer Approval", "Customer Review"). The

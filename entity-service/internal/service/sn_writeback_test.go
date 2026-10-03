@@ -144,8 +144,8 @@ func TestSNWritebackDispatcher_SerializesSameEntityInDispatchOrder(t *testing.T)
 	d := NewSNWritebackDispatcher(failures)
 
 	var mu sync.Mutex
-	var applied []string   // order values were applied to the "mirror" in
-	var started []string   // order writeFns actually started running in
+	var applied []string // order values were applied to the "mirror" in
+	var started []string // order writeFns actually started running in
 	aStarted := make(chan struct{})
 	done := make(chan struct{}, 2)
 

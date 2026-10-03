@@ -1588,7 +1588,13 @@ type ProjectMetadataResponse struct {
 	CaseTypes                   []ReferenceTableItem `json:"caseTypes"`
 	EngagementTypes             []ChoiceListItem     `json:"engagementTypes"`
 	EngagementPaymentTypes      []ChoiceListItem     `json:"engagementPaymentTypes"`
-	Features                    ProjectFeatures      `json:"features"`
+	// ResolutionCodes/Causes back the resolution fields PATCH /cases/{id}
+	// requires when closing (or proposing a solution for) a plain "case" --
+	// see UpdateCase's own comment on that requirement. ID is the value to
+	// send back on resolutionCode/cause; Label is a display string.
+	ResolutionCodes []ChoiceListItem `json:"resolutionCodes"`
+	Causes          []ChoiceListItem `json:"causes"`
+	Features        ProjectFeatures  `json:"features"`
 }
 
 // ProjectStatsOutstandingCount groups the outstanding-work-item counts

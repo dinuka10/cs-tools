@@ -168,6 +168,62 @@ query run) if empty. Shares `internal/entitycases.Client` and the row-rendering 
 (`internal/notify/templates/open_cases_report.html`) per this component's own "Per-task report
 emails" below.
 
+## Availability recalculation
+
+Recomputes every committed service offering's uptime and rewrites
+`service_availability`. Task name **`availability_recalculation`**, default
+schedule `0 3 * * *`. The Go port of ServiceNow's `Calculate Availability`
+job, which has run nightly since 2022-11-01 and whose 212,904 rows the Cloud
+Status Dashboard reads on every page load.
+
+*** THIS IS THE PRODUCER FOR THREE ALREADY-PORTED ENDPOINTS. ***
+`/cloud-status/monitors`, `/availabilities` and `/availability-history` all
+read that table and were ported long before anything wrote it: the rows come
+from csm-sync-service mirroring ServiceNow's output. At cutover the
+dashboard's uptime figures would simply stop advancing, with no error
+anywhere — reading a table nobody updates looks exactly like reading a table
+where nothing happened. This task is what takes over.
+
+**The arithmetic is in entity-service, not here.** This task is a trigger.
+The sweep reads every outage for ~146 subjects and writes up to eight period
+rows each into a table the dashboard is concurrently reading; doing that over
+HTTP would pull the whole working set across the wire every night, and this
+component holds no database credentials. Same split as `outage_communication`
+and `cloud_status`.
+
+*** IT PORTS v2, AND THE INSTANCE RUNS v1. *** `com.snc.availability.v2` is
+false on wso2sndev, so every stored row was written by the legacy calculator.
+The two genuinely disagree — v1's "last 30 days" spans 29 under PRB1304264,
+v2's spans 30 — so **the existing table is not a baseline to diff against.**
+
+**It emits `LAST_90_DAYS`, which v2 does not define.** v2 registers seven
+period types and that is not one of them; v1 writes it. But `/monitors` and
+`/availabilities` both query it and both render a "Last 90 days" figure, so
+shipping pure v2 would delete a number from the customer-facing status page
+silently. `LAST_1_DAYS` is the mirror image — v1 writes it, nothing reads it,
+not emitted.
+
+**A partial run fails the task.** entity-service keeps going when one subject
+fails and still returns 200, so the handler checks the `failed` count and the
+subject count: a sweep that skipped offerings, or found none at all, is an
+alert rather than a quiet success. Zero subjects is what an unmapped
+`service_offering_commitment` looks like.
+
+**It is inert until digiops-cs mirrors `service_offering_commitment`.** That
+table is the join saying which offering answers to which commitment, and the
+calculator builds its entire subject list from it. Everything else in the
+family is already mirrored (`service_availability` migration 0084,
+`service_commitment`, `outage_affected_ci`, `schedule`, `schedule_span`).
+
+**Registering it is a paired change with disabling ServiceNow's `Calculate
+Availability` job.** Two writers on one table, keyed differently — the sync
+on the mirrored `sys_id`, this on the natural key — would double every
+subject's rows.
+
+Timeout is five minutes, not the sixty seconds the neighbouring sweeps use.
+Volume is the normal case here, and cutting a healthy run off partway leaves
+some subjects updated and the rest stale.
+
 ## Outage communication
 
 The SRE-facing pair of outage emails: one when an outage is declared, one

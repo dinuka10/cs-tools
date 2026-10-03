@@ -72,6 +72,29 @@ func TestBuildEntityUpdateCaseRequest_StateKeyTranslates(t *testing.T) {
 	}
 }
 
+// TestBuildEntityUpdateCaseRequest_ForwardsResolutionFields is the regression
+// test for a real, reported bug: closing a case failed with "resolutionCode,
+// cause, and closeNotes are required when state is closed or
+// solution_proposed" because this DTO had no fields for them at all -- the
+// webapp had nowhere to send them even once it started asking. Now that the
+// close dialog collects them, this layer must forward them unmodified.
+func TestBuildEntityUpdateCaseRequest_ForwardsResolutionFields(t *testing.T) {
+	state := 3 // closed
+	code, cause, notes := "SOLVED_WORKAROUND_PROVIDED", "PRODUCT_BUG", "Fixed via workaround."
+	got := BuildEntityUpdateCaseRequest("case-1", UpdateCaseRequest{
+		StateKey: &state, ResolutionCode: &code, Cause: &cause, CloseNotes: &notes,
+	})
+	if got.ResolutionCode == nil || *got.ResolutionCode != code {
+		t.Errorf("ResolutionCode = %v, want %q", got.ResolutionCode, code)
+	}
+	if got.Cause == nil || *got.Cause != cause {
+		t.Errorf("Cause = %v, want %q", got.Cause, cause)
+	}
+	if got.CloseNotes == nil || *got.CloseNotes != notes {
+		t.Errorf("CloseNotes = %v, want %q", got.CloseNotes, notes)
+	}
+}
+
 // TestBuildEntitySearchChangeRequestsRequest_ScopesProjectAndTranslatesKeys
 // verifies the change-request search translator forces project scope from
 // the path and translates stateKeys/impactKeys via the numeric-id mirror

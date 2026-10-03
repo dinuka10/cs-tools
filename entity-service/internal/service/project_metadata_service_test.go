@@ -38,6 +38,9 @@ func (f *fakeReferenceDataRepo) GetProjectByID(context.Context, string) (bool, *
 func (f *fakeReferenceDataRepo) EnumLabels(context.Context, []string) (map[string][]string, error) {
 	return f.enums, nil
 }
+func (f *fakeReferenceDataRepo) ListTimeZones(context.Context) ([]repository.TimeZoneRow, error) {
+	return nil, nil
+}
 
 // The call-request endpoints reject upper-case state values ("invalid state"),
 // so the ids the metadata offers must be the lowercase domain ids -- each one
@@ -68,6 +71,57 @@ func TestGetProjectMetadata_CallRequestStatesUseAPIVocabulary(t *testing.T) {
 
 func domainCallRequestState(id string) domain.CallRequestStateType {
 	return domain.CallRequestStateType(id)
+}
+
+// TestGetProjectMetadata_ResolutionCodesUseCanonicalDomainValues covers the
+// exact bug these two choice lists exist to close: PATCH /cases/{id}
+// requires resolutionCode/cause when closing a plain "case" in dual-write
+// mode, but nothing exposed valid values for either field to a caller
+// before now. The resolution-code id must be the canonical domain value
+// (not the long-form "..._THROUGH_AUTO_CLOSURE" Postgres label), since
+// that's what validateUUIDs/validCaseResolutionCode-equivalent validation on
+// the write path actually accepts.
+func TestGetProjectMetadata_ResolutionCodesUseCanonicalDomainValues(t *testing.T) {
+	repo := &fakeReferenceDataRepo{enums: map[string][]string{
+		caseResolutionCodeEnumType: {
+			"SOLVED_WORKAROUND_PROVIDED",
+			"ABRUPTLY_CLOSED_DUE_TO_NON_RESPONSIVENESS_THROUGH_AUTO_CLOSURE",
+			"SOME_FUTURE_CODE",
+		},
+		// USER_MISTAKE (migration 0108) has no snCauseKey entry -- the
+		// dual-write mirror's own patchCaseFields would reject it, so it
+		// must be filtered out here too (see causeChoices's own doc comment).
+		caseCauseEnumType: {"PRODUCT_BUG", "USER_ERROR_RUNTIME", "USER_MISTAKE"},
+	}}
+	resp, err := NewProjectMetadataService(repo).GetProjectMetadata(context.Background(), testUUID)
+	if err != nil {
+		t.Fatalf("GetProjectMetadata: %v", err)
+	}
+
+	gotCodes := resp.ResolutionCodes
+	if len(gotCodes) != 2 {
+		t.Fatalf("want 2 resolution codes (the unrecognized label skipped), got %+v", gotCodes)
+	}
+	wantCodeLabels := map[string]string{
+		string(domain.CaseResolutionCodeSolvedWorkaroundProvided):             "Solved Workaround Provided",
+		string(domain.CaseResolutionCodeAbruptlyClosedDueToNonResponsiveness): "Abruptly Closed Due To Non Responsiveness",
+	}
+	for _, c := range gotCodes {
+		if wantCodeLabels[c.ID] != c.Label {
+			t.Errorf("resolution code %+v: want id/label pair from %v", c, wantCodeLabels)
+		}
+	}
+
+	gotCauses := resp.Causes
+	if len(gotCauses) != 2 {
+		t.Fatalf("want 2 causes, got %+v", gotCauses)
+	}
+	wantCauseLabels := map[string]string{"PRODUCT_BUG": "Product Bug", "USER_ERROR_RUNTIME": "User Error Runtime"}
+	for _, c := range gotCauses {
+		if wantCauseLabels[c.ID] != c.Label {
+			t.Errorf("cause %+v: want id/label pair from %v", c, wantCauseLabels)
+		}
+	}
 }
 
 // A project whose type has entitlement columns set on project_type gets

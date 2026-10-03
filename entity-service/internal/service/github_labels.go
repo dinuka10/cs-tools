@@ -126,7 +126,6 @@ func NewGithubLabels(o GithubLabelOverrides) (GithubLabels, error) {
 	return l, nil
 }
 
-
 // canonicalClassValues are the only values a class label may map to. A class
 // value becomes the service request's sr_type and is written to u_sr_type, so
 // an arbitrary replacement is not merely unusual -- it puts a value downstream

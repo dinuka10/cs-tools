@@ -65,6 +65,21 @@ func (h *UserHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// PatchMe handles PATCH /users/me for the postgres data source.
+func (h *UserHandler) PatchMe(w http.ResponseWriter, r *http.Request) {
+	var req domain.PatchUserMeRequest
+	if !decodeRequest(w, r, &req) {
+		return
+	}
+	resp, err := h.svc.PatchMe(r.Context(), req)
+	if err != nil {
+		writeServiceError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 // GetUser handles GET /users/{id} for the PostgreSQL data source.
 func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
 	resp, err := h.svc.GetUser(r.Context(), r.PathValue("id"))

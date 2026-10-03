@@ -52,8 +52,14 @@ const (
 
 // Config holds all environment-driven settings for the service.
 type Config struct {
-	DBHost     string
-	DBPort     string
+	DBHost string
+	DBPort string
+	// AvailabilityTimezone is the zone the availability sweep resolves its
+	// period boundaries in. Empty uses service.DefaultAvailabilityTimezone
+	// (Asia/Colombo), which is what ServiceNow's running engine actually
+	// uses — it is the system zone, NOT the commitment's recorded one.
+	AvailabilityTimezone string
+
 	DBUser     string
 	DBPassword string
 	DBName     string
@@ -313,6 +319,13 @@ type Config struct {
 	// promptness, not correctness.
 	CloudStatusPollInterval time.Duration
 
+	// IncidentReportPollInterval is how often IncidentReportDrainer looks for
+	// incident changes in event_outbox (INCIDENT_REPORT_POLL_INTERVAL,
+	// default 5s). Same envDuration convention as CRNoticePollInterval. The
+	// drainer itself has no on/off switch: like the ServiceNow flows it
+	// ports, it runs wherever the data is.
+	IncidentReportPollInterval time.Duration
+
 	AuthIssuer             string
 	AuthJWKSURL            string
 	AuthUserTokenAudiences []string
@@ -396,6 +409,7 @@ func Load() *Config {
 	cfg := &Config{
 		DBHost:                                   getEnvOrDefault("DB_HOST", "localhost"),
 		DBPort:                                   getEnvOrDefault("DB_PORT", "5432"),
+		AvailabilityTimezone:                     os.Getenv("AVAILABILITY_TIMEZONE"),
 		DBUser:                                   os.Getenv("DB_USER"),
 		DBPassword:                               os.Getenv("DB_PASSWORD"),
 		DBName:                                   os.Getenv("DB_NAME"),
@@ -440,6 +454,7 @@ func Load() *Config {
 		CloudStatusServiceIDs:                         splitComma(os.Getenv("CLOUD_STATUS_SERVICE_IDS")),
 		CloudStatusDrainerEnabled:                     os.Getenv("CLOUD_STATUS_DRAINER_ENABLED") == "true",
 		CloudStatusPollInterval:                       envDuration("CLOUD_STATUS_POLL_INTERVAL", 10*time.Second),
+		IncidentReportPollInterval:                    envDuration("INCIDENT_REPORT_POLL_INTERVAL", 5*time.Second),
 		SalesforceIngestRetryInterval:                 envDurationOrOff("SALESFORCE_INGEST_RETRY_INTERVAL", 5*time.Minute),
 		SalesEntityBaseURL:                            os.Getenv("SALES_ENTITY_BASE_URL"),
 		SalesEntityTokenURL:                           os.Getenv("SALES_ENTITY_TOKEN_URL"),

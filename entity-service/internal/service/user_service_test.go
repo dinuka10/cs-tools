@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
@@ -122,6 +123,69 @@ func TestUserService_GetMe_PropagatesRepoNotFound(t *testing.T) {
 	}
 	if strings.Contains(nfe.Msg, "ghost@example.com") {
 		t.Errorf("NotFoundError.Msg = %q, must never contain the caller's email address", nfe.Msg)
+	}
+}
+
+// TestUserService_PatchMe_UpdatesTimeZone proves PatchMe resolves the caller
+// from their token (same as GetMe), never a caller-supplied id, and writes
+// the new TimeZone to that user's own row.
+func TestUserService_PatchMe_UpdatesTimeZone(t *testing.T) {
+	var gotUserID, gotTimeZone string
+	repo := stubUserRepo{
+		getUserByEmail: func(_ context.Context, email string) (domain.User, error) {
+			if email != "jane.doe@example.com" {
+				t.Fatalf("GetUserByEmail called with unexpected email: %q", email)
+			}
+			return domain.User{ID: "11111111-1111-1111-1111-111111111111", Email: email}, nil
+		},
+		updateUserTimeZone: func(_ context.Context, userID, timezone string) (time.Time, error) {
+			gotUserID, gotTimeZone = userID, timezone
+			return time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC), nil
+		},
+	}
+	svc := NewUserService(repo)
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	resp, err := svc.PatchMe(ctx, domain.PatchUserMeRequest{TimeZone: "Asia/Colombo"})
+	if err != nil {
+		t.Fatalf("PatchMe returned error: %v", err)
+	}
+	if gotUserID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("UpdateUserTimeZone called with userID %q, want the caller's own id", gotUserID)
+	}
+	if gotTimeZone != "Asia/Colombo" {
+		t.Errorf("UpdateUserTimeZone called with timezone %q, want Asia/Colombo", gotTimeZone)
+	}
+	if resp.User.ID != "11111111-1111-1111-1111-111111111111" {
+		t.Errorf("response User.ID = %q, want the caller's own id", resp.User.ID)
+	}
+	if resp.User.UpdatedOn != "2026-10-03T12:00:00Z" {
+		t.Errorf("response User.UpdatedOn = %q, want 2026-10-03T12:00:00Z", resp.User.UpdatedOn)
+	}
+}
+
+// TestUserService_PatchMe_RejectsBlankTimeZone mirrors the ServiceNow-backed
+// PatchMe's own validation -- an empty TimeZone is a ValidationError before
+// the repository is ever reached.
+func TestUserService_PatchMe_RejectsBlankTimeZone(t *testing.T) {
+	svc := NewUserService(stubUserRepo{})
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	_, err := svc.PatchMe(ctx, domain.PatchUserMeRequest{})
+	if _, ok := err.(*apierror.ValidationError); !ok {
+		t.Fatalf("PatchMe error = %v (%T), want *apierror.ValidationError", err, err)
+	}
+}
+
+// TestUserService_PatchMe_RequiresToken mirrors GetMe's own requirement: no
+// x-user-id-token means no caller to resolve, regardless of the request body.
+func TestUserService_PatchMe_RequiresToken(t *testing.T) {
+	svc := NewUserService(stubUserRepo{})
+	ctx := contextWithUserIDToken("")
+
+	_, err := svc.PatchMe(ctx, domain.PatchUserMeRequest{TimeZone: "Asia/Colombo"})
+	if _, ok := err.(*apierror.UnauthorizedError); !ok {
+		t.Fatalf("PatchMe error = %v (%T), want *apierror.UnauthorizedError", err, err)
 	}
 }
 

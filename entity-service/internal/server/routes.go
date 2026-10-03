@@ -1066,6 +1066,11 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	// them unregistered gives an honest 404 instead.
 	var cloudStatusDashboardHandler *handler.CloudStatusDashboardHandler
 	var cloudStatusHandler *handler.CloudStatusHandler
+	// availabilityHandler is the PRODUCER for the three dashboard endpoints
+	// above. They read service_availability; until now nothing in Postgres
+	// wrote it -- csm-sync-service mirrors ServiceNow's output, so at cutover
+	// the uptime figures would stop advancing with no error anywhere.
+	var availabilityHandler *handler.AvailabilityHandler
 	if db != nil {
 		cloudStatusDashboardHandler = handler.NewCloudStatusDashboardHandler(
 			service.NewCloudStatusDashboardService(repository.NewCloudStatusDashboardRepository(db)),
@@ -1073,6 +1078,14 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		cloudStatusHandler = handler.NewCloudStatusHandler(
 			service.NewCloudStatusService(repository.NewCloudStatusRepository(db), cfg.CloudStatusServiceIDs),
 		)
+		availabilitySvc, err := service.NewAvailabilityService(
+			repository.NewAvailabilityRepository(db), cfg.AvailabilityTimezone)
+		if err != nil {
+			// A bad zone mis-dates every row the sweep writes, so this is a
+			// startup error rather than a fallback.
+			log.Fatalf("availability service: %v", err)
+		}
+		availabilityHandler = handler.NewAvailabilityHandler(availabilitySvc)
 	}
 	// globalHandler is wired for both data sources now: GetSystemMetadata has
 	// a Postgres-backed implementation (globalService, reusing
@@ -1294,6 +1307,7 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	} else {
 		mux.HandleFunc("GET /users/{id}", userHandler.GetUser)
 		mux.HandleFunc("GET /users/me", userHandler.GetMe)
+		mux.HandleFunc("PATCH /users/me", userHandler.PatchMe)
 		mux.HandleFunc("POST /users/search", userHandler.SearchUsers)
 		mux.HandleFunc("POST /users", userHandler.CreateUser)
 	}
@@ -1523,6 +1537,13 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 		mux.HandleFunc("GET /cloud-status/availabilities", cloudStatusDashboardHandler.Availabilities)
 		mux.HandleFunc("GET /cloud-status/availability-history", cloudStatusDashboardHandler.AvailabilityHistory)
 		mux.HandleFunc("GET /cloud-status/incidents/{id}", cloudStatusDashboardHandler.IncidentDetail)
+	}
+	if availabilityHandler != nil {
+		// Internal, and it WRITES: every other /cloud-status route is a read
+		// the dashboard makes, this one recomputes and replaces rows.
+		// internalOnly: auth.Middleware only validates a token, so without
+		// this a customer's user token could trigger the recompute.
+		mux.HandleFunc("POST /internal/availability/sweep", internalOnly(accessSvc, availabilityHandler.Sweep))
 	}
 	if cloudStatusHandler != nil {
 		mux.HandleFunc("POST /internal/cloud-status/sweep", cloudStatusHandler.Sweep)

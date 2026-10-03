@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -347,6 +348,42 @@ func (s *userService) GetMe(ctx context.Context) (domain.GetUserMeResponse, erro
 		TimeZone:  user.Timezone,
 		Roles:     roles,
 		Groups:    groups,
+	}, nil
+}
+
+// PatchMe implements UserService. Resolves the caller the same way GetMe
+// does (x-user-id-token's email claim -> GetUserByEmail), so there is no
+// caller-supplied id to trust -- a user can only ever update their own
+// timezone through this endpoint.
+func (s *userService) PatchMe(ctx context.Context, req domain.PatchUserMeRequest) (domain.PatchUserMeResponse, error) {
+	if req.TimeZone == "" {
+		return domain.PatchUserMeResponse{}, &apierror.ValidationError{Msg: "timeZone is required"}
+	}
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.PatchUserMeResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	email, err := emailFromJWT(token)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	user, err := s.repo.GetUserByEmail(ctx, email)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, err
+	}
+
+	updatedOn, err := s.repo.UpdateUserTimeZone(ctx, user.ID, req.TimeZone)
+	if err != nil {
+		return domain.PatchUserMeResponse{}, err
+	}
+
+	return domain.PatchUserMeResponse{
+		Message: "User updated successfully",
+		User: domain.PatchUserMeUpdated{
+			ID:        user.ID,
+			UpdatedBy: email,
+			UpdatedOn: updatedOn.UTC().Format(time.RFC3339),
+		},
 	}, nil
 }
 

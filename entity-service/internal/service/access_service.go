@@ -146,9 +146,14 @@ func (s *accessService) scopeForUser(ctx context.Context, email string) (AccessS
 		if err != nil {
 			return AccessScope{}, err
 		}
-		return AccessScope{ProjectIDs: ids, ViewerEmail: email}, nil
+		// HasInternalAccess: this email also has an active INTERNAL row (a
+		// mixed identity) -- the data-visibility scope still follows the
+		// conservative "external wins" rule above, but the caller is still
+		// genuinely WSO2 staff; see AccessScope.HasInternalAccess's own doc
+		// comment for why that distinction has to survive this branch.
+		return AccessScope{ProjectIDs: ids, ViewerEmail: email, HasInternalAccess: internal}, nil
 	case internal && !other:
-		return AccessScope{Unrestricted: true}, nil
+		return AccessScope{Unrestricted: true, HasInternalAccess: true}, nil
 	default:
 		return AccessScope{}, &apierror.ForbiddenError{Msg: "no access for this user"}
 	}

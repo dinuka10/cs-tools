@@ -32,17 +32,17 @@ type globalService struct {
 }
 
 // NewGlobalService constructs a Postgres-backed GlobalService. GetSystemMetadata
-// is populated for real (project types come from the project_type table); see
-// its own doc comment for the two fields left empty. GlobalSearch is scoped to
-// what the caller may see -- see its own doc comment.
+// is populated for real (project types come from the project_type table,
+// time zones from the timezone table); see its own doc comment for the one
+// field still left empty. GlobalSearch is scoped to what the caller may
+// see -- see its own doc comment.
 func NewGlobalService(repo repository.ReferenceDataRepository, search repository.GlobalSearchRepository, access AccessService) GlobalService {
 	return &globalService{repo: repo, search: search, access: access}
 }
 
-// GetSystemMetadata implements GlobalService. TimeZones and FeedbackEmojis
-// are left empty: both are static ServiceNow-side configuration (a curated
-// time zone list, feedback emoji image assets), not project/case data backed
-// by any Postgres table. TODO: populate once such a table exists.
+// GetSystemMetadata implements GlobalService. FeedbackEmojis is left empty:
+// it's static ServiceNow-side configuration (feedback emoji image assets),
+// not data backed by any Postgres table.
 func (s *globalService) GetSystemMetadata(ctx context.Context) (domain.SystemMetadataResponse, error) {
 	projectTypes, err := s.repo.ListProjectTypes(ctx)
 	if err != nil {
@@ -54,7 +54,16 @@ func (s *globalService) GetSystemMetadata(ctx context.Context) (domain.SystemMet
 		items = append(items, domain.ReferenceTableItem{ID: pt.ID, Name: pt.Name})
 	}
 
-	return domain.SystemMetadataResponse{ProjectTypes: items}, nil
+	timeZones, err := s.repo.ListTimeZones(ctx)
+	if err != nil {
+		return domain.SystemMetadataResponse{}, err
+	}
+	tzItems := make([]domain.ChoiceListItem, 0, len(timeZones))
+	for _, tz := range timeZones {
+		tzItems = append(tzItems, domain.ChoiceListItem{ID: tz.Value, Label: tz.Label})
+	}
+
+	return domain.SystemMetadataResponse{ProjectTypes: items, TimeZones: tzItems}, nil
 }
 
 // globalSearchSortFields maps the accepted sortBy.field values to the

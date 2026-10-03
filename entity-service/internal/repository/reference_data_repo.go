@@ -74,6 +74,23 @@ type ReferenceDataRepository interface {
 	// always matches whatever the migrations currently define. A requested
 	// type with no matching rows is simply absent from the returned map.
 	EnumLabels(ctx context.Context, enumTypeNames []string) (map[string][]string, error)
+	// ListTimeZones returns every row of the timezone reference table
+	// (value, label), ordered by value. This table is not declared in this
+	// repo's own migrations/ -- same "built outside this directory" class
+	// as several other tables documented in CLAUDE.md's "Staging schema
+	// drift" section -- so check the live schema before assuming its shape,
+	// not this file.
+	ListTimeZones(ctx context.Context) ([]TimeZoneRow, error)
+}
+
+// TimeZoneRow is one row of the timezone reference table. utc_offset/dst
+// exist on the table but have no slot in domain.ChoiceListItem (the
+// {id, label} shape GET /metadata's own timeZones field has always used,
+// matching the ServiceNow-backed response this replaces) -- left unread
+// rather than widening that wire contract for data nothing consumes yet.
+type TimeZoneRow struct {
+	Value string
+	Label string
 }
 
 type referenceDataRepo struct {
@@ -101,6 +118,25 @@ func (r *referenceDataRepo) ListProjectTypes(ctx context.Context) ([]ProjectType
 			return nil, fmt.Errorf("scan project type: %w", err)
 		}
 		out = append(out, pt)
+	}
+	return out, rows.Err()
+}
+
+// ListTimeZones implements ReferenceDataRepository.
+func (r *referenceDataRepo) ListTimeZones(ctx context.Context) ([]TimeZoneRow, error) {
+	rows, err := r.db.Query(ctx, `SELECT value, label FROM timezone ORDER BY value`)
+	if err != nil {
+		return nil, fmt.Errorf("list time zones: %w", err)
+	}
+	defer rows.Close()
+
+	var out []TimeZoneRow
+	for rows.Next() {
+		var tz TimeZoneRow
+		if err := rows.Scan(&tz.Value, &tz.Label); err != nil {
+			return nil, fmt.Errorf("scan time zone: %w", err)
+		}
+		out = append(out, tz)
 	}
 	return out, rows.Err()
 }

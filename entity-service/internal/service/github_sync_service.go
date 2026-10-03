@@ -491,7 +491,6 @@ func (s *githubSyncService) handleComment(ctx context.Context, p IssuePayload, m
 	return Outcome{Action: "comment_relayed", ChangeRequestID: caseID}, nil
 }
 
-
 // isOwnIssue reports whether an issues event concerns an issue this service
 // raised itself, from a case. Only the configured integration login creates
 // issues; github-actions[bot] never does -- it runs the repository's workflows,

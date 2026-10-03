@@ -65,32 +65,6 @@ const (
 	// lookup, so this service renders and sends rather than deciding who.
 	TypeCRApprovalRequested Type = "change_request.approval_requested"
 
-	// TypeCaseBillableStatusChanged is Postgres-data-source-only on the
-	// entity-service side, and — like TypeSLATierReached above — not an
-	// email/Chat trigger, so dispatch.Handle's switch has no
-	// case for it either. Unlike TypeSLATierReached, it isn't even handled
-	// by dispatch's own no-op case: internal/timecardengine.Engine consumes
-	// it instead, on its own dedicated consumer group (see
-	// cmd/server/main.go's TIME_CARD_CONSUMER_GROUP/_COUNT) — because
-	// eventbus.Consumer.Run processes one record at a time, fully
-	// sequentially (fetch, handle, commit, repeat), so a future bulk update
-	// over "several time cards," each its own HTTP round trip to
-	// entity-service, must not delay unrelated email/Chat delivery on
-	// dispatch's own consumer instance.
-	//
-	// TODO: internal/timecardengine.Engine.Handle only logs today — the
-	// actual reaction (bulk-flipping every time card's billable flag for
-	// the case) needs a Postgres time_cards table/repo/service on
-	// entity-service first (it has none today; time cards are
-	// ServiceNow-only there). entity-service's own Publish call for this
-	// event is itself still commented out for the same reason, so this
-	// consumer group exists ahead of ever actually receiving one — see
-	// that type's own doc comment in entity-service's copy of this file.
-	// Declared here anyway, kept in sync by hand with entity-service's own
-	// internal/events/events.go, so the two schemas never drift even while
-	// this type is otherwise dormant.
-	TypeCaseBillableStatusChanged Type = "case.billable_status_changed"
-
 	// TypeProjectContactInvited is published by entity-service's Salesforce
 	// membership ingest once a Project_Contact__c in state INVITED /
 	// RE-INVITED has been written to Postgres (see that repo's own CLAUDE.md,
@@ -113,7 +87,7 @@ const (
 // that enumerate valid values.
 var KnownTypes = []Type{
 	TypeCaseCreated, TypeCommentAdded, TypeStatusChanged, TypeCaseAssigned, TypeCaseAcknowledged, TypeSeverityChanged, TypeIncidentCreated,
-	TypeSLATierReached, TypeCaseBillableStatusChanged,
+	TypeSLATierReached,
 	TypeCRApprovalRequested, TypeCRPlanDateNotice,
 	TypeProjectContactInvited, TypeProjectContactRegistered,
 }
@@ -360,16 +334,6 @@ type SLATierReachedPayload struct {
 	CaseID    string `json:"caseId"`
 	ClockType string `json:"clockType"`
 	Tier      string `json:"tier"`
-}
-
-// CaseBillableStatusChangedPayload is the Payload shape for
-// TypeCaseBillableStatusChanged — mirrors entity-service's own
-// CaseBillableStatusChangedPayload exactly; see that type's own doc comment
-// for why LOW severity is the one thing this reacts to and why IsBillable
-// is precomputed there rather than left for a consumer to re-derive.
-type CaseBillableStatusChangedPayload struct {
-	CaseID     string `json:"caseId"`
-	IsBillable bool   `json:"isBillable"`
 }
 
 // TypeCRPlanDateNotice is published by csm-flow-service's cr_plan_date_notice

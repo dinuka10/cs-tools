@@ -583,18 +583,28 @@ func MapCaseCreate(r entity.CreateCaseResponse) CaseCreateResponse {
 // matches the frontend's own PatchCaseRequest type
 // (apps/customer-portal/webapp/src/features/support/types/cases.ts) and the
 // old Ballerina backend's CaseUpdatePayload (modules/entity/types.bal)
-// exactly: only stateKey and watchList. Every other field
-// entity.UpdateCaseRequest supports (severity, subject, description,
-// resolutionCode, cause, closeNotes, and every internal WSO2 support
-// operation — workState, assigneeEmail, case relinking, autocloseHoldUntil,
-// fix-commitment dates) is neither sent by the frontend today nor part of
-// this endpoint's real contract; don't reintroduce them speculatively.
+// exactly: stateKey, watchList, and (as of the closing-dialog fix below)
+// resolutionCode/cause/closeNotes. Every other field entity.UpdateCaseRequest
+// supports — every internal WSO2 support operation (workState, assigneeEmail,
+// case relinking, autocloseHoldUntil, fix-commitment dates) and severity/
+// subject/description — is neither sent by the frontend today nor part of
+// this endpoint's real contract; don't reintroduce those speculatively.
 // StateKey carries ServiceNow's numeric choice-list id (the frontend was
 // built against the old Ballerina backend and still sends this, not
 // entity-service's own string enum) — see case_enum_mapping.go for the
 // translation. entity-service requires exactly one of State/WatchList (of
 // the fields this portal DTO exposes) to be set — StateKey counts as State
 // for that check.
+//
+// ResolutionCode/Cause/CloseNotes are customer-safe (the webapp's own close/
+// accept-solution dialog collects them from the caller, using the choice
+// lists GET /projects/{id}/filters now exposes — see
+// ProjectFilterOptions.ResolutionCodes/Causes) — unlike the excluded fields
+// above, these are not internal WSO2-only operations; a customer closing
+// their own case genuinely needs to say why. They only have meaning
+// alongside a State transition to closed/solution_proposed — entity-service
+// enforces that itself (see its own UpdateCase doc comment), this layer
+// just passes them through unvalidated.
 //
 // WatchList cannot be used to clear every watcher via an explicit empty
 // array — this is a genuine end-to-end platform limitation, not something
@@ -607,8 +617,11 @@ func MapCaseCreate(r entity.CreateCaseResponse) CaseCreateResponse {
 // not a bug — don't change this to a `*[]string` to "fix" an empty-array
 // case that entity-service can't honor anyway.
 type UpdateCaseRequest struct {
-	StateKey  *int     `json:"stateKey,omitempty"`
-	WatchList []string `json:"watchList,omitempty"`
+	StateKey       *int     `json:"stateKey,omitempty"`
+	WatchList      []string `json:"watchList,omitempty"`
+	ResolutionCode *string  `json:"resolutionCode,omitempty"`
+	Cause          *string  `json:"cause,omitempty"`
+	CloseNotes     *string  `json:"closeNotes,omitempty"`
 }
 
 // BuildEntityUpdateCaseRequest converts the portal's restricted update
@@ -622,9 +635,12 @@ func BuildEntityUpdateCaseRequest(id string, req UpdateCaseRequest) entity.Updat
 		state = &s
 	}
 	return entity.UpdateCaseRequest{
-		ID:        id,
-		State:     state,
-		WatchList: req.WatchList,
+		ID:             id,
+		State:          state,
+		WatchList:      req.WatchList,
+		ResolutionCode: req.ResolutionCode,
+		Cause:          req.Cause,
+		CloseNotes:     req.CloseNotes,
 	}
 }
 

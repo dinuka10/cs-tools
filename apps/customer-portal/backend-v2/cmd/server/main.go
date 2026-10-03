@@ -212,8 +212,6 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	// GET/PATCH /users/me are only served by entity-service when it runs
-	// with DATA_SOURCE=servicenow — see internal/entity/users.go.
 	mux.HandleFunc("GET /users/me", userHandler.GetMe)
 	mux.HandleFunc("PATCH /users/me", userHandler.PatchMe)
 

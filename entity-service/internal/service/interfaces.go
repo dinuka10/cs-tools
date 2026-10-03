@@ -41,6 +41,10 @@ type UserService interface {
 	// is missing; a ValidationError when the token cannot be decoded; a
 	// NotFoundError when no user row matches the email.
 	GetMe(ctx context.Context) (domain.GetUserMeResponse, error)
+	// PatchMe updates mutable fields (today: just TimeZone) on the currently
+	// authenticated user, resolved the same way GetMe resolves its caller. A
+	// ValidationError is returned for a blank TimeZone.
+	PatchMe(ctx context.Context, req domain.PatchUserMeRequest) (domain.PatchUserMeResponse, error)
 	// GetUser returns one user's profile: the user row, roles, groups, and for a
 	// customer the project-contact rows with whether each grants access. A
 	// ValidationError is returned for a malformed id and a NotFoundError when no

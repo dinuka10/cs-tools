@@ -375,6 +375,10 @@ export type CaseMetadataResponse = {
   conversationStates?: MetadataItem[];
   timeCardStates?: MetadataItem[];
   severityBasedAllocationTime?: Record<string, number>;
+  // Options for the resolutionCode/cause fields PATCH /cases/:id requires
+  // when closing a case (see PatchCaseRequest).
+  resolutionCodes?: MetadataItem[];
+  causes?: MetadataItem[];
 };
 
 // Model type for all cases filter values state.
@@ -476,6 +480,11 @@ export type CaseClassificationRequest = SharedEnvContext & {
 export type PatchCaseRequest = {
   stateKey?: number;
   watchList?: string[];
+  // Required alongside stateKey when closing (or proposing a solution for)
+  // a case — see CaseStateConfirmDialog.
+  resolutionCode?: string;
+  cause?: string;
+  closeNotes?: string;
 };
 
 // Request type for creating a support case.

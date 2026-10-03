@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
@@ -87,6 +88,9 @@ func (f *fakeUserRepoForEscalationService) GetUserGroups(context.Context, string
 }
 func (f *fakeUserRepoForEscalationService) CreateUser(context.Context, domain.CreateUserRequest, string) (domain.User, error) {
 	panic("fakeUserRepoForEscalationService.CreateUser: not expected to be called by these tests")
+}
+func (f *fakeUserRepoForEscalationService) UpdateUserTimeZone(context.Context, string, string) (time.Time, error) {
+	panic("fakeUserRepoForEscalationService.UpdateUserTimeZone: not expected to be called by these tests")
 }
 
 // caseFoundInScopeRepo is the default stubCaseRepo.GetCaseByID for tests

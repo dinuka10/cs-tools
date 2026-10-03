@@ -152,6 +152,13 @@ var caseResolutionCodeFromEnum = map[string]domain.CaseResolutionCode{
 	"ABRUPTLY_CLOSED_DUE_TO_NON_RESPONSIVENESS_THROUGH_AUTO_CLOSURE": domain.CaseResolutionCodeAbruptlyClosedDueToNonResponsiveness,
 }
 
+// CaseResolutionCodeFromEnum exports caseResolutionCodeFromEnum's lookup for
+// the service package (project_metadata_service.go's resolution-code choice
+// list) -- same "" -for-unrecognized contract as CallRequestStateFromEnum.
+func CaseResolutionCodeFromEnum(enumLabel string) domain.CaseResolutionCode {
+	return caseResolutionCodeFromEnum[enumLabel]
+}
+
 // caseLikeWorkItemTypes is validCaseType's (case_service.go) five values,
 // spelled as the real work_item_type_enum labels: the work_item types
 // GetCaseByID/SearchCases treat as "a case" -- each is a shared-PK
@@ -1697,7 +1704,25 @@ func (r *caseRepo) UpdateCase(ctx context.Context, req domain.UpdateCaseRequest)
 		}
 		var txErr error
 		c, txErr = scanUpdatedCase(tx.QueryRow(ctx, updateCaseQuery, req.ID, state, severity, workState, resolutionCode, cause, req.CloseNotes))
-		return txErr
+		if txErr != nil {
+			return txErr
+		}
+
+		// Recompute time-card billability only on a genuine LOW/S4 boundary
+		// crossing (not every severity change) -- see
+		// recomputeTimeCardsBillable's own doc comment for why this runs
+		// inside this same transaction, under the row lock just taken
+		// above, rather than as a separate call after commit. Best-effort:
+		// logged, never allowed to roll back a severity change that
+		// otherwise succeeded.
+		oldLow := previousSeverityRaw != nil && caseSeverityFromEnum[*previousSeverityRaw] == domain.CaseSeverityLow
+		newLow := c.Severity != nil && *c.Severity == domain.CaseSeverityLow
+		if oldLow != newLow {
+			if _, err := recomputeTimeCardsBillable(ctx, tx, req.ID, newLow); err != nil {
+				slog.ErrorContext(ctx, "update case: recompute time cards billable failed", "caseId", req.ID, "error", err)
+			}
+		}
+		return nil
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.Case{}, nil, &apierror.NotFoundError{Msg: "case not found"}
@@ -2737,6 +2762,64 @@ func (r *caseRepo) MarkCaseFixIssued(ctx context.Context, caseID string) (time.T
 	return fixIssued, true, nil
 }
 
+// txQuerier is the QueryRow+Exec subset both pgx.Tx and *Scoped satisfy --
+// lets recomputeTimeCardsBillable/addCaseTagTx's own patch-tag check run
+// against either a transaction already in progress or (in principle) the
+// plain pool, without duplicating the SQL.
+type txQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+// caseHasPatchTag reports whether caseID currently carries a tag named
+// "patch" (case/whitespace-insensitive -- tag.name has no normalization of
+// its own), via q so the check can run inside an already-open transaction
+// that has the case row locked.
+func caseHasPatchTag(ctx context.Context, q txQuerier, caseID string) (bool, error) {
+	var hasPatch bool
+	err := q.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM work_item_tag wit
+			JOIN tag t ON t.id = wit.tag_id
+			WHERE wit.work_item_id = $1 AND LOWER(TRIM(t.name)) = 'patch'
+		)`, caseID).Scan(&hasPatch)
+	if err != nil {
+		return false, fmt.Errorf("check patch tag: %w", err)
+	}
+	return hasPatch, nil
+}
+
+// recomputeTimeCardsBillable sets every time_card row under caseID to
+// isLow && !hasPatchTag -- "entering LOW/S4 severity makes time cards
+// billable, unless a 'patch' tag overrides it back to non-billable" (WSO2
+// still covers a patch under support even on an otherwise best-efforts S4
+// case) -- in one UPDATE, via q. Called from inside the SAME transaction
+// that already holds a `SELECT ... FOR UPDATE` lock on the case row
+// (UpdateCase's severity branch, addCaseTagTx's "patch" branch below), so
+// two concurrent writers that could otherwise race on this (a severity
+// change and a tag add, or two overlapping severity changes) are
+// serialized by Postgres's own row lock instead: whichever transaction
+// commits last is also the one whose fresh-within-that-transaction read of
+// severity/tags determines the final state, so an older transition can
+// never land after a newer one already did. Errors are returned to the
+// caller to log (best-effort, never meant to abort the transaction this
+// runs inside -- see each call site's own handling).
+func recomputeTimeCardsBillable(ctx context.Context, q txQuerier, caseID string, isLow bool) (int64, error) {
+	isBillable := false
+	if isLow {
+		hasPatch, err := caseHasPatchTag(ctx, q, caseID)
+		if err != nil {
+			return 0, err
+		}
+		isBillable = !hasPatch
+	}
+	tag, err := q.Exec(ctx, `UPDATE time_card SET is_billable = $1 WHERE case_id = $2`, isBillable, caseID)
+	if err != nil {
+		return 0, fmt.Errorf("set time cards billable for case: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // UpdateCaseParent implements CaseRepository.
 func (r *caseRepo) UpdateCaseParent(ctx context.Context, caseID, parentID, callerEmail string) (time.Time, error) {
 	var updatedOn time.Time
@@ -2997,6 +3080,31 @@ func addCaseTagTx(ctx context.Context, tx pgx.Tx, caseID, label, callerEmail str
 	}
 	if !exists {
 		return domain.Tag{}, &apierror.NotFoundError{Msg: "case not found"}
+	}
+
+	// A case tagged "patch" while at LOW/S4 severity should have its time
+	// cards non-billable regardless of the normal "entering LOW makes time
+	// cards billable" rule -- WSO2 still covers a patch under support even
+	// for an otherwise best-efforts S4 case. Locks the same case row
+	// UpdateCase's own severity branch locks (SELECT ... FOR UPDATE on
+	// "case"), so a concurrent severity change is serialized against this
+	// tag add rather than racing it -- see recomputeTimeCardsBillable's own
+	// doc comment. Only acts when the case is currently LOW: adding "patch"
+	// at any other severity does nothing immediately, and is picked up the
+	// next time the case's severity actually crosses into LOW (that
+	// transition's own recompute checks for this tag fresh, every time).
+	// Best-effort: logged, never allowed to fail the tag attach that
+	// already succeeded above.
+	if strings.EqualFold(strings.TrimSpace(label), "patch") {
+		var severityRaw *string
+		err := tx.QueryRow(ctx, `SELECT severity::TEXT FROM "case" WHERE id = $1 FOR UPDATE`, caseID).Scan(&severityRaw)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			slog.ErrorContext(ctx, "add case tag: lock case for patch billable override failed", "caseId", caseID, "error", err)
+		} else if severityRaw != nil && caseSeverityFromEnum[*severityRaw] == domain.CaseSeverityLow {
+			if _, err := recomputeTimeCardsBillable(ctx, tx, caseID, true); err != nil {
+				slog.ErrorContext(ctx, "add case tag: recompute time cards billable failed", "caseId", caseID, "error", err)
+			}
+		}
 	}
 
 	return tag, nil

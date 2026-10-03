@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -66,6 +67,13 @@ type UserRepository interface {
 	// use (user_name is UNIQUE), a ServiceUnavailableError naming any
 	// requested role not seeded in the role table.
 	CreateUser(ctx context.Context, req domain.CreateUserRequest, actor string) (domain.User, error)
+	// UpdateUserTimeZone sets "user".timezone for userID (PATCH /users/me's
+	// own write) and returns the new updated_on. A free-text column (no
+	// FK/enum constraint tying it to the timezone reference table), so any
+	// non-empty value is accepted as-is -- validated against that table only
+	// if a caller ever asks for it. Returns a NotFoundError if userID does
+	// not exist.
+	UpdateUserTimeZone(ctx context.Context, userID, timezone string) (time.Time, error)
 }
 
 type userRepo struct {
@@ -78,13 +86,15 @@ func NewUserRepository(db *pgxpool.Pool) UserRepository {
 }
 
 // userColumns is the column list shared by GetUserByEmail and SearchUsers.
-// The "user" table (migration 0002) has no phone/timezone column at all --
-// unlike account.phone, there is nothing to select for domain.User's Phone/
-// Timezone fields, so both are simply left nil (Go's pointer zero value)
-// rather than queried. Postgres-backed PatchMe/TimeZone support does not
-// exist today regardless (UserService has no PatchMe method at all -- only
-// the ServiceNow-backed SNUserService does).
-const userColumns = `id, user_name, first_name, last_name, email, user_type::TEXT, created_on, updated_on`
+// The "user" table (migration 0002) has no phone column -- unlike
+// account.phone, there is nothing to select for domain.User's Phone field,
+// so it is simply left nil (Go's pointer zero value) rather than queried.
+// timezone (not declared in this repo's own migrations/ -- confirmed
+// directly against the live database, same "built outside this directory"
+// class as the timezone reference table CLAUDE.md's "GET /metadata and
+// GET /projects/{id}/metadata" section documents) backs Timezone/
+// PATCH /users/me's own write.
+const userColumns = `id, user_name, first_name, last_name, email, user_type::TEXT, created_on, updated_on, timezone`
 
 // prefixUserColumns is userColumns qualified with the "u" alias SearchUsers'
 // query uses (needed once EXISTS subqueries reference u.id for role
@@ -117,7 +127,7 @@ func userOrderBy(s domain.UserSortBy) string {
 	return col + " " + dir + ", u.id"
 }
 
-const prefixUserColumns = `u.id, u.user_name, u.first_name, u.last_name, u.email, u.user_type::TEXT, u.created_on, u.updated_on`
+const prefixUserColumns = `u.id, u.user_name, u.first_name, u.last_name, u.email, u.user_type::TEXT, u.created_on, u.updated_on, u.timezone`
 
 // userTypeFromEnum maps "user".user_type's real user_type_enum labels
 // (migration 0011) to domain.UserType. EXTERNAL becomes UserTypeCustomer,
@@ -135,14 +145,15 @@ var userTypeFromEnum = map[string]domain.UserType{
 func scanUser(row interface{ Scan(...any) error }) (domain.User, error) {
 	var u domain.User
 	var firstName, lastName, email, userType *string
-	err := row.Scan(&u.ID, &u.UserName, &firstName, &lastName, &email, &userType, &u.CreatedOn, &u.UpdatedOn)
+	err := row.Scan(&u.ID, &u.UserName, &firstName, &lastName, &email, &userType, &u.CreatedOn, &u.UpdatedOn, &u.Timezone)
 	if err != nil {
 		return domain.User{}, err
 	}
 	// first_name/last_name/email/user_type (migration 0002/0011) all
 	// have no NOT NULL constraint; the domain.User fields they fill are
 	// required (non-pointer), so a NULL column becomes "" rather than
-	// failing the scan.
+	// failing the scan. Timezone is already a pointer field, so a NULL
+	// column (no preference saved yet) scans straight through as nil.
 	u.FirstName = stringOrEmpty(firstName)
 	u.LastName = stringOrEmpty(lastName)
 	u.Email = stringOrEmpty(email)
@@ -533,6 +544,22 @@ func (r *userRepo) CreateUser(ctx context.Context, req domain.CreateUserRequest,
 		return domain.User{}, fmt.Errorf("create user: commit: %w", err)
 	}
 	return u, nil
+}
+
+// UpdateUserTimeZone implements UserRepository.
+func (r *userRepo) UpdateUserTimeZone(ctx context.Context, userID, timezone string) (time.Time, error) {
+	var updatedOn time.Time
+	err := r.db.QueryRow(ctx,
+		`UPDATE "user" SET timezone = $1, updated_on = NOW() WHERE id = $2 RETURNING updated_on`,
+		timezone, userID,
+	).Scan(&updatedOn)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, &apierror.NotFoundError{Msg: "user not found"}
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("update user timezone: %w", err)
+	}
+	return updatedOn, nil
 }
 
 // grantRoles resolves each of names (role.name, migration 0008) to its id

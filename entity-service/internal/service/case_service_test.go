@@ -258,6 +258,7 @@ func (s *stubCaseRepo) MarkCaseFixIssued(ctx context.Context, caseID string) (ti
 	}
 	panic("not implemented")
 }
+
 func (s *stubCaseRepo) SearchCaseActivities(context.Context, domain.SearchCaseActivitiesRequest) ([]domain.CaseActivity, int, error) {
 	panic("not implemented")
 }
@@ -284,11 +285,19 @@ type stubUserRepo struct {
 	getUserGroups        func(ctx context.Context, id string) ([]domain.UserGroupRef, error)
 	getUserProjectAccess func(ctx context.Context, email string) ([]domain.UserContactAccess, error)
 	createUser           func(ctx context.Context, req domain.CreateUserRequest, actor string) (domain.User, error)
+	updateUserTimeZone   func(ctx context.Context, userID, timezone string) (time.Time, error)
 }
 
 func (s stubUserRepo) CreateUser(ctx context.Context, req domain.CreateUserRequest, actor string) (domain.User, error) {
 	if s.createUser != nil {
 		return s.createUser(ctx, req, actor)
+	}
+	panic("not implemented")
+}
+
+func (s stubUserRepo) UpdateUserTimeZone(ctx context.Context, userID, timezone string) (time.Time, error) {
+	if s.updateUserTimeZone != nil {
+		return s.updateUserTimeZone(ctx, userID, timezone)
 	}
 	panic("not implemented")
 }
@@ -4229,6 +4238,126 @@ func TestCaseService_UpdateCase_DualWriteRequiresResolutionFieldsAndMirrorsThem(
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatal("mirror.patchCaseFields was never called")
+		}
+	})
+
+	// TestCaseService_UpdateCase_DualWriteRequiresResolutionFieldsAndMirrorsThem's
+	// own "closed without resolution fields is rejected" case covers type
+	// "case" (the stub's getCaseByID returns no Type at all, which this
+	// requirement conservatively treats as "case" -- see UpdateCase's own
+	// comment on that fallback). This is the regression test for a real,
+	// reported bug: the exact same requirement fired for every other
+	// case-like type too -- engagement/service_request/
+	// security_report_analysis/announcement -- even though
+	// resolutionCode/cause/closeNotes have no backing column for any of
+	// them, and no close flow for those types ever collects them. Closing a
+	// Security Report (security_report_analysis) with no resolution fields
+	// must succeed.
+	// TestCaseService_UpdateCase_DualWriteRequiresResolutionFieldsAndMirrorsThem's
+	// own "closed without resolution fields is rejected" case covers type
+	// "case" (the stub's getCaseByID returns no Type at all, which this
+	// requirement conservatively treats as "case" -- see UpdateCase's own
+	// comment on that fallback).
+	//
+	// This is the regression test for a CodeRabbit-caught follow-up: an
+	// external caller is not simply exempted from supplying resolution
+	// fields -- leaving them nil would make the ServiceNow mirror write fail
+	// outright (ServiceNow's own case-closure workflow requires them), so
+	// they're defaulted to real, valid values instead ("solved by
+	// customer" / "unknown cause" / a generic note) and those defaults must
+	// actually reach both the Postgres write and the mirror.
+	t.Run("external caller's missing resolution fields are defaulted, not left nil", func(t *testing.T) {
+		var gotReq domain.UpdateCaseRequest
+		repo := &stubCaseRepo{
+			getCaseByID: func(_ context.Context, id string, _ repository.SearchScope) (domain.CaseView, error) {
+				st := domain.CaseStateOpen
+				typ := "case"
+				return domain.CaseView{ID: id, State: &st, Type: &typ}, nil
+			},
+			updateCase: func(_ context.Context, req domain.UpdateCaseRequest) (domain.Case, *domain.CaseSeverity, error) {
+				gotReq = req
+				st := *req.State
+				return domain.Case{ID: req.ID, State: &st}, nil, nil
+			},
+		}
+		dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+		gotMirror := make(chan *caseResolutionFields, 1)
+		mirror := &stubMirrorCaseService{patchCaseFieldsFn: func(_ context.Context, _ string, _ *domain.CaseState, _ *domain.CaseSeverity, _ *domain.CaseWorkState, _ *bool, r *caseResolutionFields) (domain.UpdatedCase, error) {
+			gotMirror <- r
+			return domain.UpdatedCase{}, nil
+		}}
+		svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, stubAccess{scope: AccessScope{Unrestricted: false}}, nil, dispatcher, mirror, nil, "")
+
+		if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &closed}); err != nil {
+			t.Fatalf("unexpected error closing a case with no resolution fields as an external caller: %v", err)
+		}
+		if gotReq.ResolutionCode == nil || *gotReq.ResolutionCode != domain.CaseResolutionCodeSolvedByCustomer {
+			t.Errorf("ResolutionCode = %v, want %q", gotReq.ResolutionCode, domain.CaseResolutionCodeSolvedByCustomer)
+		}
+		if gotReq.Cause == nil || *gotReq.Cause != domain.CaseCauseUnknown {
+			t.Errorf("Cause = %v, want %q", gotReq.Cause, domain.CaseCauseUnknown)
+		}
+		if gotReq.CloseNotes == nil || *gotReq.CloseNotes != externalCloseDefaultNotes {
+			t.Errorf("CloseNotes = %v, want %q", gotReq.CloseNotes, externalCloseDefaultNotes)
+		}
+		select {
+		case r := <-gotMirror:
+			if r == nil || r.Code == nil || *r.Code != domain.CaseResolutionCodeSolvedByCustomer {
+				t.Errorf("mirror resolution code = %v, want %q", r, domain.CaseResolutionCodeSolvedByCustomer)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("mirror.patchCaseFields was never called")
+		}
+	})
+
+	// TestCaseService_UpdateCase_MixedIdentityStillRequiresResolutionFields
+	// is the regression test for the other CodeRabbit-caught gap: a caller
+	// whose email ALSO has an active EXTERNAL row resolves to a non-
+	// Unrestricted, project-scoped AccessScope (accessService.scopeForUser's
+	// "external wins" rule), but is still genuinely WSO2 staff and must
+	// still be required to supply resolution fields -- checking
+	// scope.Unrestricted alone (an earlier version of this fix) would wrongly
+	// exempt them.
+	t.Run("caller with a mixed internal+external identity still requires resolution fields", func(t *testing.T) {
+		repo := &stubCaseRepo{
+			getCaseByID: func(_ context.Context, id string, _ repository.SearchScope) (domain.CaseView, error) {
+				st := domain.CaseStateOpen
+				typ := "case"
+				return domain.CaseView{ID: id, State: &st, Type: &typ}, nil
+			},
+		}
+		dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+		mirror := &stubMirrorCaseService{}
+		scope := AccessScope{ProjectIDs: []string{"p1"}, ViewerEmail: writeEmail, HasInternalAccess: true}
+		svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, stubAccess{scope: scope}, nil, dispatcher, mirror, nil, "")
+
+		_, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &closed})
+		var ve *apierror.ValidationError
+		if !asValidationError(err, &ve) {
+			t.Fatalf("expected ValidationError for a mixed-identity caller with no resolution fields, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("closing a non-case type without resolution fields is allowed", func(t *testing.T) {
+		repo := &stubCaseRepo{
+			getCaseByID: func(_ context.Context, id string, _ repository.SearchScope) (domain.CaseView, error) {
+				st := domain.CaseStateOpen
+				typ := "security_report_analysis"
+				return domain.CaseView{ID: id, State: &st, Type: &typ}, nil
+			},
+			updateCase: func(_ context.Context, req domain.UpdateCaseRequest) (domain.Case, *domain.CaseSeverity, error) {
+				st := *req.State
+				return domain.Case{ID: req.ID, State: &st}, nil, nil
+			},
+		}
+		dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
+		mirror := &stubMirrorCaseService{patchCaseFieldsFn: func(_ context.Context, _ string, _ *domain.CaseState, _ *domain.CaseSeverity, _ *domain.CaseWorkState, _ *bool, _ *caseResolutionFields) (domain.UpdatedCase, error) {
+			return domain.UpdatedCase{}, nil
+		}}
+		svc := NewCaseServiceWithSNWriteback(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil, dispatcher, mirror, nil, "")
+
+		if _, err := svc.UpdateCase(context.Background(), domain.UpdateCaseRequest{ID: testDeploymentUUID, State: &closed}); err != nil {
+			t.Fatalf("unexpected error closing a security report with no resolution fields: %v", err)
 		}
 	})
 }

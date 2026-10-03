@@ -186,17 +186,6 @@ This engine's own narrow entity-service client talks to the same entity-service 
 | `REDIS_PASSWORD` | Optional — empty for a local Redis with no auth. Ignored when `REDIS_URL` is set |
 | `SLA_TICK_INTERVAL` | How often this engine polls `GET /sla-status` and diffs tiers. Optional — defaults to `5m`. Most active SLA clocks don't change more than a few times a day, so a short interval mostly just adds load without meaningfully lowering alert latency |
 
-### Billable status engine
-
-Always started (no Redis/state dependency, unlike the SLA engine above — it's a plain Kafka consumer). `internal/timecardengine.Engine` consumes `case.billable_status_changed` — published by entity-service's Postgres data source when a case's severity crosses into or out of `LOW` — on its own dedicated consumer group: `eventbus.Consumer` processes one record at a time, fully sequentially, so a future bulk time-card update must not delay unrelated email/Chat delivery on `dispatch.Dispatcher`'s own consumer group.
-
-**Currently log-only.** Entity-service has no `time_cards` table on its Postgres data source yet (time cards are ServiceNow-only there), so there's no bulk-update reaction to perform — and entity-service's own `Publish` call for this event is itself still commented out. This consumer group exists ahead of need: the plumbing (topic wiring, retry/DLQ behavior, schema validation) is in place and ready for when that reaction is built.
-
-| Variable | Description |
-|---|---|
-| `TIME_CARD_CONSUMER_GROUP` | Consumer group ID this engine's own consumer instances join. Optional — defaults to `csm-notification-service-time-card` |
-| `TIME_CARD_CONSUMER_COUNT` | How many concurrent consumer instances to run. Optional — defaults to `1` |
-
 ### Server
 
 | Variable | Description |

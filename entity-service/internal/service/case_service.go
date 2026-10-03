@@ -46,9 +46,6 @@ type caseService struct {
 	projectContactRepo repository.ProjectContactRepository
 	// publisher is nil when Event Hub is not configured — see
 	// snCaseService.publisher's own doc comment for the same convention.
-	// Currently only ever read by UpdateCase's (inert — see
-	// events.TypeCaseBillableStatusChanged's own doc comment)
-	// case.billable_status_changed detection.
 	publisher EventPublisherService
 	access    AccessService
 	// snWriteback/snMirror back CreateCase, UpdateCase, and CreateCaseComment's
@@ -1210,6 +1207,13 @@ func (s *caseService) SearchCaseComments(ctx context.Context, req domain.SearchC
 	}, nil
 }
 
+// externalCloseDefaultNotes is the closeNotes value an external caller's
+// case close is defaulted to when they didn't (and, per the Customer
+// Portal's own close dialog, never would) supply one -- see UpdateCase's own
+// doc comment on why a default is used instead of exempting the field
+// outright.
+const externalCloseDefaultNotes = "Closed by the customer."
+
 // UpdateCase implements CaseService.
 func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseRequest) (domain.UpdateCaseResponse, error) {
 	if err := validateUUIDs("id", []string{req.ID}); err != nil {
@@ -1314,17 +1318,6 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 			return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "resolutionCode, cause, and closeNotes are only allowed when state is closed or solution_proposed"}
 		}
 	}
-	// Dual-write only: closed / solution_proposed require all three
-	// resolution fields. The mirrored data source enforces this too;
-	// enforcing it here keeps the stores from diverging (a Postgres-only
-	// close with no resolution data can never be mirrored). Plain Postgres
-	// mode keeps its current, looser behaviour.
-	if s.snWriteback != nil && req.State != nil && (*req.State == domain.CaseStateClosed || *req.State == domain.CaseStateSolutionProposed) {
-		if req.ResolutionCode == nil || req.Cause == nil || req.CloseNotes == nil || strings.TrimSpace(*req.CloseNotes) == "" {
-			return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "resolutionCode, cause, and closeNotes are required when state is closed or solution_proposed"}
-		}
-	}
-
 	if req.WatchList != nil {
 		return s.updateCaseWatchList(ctx, req)
 	}
@@ -1392,6 +1385,87 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 		}
 	}
 
+	// Dual-write only: closing (or proposing a solution for) a plain "case"
+	// requires all three resolution fields -- but only for an INTERNAL
+	// caller (WSO2 staff). The mirrored ServiceNow write enforces this too;
+	// enforcing it here keeps the stores from diverging (a Postgres-only
+	// close with no resolution data can never be mirrored). Plain Postgres
+	// mode keeps its current, looser behaviour.
+	//
+	// Scoped to type == "case" specifically -- found live as a real bug:
+	// closing an engagement/service_request/security_report_analysis/
+	// announcement (the other four case-like work_item types, see
+	// "Case-like work_item types" elsewhere in this codebase) hit this same
+	// requirement even though resolution_code/cause/close_notes are
+	// "case"-only columns (see updateCaseQuery) -- there is no way for any
+	// other type to ever satisfy it, and the webapp's own close flow for
+	// those types never collects these fields in the first place. A fetch
+	// failure above (before == nil) can't confirm the type, so this still
+	// conservatively requires the fields rather than silently exempting a
+	// case whose type just couldn't be read.
+	//
+	// Also scoped to an internal caller -- found live as a second, related
+	// bug: resolutionCode/cause are WSO2's own case-resolution taxonomy
+	// (e.g. "Product Bug", "Infrastructure Network"), support-engineer
+	// vocabulary a customer closing their own case was never meant to
+	// classify their issue with. The Customer Portal's own close dialog
+	// should never ask an external caller for this -- only an internal
+	// (WSO2 staff) caller closing a case should be required to supply it.
+	//
+	// "Internal" is scope.Unrestricted OR scope.HasInternalAccess, not just
+	// Unrestricted alone -- a caller whose email also carries an active
+	// EXTERNAL "user" row (a mixed identity) resolves to a non-Unrestricted,
+	// project-scoped AccessScope under accessService.scopeForUser's own
+	// "external wins" rule for data-VISIBILITY scoping, but is still
+	// genuinely WSO2 staff and must still be required to classify the
+	// case -- see AccessScope.HasInternalAccess's own doc comment (a
+	// CodeRabbit-caught gap in an earlier version of this fix, which used
+	// Unrestricted alone and let such a caller bypass the requirement). A
+	// ResolveScope failure here can't confirm the caller is external, so it
+	// conservatively keeps requiring the fields, same posture as the type
+	// check just above.
+	//
+	// An external caller is not simply exempted, either -- a second
+	// CodeRabbit-caught gap: the comment above this block already asserts
+	// "the mirrored data source enforces this too", i.e. ServiceNow's own
+	// case-closure workflow genuinely requires these fields (confirmed via
+	// snResolutionCodeKey/snCauseKey, which both exist and both already
+	// cover the two defaults used below). Leaving them nil for an external
+	// caller would make the best-effort, asynchronous ServiceNow mirror
+	// write fail outright, leaving the mirrored case open/unresolved while
+	// Postgres shows it closed -- the exact divergence this requirement
+	// exists to prevent. So a missing field is defaulted instead of
+	// skipped: "solved by customer" / "unknown cause" / a generic note are
+	// real, valid values on both sides, not nulls -- sparing the customer
+	// an internal-classification question they can't answer while still
+	// keeping both stores in sync.
+	if s.snWriteback != nil && req.State != nil && (*req.State == domain.CaseStateClosed || *req.State == domain.CaseStateSolutionProposed) {
+		if before == nil || before.Type == nil || *before.Type == "case" {
+			isInternalCaller := true
+			if scope, err := s.access.ResolveScope(ctx); err == nil {
+				isInternalCaller = scope.Unrestricted || scope.HasInternalAccess
+			}
+			if isInternalCaller {
+				if req.ResolutionCode == nil || req.Cause == nil || req.CloseNotes == nil || strings.TrimSpace(*req.CloseNotes) == "" {
+					return domain.UpdateCaseResponse{}, &apierror.ValidationError{Msg: "resolutionCode, cause, and closeNotes are required when state is closed or solution_proposed"}
+				}
+			} else {
+				if req.ResolutionCode == nil {
+					code := domain.CaseResolutionCodeSolvedByCustomer
+					req.ResolutionCode = &code
+				}
+				if req.Cause == nil {
+					cause := domain.CaseCauseUnknown
+					req.Cause = &cause
+				}
+				if req.CloseNotes == nil || strings.TrimSpace(*req.CloseNotes) == "" {
+					notes := externalCloseDefaultNotes
+					req.CloseNotes = &notes
+				}
+			}
+		}
+	}
+
 	// actorEmail is used only for this update's own activity-feed entry
 	// below -- resolved best-effort, not required, since this branch has
 	// never required an authenticated caller before now (no permission
@@ -1409,13 +1483,15 @@ func (s *caseService) UpdateCase(ctx context.Context, req domain.UpdateCaseReque
 	// repository locks the row before reading it whenever req.Severity is
 	// set (see CaseRepository.UpdateCase's own doc comment). Only meaningful
 	// when req.Severity != nil; otherwise it's just the unchanged severity.
+	// Severity's LOW/S4-boundary time-card billable recompute (and, for
+	// AddCaseTag, the "patch" tag override) now happens inside
+	// CaseRepository.UpdateCase/AddCaseTag's own transactions, under the
+	// same row lock as the write that triggers it -- see
+	// recomputeTimeCardsBillable's own doc comment for why. Nothing to call
+	// from here anymore.
 	c, oldSeverity, err := s.repo.UpdateCase(ctx, req)
 	if err != nil {
 		return domain.UpdateCaseResponse{}, err
-	}
-
-	if req.Severity != nil {
-		s.detectBillableStatusChange(ctx, req.ID, oldSeverity, c.Severity)
 	}
 
 	// Deliberately independent of s.publisher (never touches Event Hub) --
@@ -2306,48 +2382,6 @@ func (s *caseService) updateCaseFields(ctx context.Context, req domain.UpdateCas
 	return domain.UpdateCaseResponse{Message: "Case updated successfully", Case: resp}, nil
 }
 
-// detectBillableStatusChange checks whether a severity update just crossed
-// the LOW boundary in either direction — entering LOW means every time
-// card on this case should become billable, leaving it means they should
-// become non-billable (see events.CaseBillableStatusChangedPayload's own
-// doc comment for why LOW is the one severity that matters here). A
-// Postgres-backed case's Type is always "case" and can never change (see
-// this file's own UpdateCase, which rejects req.Type entirely on this data
-// source), so unlike the ServiceNow data source this reduces to a single
-// severity comparison — no Type-transition case to handle.
-//
-// Publishing events.TypeCaseBillableStatusChanged is commented out below
-// rather than live — see that type's own doc comment: nothing consumes it
-// yet (Postgres has no time_cards table/repo/service at all today), so
-// publishing now would produce an event nothing acts on. The detection
-// itself is real; only the actual Publish call is inert.
-func (s *caseService) detectBillableStatusChange(ctx context.Context, caseID string, oldSeverity, newSeverity *domain.CaseSeverity) {
-	oldLow := oldSeverity != nil && *oldSeverity == domain.CaseSeverityLow
-	newLow := newSeverity != nil && *newSeverity == domain.CaseSeverityLow
-	if oldLow == newLow {
-		return
-	}
-	isBillable := newLow
-
-	// TODO: enable once a consumer exists for events.TypeCaseBillableStatusChanged
-	// (bulk-flipping every time card's IsBillable for caseId) — see that
-	// type's own doc comment for what's still missing.
-	//
-	// payload, err := json.Marshal(events.CaseBillableStatusChangedPayload{CaseID: caseID, IsBillable: isBillable})
-	// if err != nil {
-	// 	slog.ErrorContext(ctx, "case update: encode case.billable_status_changed payload failed", "caseId", caseID, "error", err)
-	// 	return
-	// }
-	// if s.publisher == nil {
-	// 	return
-	// }
-	// if err := s.publisher.Publish(ctx, events.TypeCaseBillableStatusChanged, caseID, payload); err != nil {
-	// 	slog.ErrorContext(ctx, "case update: publish case.billable_status_changed failed", "caseId", caseID)
-	// }
-
-	slog.InfoContext(ctx, "case update: severity crossed the billable boundary, event hub publish not yet enabled", "caseId", caseID, "isBillable", isBillable)
-}
-
 // validateCaseFieldValues rejects malformed ids and unknown enum spellings in the
 // fields a case search accepts both at the top level and inside an anyOf branch,
 // so they fail as a validation error instead of reaching SQL as a cast error.
@@ -2904,16 +2938,14 @@ func (s *caseService) GetAttachment(_ context.Context, _ string) (domain.Attachm
 
 // AddCaseTag implements CaseService.
 //
-// Persists via tag/work_item_tag (migration 0026), added after this
-// method was written as a detection-only stub (see
-// detectPatchTagBillableOverride's own doc comment for that history) — it
-// now actually attaches label to caseID, idempotently (a repeat call for an
-// already-attached label, case-insensitively, returns the existing tag
-// rather than erroring or duplicating). The "patch" + LOW-severity detection
-// still only logs: (a) case tags having real storage is now true, but (b)
-// no consumer exists yet for events.TypeCaseBillableStatusChanged (bulk-
-// flipping every time card's IsBillable for caseId), so the actual publish
-// stays commented out in detectPatchTagBillableOverride until that exists.
+// Persists via tag/work_item_tag (migration 0026) -- attaches label to
+// caseID, idempotently (a repeat call for an already-attached label,
+// case-insensitively, returns the existing tag rather than erroring or
+// duplicating). A "patch" label on a case currently at LOW/S4 severity
+// also flips its time cards non-billable -- see
+// CaseRepository.recomputeTimeCardsBillable's own doc comment; that
+// override now lives entirely in the repository's own transaction, not
+// here.
 func (s *caseService) AddCaseTag(ctx context.Context, caseID, label string) (domain.Tag, error) {
 	actor, err := s.resolveActor(ctx)
 	if err != nil {
@@ -2943,8 +2975,6 @@ func (s *caseService) addCaseTagAs(ctx context.Context, caseID, label, actorEmai
 	if len(label) > 255 {
 		return domain.Tag{}, &apierror.ValidationError{Msg: "label must not exceed 255 characters"}
 	}
-
-	s.detectPatchTagBillableOverride(ctx, caseID, label)
 
 	tag, err := s.repo.AddCaseTag(ctx, caseID, label, actorEmail)
 	if err != nil {
@@ -3001,66 +3031,6 @@ func (s *caseService) addCaseTagAs(ctx context.Context, caseID, label, actorEmai
 	}
 
 	return tag, nil
-}
-
-// detectPatchTagBillableOverride DETECTS AND LOGS ONLY — it does not
-// itself change any time card's billable status, publish an event, or
-// persist the tag (see AddCaseTag's own doc comment). It is a special case
-// of detectBillableStatusChange's normal "entering LOW/S4 severity makes
-// time cards billable" rule: a case tagged "patch" while at LOW severity
-// should eventually have its time cards non-billable regardless — WSO2
-// still covers a patch under support even for an otherwise best-efforts S4
-// case — but nothing in this codebase acts on that yet (see the TODO
-// below). Label matching is case/whitespace-insensitive, same reasoning as
-// this codebase's other free-text label lookups (e.g.
-// slaSeverityLabelAndColor in csm-notification-service). Unlike
-// detectBillableStatusChange, the eventual reaction is meant to be
-// one-directional: removing the tag (or adding any other label) should
-// never reverse it — only ever set isBillable=false, never back to true,
-// since there's no natural "un-patch" event to react to.
-//
-// Same commented-out-publish posture as detectBillableStatusChange: logs
-// only, since there is still no time_cards consumer to act on
-// events.TypeCaseBillableStatusChanged (see that type's own doc comment).
-// AddCaseTag itself now succeeds (see its own doc comment) -- the remaining
-// gap is purely the missing consumer, not the tag storage this was
-// originally blocked on.
-func (s *caseService) detectPatchTagBillableOverride(ctx context.Context, caseID, label string) {
-	if !strings.EqualFold(strings.TrimSpace(label), "patch") {
-		return
-	}
-
-	// Unrestricted: this is an internal re-fetch of a case AddCaseTag just
-	// wrote to, not a caller-facing read -- there's no separate caller
-	// identity to scope here, and the tag write itself already happened.
-	cv, err := s.repo.GetCaseByID(ctx, caseID, repository.SearchScope{Unrestricted: true})
-	if err != nil {
-		slog.ErrorContext(ctx, "add case tag: patch billable override not evaluated, get case failed", "caseId", caseID)
-		return
-	}
-	if cv.Severity == nil || *cv.Severity != domain.CaseSeverityLow {
-		return
-	}
-
-	// TODO: enable once (a) case tags have real Postgres storage so
-	// AddCaseTag can actually succeed, and (b) a consumer exists for
-	// events.TypeCaseBillableStatusChanged (bulk-flipping every time
-	// card's IsBillable for caseId) — see that type's own doc comment for
-	// what's still missing there.
-	//
-	// payload, err := json.Marshal(events.CaseBillableStatusChangedPayload{CaseID: caseID, IsBillable: false})
-	// if err != nil {
-	// 	slog.ErrorContext(ctx, "add case tag: encode case.billable_status_changed payload failed", "caseId", caseID, "error", err)
-	// 	return
-	// }
-	// if s.publisher == nil {
-	// 	return
-	// }
-	// if err := s.publisher.Publish(ctx, events.TypeCaseBillableStatusChanged, caseID, payload); err != nil {
-	// 	slog.ErrorContext(ctx, "add case tag: publish case.billable_status_changed failed", "caseId", caseID)
-	// }
-
-	slog.InfoContext(ctx, "add case tag: patch tag detected on an S4 case, time cards would need to become non-billable once a real tag/time-card path exists (detection only, no action taken)", "caseId", caseID, "isBillable", false)
 }
 
 // RemoveCaseTag implements CaseService.

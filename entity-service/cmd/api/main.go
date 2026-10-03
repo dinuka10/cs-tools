@@ -181,6 +181,29 @@ func main() {
 			cfg.CloudStatusPollInterval, len(cfg.CloudStatusServiceIDs))
 	}
 
+	// Incident report flows: the record-triggered port of ServiceNow's
+	// "Create Incident Report Task" and "Incident Report Generator". Always
+	// on wherever there is a database -- like the ServiceNow flows, there is
+	// no switch. Running even with DATA_SOURCE=servicenow is deliberate: the
+	// 0181 trigger records incident changes whenever the table is written,
+	// and a drainer that is off lets them pile up, to be replayed as stale
+	// tasks the day it comes on. Writes Postgres only, never ServiceNow, so it
+	// needs no caller token and no publisher.
+	// WithSystemIdentity: a background process with no viewer, and
+	// work_item's RLS insert policy (0147) admits it only as internal.
+	incidentReportCtx, stopIncidentReport := context.WithCancel(repository.WithSystemIdentity(context.Background()))
+	defer stopIncidentReport()
+	if pool != nil {
+		incidentReportDrainer := service.NewIncidentReportDrainer(
+			repository.NewIncidentReportRepository(repository.NewScoped(pool)),
+			service.NewIncidentReportService(),
+			cfg.IncidentReportPollInterval,
+			service.IncidentReportMaxAttempts,
+		)
+		go incidentReportDrainer.Run(incidentReportCtx)
+		log.Printf("incident report flows running: draining every %s", cfg.IncidentReportPollInterval)
+	}
+
 	// The health probe listens separately, on its own port, so that only its
 	// own route is reachable at the public visibility it is published with —
 	// see server.NewHealthServer and .choreo/component.yaml.

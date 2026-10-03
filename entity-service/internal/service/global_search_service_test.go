@@ -70,6 +70,55 @@ func (unusedReferenceDataRepo) GetProjectByID(context.Context, string) (bool, *r
 func (unusedReferenceDataRepo) EnumLabels(context.Context, []string) (map[string][]string, error) {
 	return nil, nil
 }
+func (unusedReferenceDataRepo) ListTimeZones(context.Context) ([]repository.TimeZoneRow, error) {
+	return nil, nil
+}
+
+// fakeTimeZoneRepo backs TestGlobalService_GetSystemMetadata_MapsTimeZones --
+// a configurable ListTimeZones alongside the same fixed-empty everything
+// else unusedReferenceDataRepo provides.
+type fakeTimeZoneRepo struct {
+	timeZones []repository.TimeZoneRow
+}
+
+func (fakeTimeZoneRepo) ListProjectTypes(context.Context) ([]repository.ProjectTypeRow, error) {
+	return nil, nil
+}
+func (fakeTimeZoneRepo) GetProjectByID(context.Context, string) (bool, *repository.ProjectTypeRow, error) {
+	return false, nil, nil
+}
+func (fakeTimeZoneRepo) EnumLabels(context.Context, []string) (map[string][]string, error) {
+	return nil, nil
+}
+func (f fakeTimeZoneRepo) ListTimeZones(context.Context) ([]repository.TimeZoneRow, error) {
+	return f.timeZones, nil
+}
+
+// TestGlobalService_GetSystemMetadata_MapsTimeZones is the regression guard
+// for GET /metadata's timeZones field actually being populated from the
+// Postgres timezone table (value -> id, label -> label) instead of always
+// coming back empty.
+func TestGlobalService_GetSystemMetadata_MapsTimeZones(t *testing.T) {
+	repo := fakeTimeZoneRepo{timeZones: []repository.TimeZoneRow{
+		{Value: "Asia/Colombo", Label: "South Asia (India / Sri Lanka)"},
+		{Value: "America/New_York", Label: "Eastern Time (US/Canada)"},
+	}}
+	svc := NewGlobalService(repo, nil, nil)
+
+	resp, err := svc.GetSystemMetadata(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(resp.TimeZones) != 2 {
+		t.Fatalf("got %d time zones, want 2", len(resp.TimeZones))
+	}
+	if resp.TimeZones[0].ID != "Asia/Colombo" || resp.TimeZones[0].Label != "South Asia (India / Sri Lanka)" {
+		t.Errorf("unexpected first time zone: %+v", resp.TimeZones[0])
+	}
+	if resp.TimeZones[1].ID != "America/New_York" || resp.TimeZones[1].Label != "Eastern Time (US/Canada)" {
+		t.Errorf("unexpected second time zone: %+v", resp.TimeZones[1])
+	}
+}
 
 func newGlobal(acc AccessService, search *fakeSearchRepo) GlobalService {
 	return NewGlobalService(unusedReferenceDataRepo{}, search, acc)

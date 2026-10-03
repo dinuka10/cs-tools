@@ -104,6 +104,11 @@ type ProjectFilterOptions struct {
 	TimeCardStates              []ReferenceItem `json:"timeCardStates"`
 	EngagementTypes             []ReferenceItem `json:"engagementTypes"`
 	EngagementPaymentTypes      []ReferenceItem `json:"engagementPaymentTypes"`
+	// ResolutionCodes/Causes back the resolution fields the webapp must
+	// collect before closing (or proposing a solution for) a case — see
+	// PATCH /cases/{id}'s own dto.UpdateCaseRequest doc comment.
+	ResolutionCodes             []ReferenceItem `json:"resolutionCodes"`
+	Causes                      []ReferenceItem `json:"causes"`
 	SeverityBasedAllocationTime map[string]int  `json:"severityBasedAllocationTime"`
 }
 
@@ -130,6 +135,8 @@ func MapProjectFilterOptions(m entity.ProjectMetadataResponse) ProjectFilterOpti
 		TimeCardStates:              mapChoiceListItems(m.TimeCardStates),
 		EngagementTypes:             normalizeCaseEngagementTypeChoices(mapChoiceListItems(m.EngagementTypes)),
 		EngagementPaymentTypes:      mapChoiceListItems(m.EngagementPaymentTypes),
+		ResolutionCodes:             mapChoiceListItems(m.ResolutionCodes),
+		Causes:                      mapChoiceListItems(m.Causes),
 		SeverityBasedAllocationTime: m.SeverityBasedAllocationTime,
 	}
 }

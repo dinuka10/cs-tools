@@ -56,14 +56,15 @@ var testInternalClientIDs = map[string]bool{"csm-backend": true, "integration": 
 func TestAccessService_ResolveScope(t *testing.T) {
 	const email = "jane@example.com"
 	tests := []struct {
-		name         string
-		id           auth.Identity
-		users        []repository.AccessUser
-		projects     []string
-		wantErr      any // nil, or a pointer to the expected apierror type
-		wantAll      bool
-		wantProjects []string
-		wantNoDBCall bool // internal-client path must never touch the repo
+		name                  string
+		id                    auth.Identity
+		users                 []repository.AccessUser
+		projects              []string
+		wantErr               any // nil, or a pointer to the expected apierror type
+		wantAll               bool
+		wantProjects          []string
+		wantNoDBCall          bool // internal-client path must never touch the repo
+		wantHasInternalAccess bool
 	}{
 		{name: "identity not validated -> refuse (503), never trust the token",
 			id: auth.Identity{Validated: false, UserEmail: email}, wantErr: &apierror.ServiceUnavailableError{}, wantNoDBCall: true},
@@ -81,21 +82,27 @@ func TestAccessService_ResolveScope(t *testing.T) {
 
 		// --- Not an internal client: resolved purely from the user token ---
 		{name: "internal user sees everything",
-			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("INTERNAL", true)}, wantAll: true},
+			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("INTERNAL", true)}, wantAll: true, wantHasInternalAccess: true},
 		{name: "customer sees only registered projects",
 			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("EXTERNAL", true)},
 			projects: []string{"p1", "p2"}, wantProjects: []string{"p1", "p2"}},
 		{name: "customer with no registered projects gets an EMPTY scope, not everything",
 			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("EXTERNAL", true)},
 			projects: []string{}, wantProjects: []string{}},
-		{name: "email shared by an internal and an external row -> customer scope (less access)",
+		// HasInternalAccess must stay true here even though Unrestricted is
+		// false: this caller is still genuinely WSO2 staff (a mixed
+		// identity), just scoped like a customer for data-VISIBILITY
+		// purposes (see AccessScope.HasInternalAccess's own doc comment) --
+		// a CodeRabbit-caught gap in an earlier fix that read Unrestricted
+		// alone as "is this caller internal".
+		{name: "email shared by an internal and an external row -> customer scope (less access), but HasInternalAccess stays true",
 			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("INTERNAL", true), userOf("EXTERNAL", true)},
-			projects: []string{"p1"}, wantProjects: []string{"p1"}},
+			projects: []string{"p1"}, wantProjects: []string{"p1"}, wantHasInternalAccess: true},
 		{name: "inactive internal row does not count",
 			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("INTERNAL", false)}, wantErr: &apierror.ForbiddenError{}},
-		{name: "inactive internal + active customer -> customer",
+		{name: "inactive internal + active customer -> customer, HasInternalAccess false (the internal row doesn't count)",
 			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("INTERNAL", false), userOf("EXTERNAL", true)},
-			projects: []string{"p9"}, wantProjects: []string{"p9"}},
+			projects: []string{"p9"}, wantProjects: []string{"p9"}, wantHasInternalAccess: false},
 		{name: "internal row alongside a NOT_AVAILABLE row -> denied",
 			id: auth.Identity{Validated: true, UserEmail: email}, users: []repository.AccessUser{userOf("INTERNAL", true), userOf("NOT_AVAILABLE", true)}, wantErr: &apierror.ForbiddenError{}},
 		{name: "system user is not a person -> denied",
@@ -153,6 +160,9 @@ func TestAccessService_ResolveScope(t *testing.T) {
 			if scope.ProjectIDs == nil || len(scope.ProjectIDs) != len(tt.wantProjects) {
 				t.Errorf("%s: ProjectIDs = %#v, want %v (non-nil)", tt.name, scope.ProjectIDs, tt.wantProjects)
 			}
+		}
+		if scope.HasInternalAccess != tt.wantHasInternalAccess {
+			t.Errorf("%s: HasInternalAccess = %v, want %v", tt.name, scope.HasInternalAccess, tt.wantHasInternalAccess)
 		}
 	}
 }

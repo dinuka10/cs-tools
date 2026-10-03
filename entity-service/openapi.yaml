@@ -1479,6 +1479,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  /internal/availability/sweep:
+    post:
+      summary: >-
+        Internal-caller-only. Recomputes service availability for every
+        offering held to an AVAILABILITY commitment and writes
+        service_availability: the daily, weekly, monthly and annual periods
+        containing now, the four that most recently closed, and the rolling
+        last 7 / 30 / 90 days and 12 months. The producer behind the cloud
+        status dashboard endpoints; invoked nightly by
+        operations/csm-scheduled-tasks' availability_recalculation sub-cron.
+        Idempotent: rows are keyed on their own period, so a re-run rewrites
+        them rather than adding more.
+      operationId: sweepServiceAvailability
+      responses:
+        "200":
+          description: >-
+            The sweep ran. failed counts subjects whose computation errored;
+            the others were written regardless.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailabilitySweepResult'
+        "500":
+          description: InternalServerError.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
   /internal/cloud-status/sweep:
     post:
       summary: >-
@@ -8945,8 +8973,8 @@ paths:
     get:
       summary: Get system-wide reference metadata (time zones, project types, feedback emojis).
       description: >
-        Postgres: projectTypes come from project_type; timeZones and feedbackEmojies have no
-        Postgres source yet and come back empty.
+        Postgres: projectTypes come from project_type and timeZones come from timezone;
+        feedbackEmojies has no Postgres source yet and comes back empty.
       operationId: getSystemMetadata
       responses:
         "200":
@@ -20088,6 +20116,8 @@ components:
         - caseTypes
         - engagementTypes
         - engagementPaymentTypes
+        - resolutionCodes
+        - causes
         - features
       properties:
         caseStates:
@@ -20140,6 +20170,18 @@ components:
             $ref: '#/components/schemas/ChoiceListItem'
         engagementPaymentTypes:
           type: array
+          items:
+            $ref: '#/components/schemas/ChoiceListItem'
+        resolutionCodes:
+          type: array
+          description: >
+            Valid values for PATCH /cases/{id}'s `resolutionCode`, required alongside
+            `cause` and `closeNotes` when closing (or proposing a solution for) a case.
+          items:
+            $ref: '#/components/schemas/ChoiceListItem'
+        causes:
+          type: array
+          description: Valid values for PATCH /cases/{id}'s `cause`.
           items:
             $ref: '#/components/schemas/ChoiceListItem'
         features:
@@ -22392,6 +22434,20 @@ components:
           type: boolean
           description: Drives a UI accordion; always false on the wire.
       required: [id, begin, end, type, status, short_description, expanded]
+    AvailabilitySweepResult:
+      type: object
+      properties:
+        subjects:
+          type: integer
+          description: How many offering/commitment pairs the sweep computed.
+        rows:
+          type: integer
+          description: How many service_availability rows were written.
+        failed:
+          type: integer
+          description: >-
+            Subjects whose computation errored. Non-zero is a fault; the
+            entity-service log names each one and its commitment.
     CloudStatusSweepResult:
       type: object
       properties:

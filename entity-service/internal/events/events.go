@@ -37,27 +37,6 @@ const (
 	TypeCaseAcknowledged Type = "case.acknowledged"
 	TypeSeverityChanged  Type = "case.severity_changed"
 	TypeIncidentCreated  Type = "incident.created"
-	// TypeCaseBillableStatusChanged is Postgres-data-source-only (unlike
-	// every other type here, which is ServiceNow-only) — see
-	// CaseBillableStatusChangedPayload's own doc comment for what it's for
-	// and why the two data sources aren't symmetric here.
-	//
-	// TODO: the consumer group plumbing exists on the
-	// csm-notification-service side (its own dedicated consumer group,
-	// internal/timecardengine.Engine — not folded into dispatch.Dispatcher's
-	// group, since eventbus.Consumer.Run processes one record at a time,
-	// fully sequentially/blocking, and a bulk update over "several time
-	// cards" must not delay unrelated email/Chat delivery on the same
-	// consumer instance), but its Handle only logs today — the actual
-	// reaction (bulk-flip every time card on the case to match
-	// Payload.IsBillable) needs a time_cards table/repo/service on this
-	// data source first (it has none today; time cards are
-	// ServiceNow-only, see internal/service/sn_time_card_service.go).
-	// Publishing this event is therefore still commented out at its one
-	// call site (case_service.go's UpdateCase) — the detection logic is
-	// real and live, only the actual Publish call is inert, so there's
-	// nothing for that consumer to receive yet either.
-	TypeCaseBillableStatusChanged Type = "case.billable_status_changed"
 	// TypeProjectContactInvited is Postgres-data-source-only. Published by
 	// the Salesforce membership ingest (salesforceEventService) after a
 	// Project_Contact__c in state INVITED / RE-INVITED has been written to the
@@ -201,28 +180,6 @@ type SeverityChangedPayload struct {
 	// Team — see CaseCreatedPayload's own doc comment.
 	Team       string   `json:"team,omitempty"`
 	Recipients []string `json:"recipients"`
-}
-
-// CaseBillableStatusChangedPayload is the Payload shape for
-// TypeCaseBillableStatusChanged — published (once a consumer exists — see
-// that type's own TODO) when a case's severity crosses into or out of LOW
-// on the Postgres data source. Type is always "case" and fixed forever for
-// a Postgres-backed case (see case_service.go's UpdateCase, which rejects
-// changing Type at all on this data source), so unlike the ServiceNow data
-// source — where Type can transfer between case/engagement/service_request
-// and severity is only ever meaningful for Type=="case" — the "does this
-// case count as S4 (WSO2's own support-policy tier for LOW severity, see
-// entity-service's sla_policy.go)" question collapses to a single check:
-// is the new severity LOW or not. IsBillable is the resulting target state
-// (true entering LOW, false leaving it) — precomputed here rather than left
-// for a consumer to re-derive from raw severity strings, since severity's
-// mapping to "billable" is business policy this service already owns (the
-// same reasoning sla_policy.go already established for SLA durations).
-// No Recipients/Product/Team: this event has no notification reaction at
-// all, only the (not yet built) time-card side effect.
-type CaseBillableStatusChangedPayload struct {
-	CaseID     string `json:"caseId"`
-	IsBillable bool   `json:"isBillable"`
 }
 
 // CaseCreatedPayload is the Payload shape for TypeCaseCreated — mirrors

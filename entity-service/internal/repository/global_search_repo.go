@@ -67,6 +67,21 @@ type SearchScope struct {
 	Unrestricted bool
 	ProjectIDs   []string
 	ViewerEmail  string
+	// HasInternalAccess is true whenever the caller's email has an active
+	// INTERNAL "user" row, even when Unrestricted is false because the same
+	// email ALSO has an active EXTERNAL row (accessService.scopeForUser's
+	// own "external wins" rule for data-visibility scoping -- "less access,
+	// never more, when the data is ambiguous"). That rule is about which
+	// projects/cases a caller may LIST, a different question from "is this
+	// person WSO2 staff" -- a caller this field is true for is still legitimate
+	// internal staff and must not be treated as an external customer by
+	// callers asking that second question (see caseService.UpdateCase's own
+	// resolution-fields requirement, the one place this is read as of this
+	// field's introduction). Never true from an Unrestricted:true internal-
+	// client-id/system-identity scope -- those paths have no "user" row to
+	// check at all; callers that also want to treat such a caller as internal
+	// should check Unrestricted separately, as UpdateCase does.
+	HasInternalAccess bool
 }
 
 // scopePredicate is the single place the "row belongs to one of the caller's
