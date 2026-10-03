@@ -1321,7 +1321,9 @@ func publishCaseCreatedEvent(
 		// the full error is already durably recorded in
 		// event_publish_failures by Publish itself).
 		slog.ErrorContext(ctx, "create case: publish case.created failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "create case: case.created published", "caseId", caseID)
 }
 
 // resolveCommentAuthorSearchLimit bounds resolveCommentAuthor's lookup —
@@ -1479,7 +1481,9 @@ func publishCommentAddedEvent(ctx context.Context, publisher EventPublisherServi
 		// Not logging err itself — see publishCaseCreatedEvent's matching
 		// log line for why.
 		slog.ErrorContext(ctx, "create comment: publish case.comment_added failed", "caseId", req.CaseID)
+		return
 	}
+	slog.InfoContext(ctx, "create comment: case.comment_added published", "caseId", req.CaseID)
 }
 
 // applyCustomerReplyStateTransition moves a case back to Waiting on WSO2
@@ -1765,7 +1769,9 @@ func publishStatusChangedEvent(ctx context.Context, publisher EventPublisherServ
 		// Not logging err itself — see publishCaseCreatedEvent's matching
 		// log line for why.
 		slog.ErrorContext(ctx, "update case: publish case.status_changed failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "update case: case.status_changed published", "caseId", caseID)
 }
 
 // publishSeverityChanged best-effort publishes a case.severity_changed
@@ -1849,7 +1855,9 @@ func publishSeverityChangedEvent(ctx context.Context, publisher EventPublisherSe
 		// Not logging err itself — see publishCaseCreatedEvent's matching
 		// log line for why.
 		slog.ErrorContext(ctx, "update case: publish case.severity_changed failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "update case: case.severity_changed published", "caseId", caseID)
 }
 
 // publishCaseAssigned best-effort publishes a case.assigned event after
@@ -1906,7 +1914,9 @@ func (s *snCaseService) publishCaseAssigned(ctx context.Context, caseID, assigne
 		// Not logging err itself — see publishCaseCreated's matching log
 		// line for why.
 		slog.ErrorContext(ctx, "sn update case: publish case.assigned failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "sn update case: case.assigned published", "caseId", caseID)
 }
 
 // publishCaseAcknowledged best-effort publishes a case.acknowledged event
@@ -1957,7 +1967,9 @@ func (s *snCaseService) publishCaseAcknowledged(ctx context.Context, caseID, ack
 		// Not logging err itself — see publishCaseCreated's matching log
 		// line for why.
 		slog.ErrorContext(ctx, "sn update case: publish case.acknowledged failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "sn update case: case.acknowledged published", "caseId", caseID)
 }
 
 // ProjectContactEmailsByRole implements CaseService. project_contact/

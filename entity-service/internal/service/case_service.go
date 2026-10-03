@@ -515,6 +515,14 @@ func (s *caseService) CreateCase(ctx context.Context, req domain.CreateCaseReque
 		callerEmail, _ := emailFromJWT(middleware.UserIDTokenFromContext(ctx))
 		s.addRequestedWatchers(ctx, c.ID, callerEmail, watcherIDs)
 	}
+	// Publish case.created here too -- previously only createCaseSNFirst
+	// (the SN-mirror path, reached when s.snMirror != nil) did this, so a
+	// deployment with no ServiceNow mirror at all never published
+	// case.created, regardless of how Event Hub was configured. Watchers are
+	// persisted first (immediately above) for the same reason
+	// createCaseSNFirst orders it this way: publishCaseCreatedEvent's own
+	// GetCaseByID re-fetch needs them already written to resolve Recipients.
+	publishCaseCreatedEvent(ctx, s.publisher, s.GetCaseByID, s.ProjectContactEmailsByRole, s.AccountDefaultWatcherEmails, req, c.ID)
 	state := ""
 	if c.State != nil {
 		state = string(*c.State)
@@ -2010,7 +2018,9 @@ func (s *caseService) publishCaseAssigned(ctx context.Context, caseID, assigneeN
 	}
 	if err := s.publisher.Publish(ctx, events.TypeCaseAssigned, caseID, payload); err != nil {
 		slog.ErrorContext(ctx, "update case: publish case.assigned failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "update case: case.assigned published", "caseId", caseID)
 }
 
 // acknowledgeCase implements UpdateCase's Acknowledge branch: claiming the
@@ -2102,7 +2112,9 @@ func (s *caseService) publishCaseAcknowledged(ctx context.Context, caseID, ackno
 	}
 	if err := s.publisher.Publish(ctx, events.TypeCaseAcknowledged, caseID, payload); err != nil {
 		slog.ErrorContext(ctx, "update case: publish case.acknowledged failed", "caseId", caseID)
+		return
 	}
+	slog.InfoContext(ctx, "update case: case.acknowledged published", "caseId", caseID)
 }
 
 // updateCaseParent implements UpdateCase's ParentID branch: writing

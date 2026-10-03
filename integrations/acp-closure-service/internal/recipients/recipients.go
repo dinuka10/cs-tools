@@ -20,6 +20,8 @@
 // closure notice. Pure — no I/O, same philosophy as the closure package.
 package recipients
 
+import "strings"
+
 // ProjectContact mirrors entity-service's project-contact shape (Supported
 // by the ServiceNow data source only).
 type ProjectContact struct {
@@ -61,41 +63,60 @@ const businessContactRole = "business_contact" // PLACEHOLDER
 // Resolution is the outcome of resolving who should receive a project's
 // customer-facing ACP notice. NeedsAMNudge signals a *different* email (a
 // "please configure a business contact" nudge) than the closure notice
-// itself — it is not additive with CustomerContact.
+// itself — it is not additive with CustomerContacts.
 type Resolution struct {
-	CustomerContact *Contact
-	NeedsAMNudge    bool
-	ResolvedVia     ResolvedVia
+	CustomerContacts []Contact
+	NeedsAMNudge     bool
+	ResolvedVia      ResolvedVia
 }
 
-// ResolveCustomerContact implements the three-tier fallback: a Project
-// Contact with the business-contact role first, then the account's Primary
-// Contact, then a signal to nudge the Account Manager instead. A tier only
-// counts as resolved if the contact has a usable (non-empty) email — a real
-// contact record with no email on file (confirmed elsewhere in this package,
-// see AccountManagerEmail's doc comment, to be a legitimate, unremarkable
-// data state) is not a usable Recipient, and must fall through to the next
-// tier rather than resolving to Recipient: "".
-func ResolveCustomerContact(projectContacts []ProjectContact, accountContacts []AccountContact) Resolution {
+// ResolveCustomerContacts implements the three-tier fallback: every Project
+// Contact with the business-contact role first, then every Primary Contact
+// on the account, then a signal to nudge the Account Manager instead. Each
+// tier returns all of its matches, not just the first: the ServiceNow system
+// sends the customer notice to several customer addresses (confirmed by the
+// user from real legacy emails), and real accounts can have more than one
+// Primary Contact. A contact only counts if it has a usable (non-empty)
+// email — a real contact record with no email on file (confirmed elsewhere
+// in this package, see AccountManagerEmail's doc comment, to be a
+// legitimate, unremarkable data state) is not a usable recipient, and a tier
+// with no usable contact falls through to the next. Each address is listed
+// once (compared case-insensitively), in the order the contacts came.
+func ResolveCustomerContacts(projectContacts []ProjectContact, accountContacts []AccountContact) Resolution {
+	var business []Contact
 	for _, c := range projectContacts {
-		if hasBusinessContactRole(c) && c.Email != "" {
-			return Resolution{
-				CustomerContact: &Contact{Name: c.Name, Email: c.Email},
-				ResolvedVia:     ResolvedViaBusinessContact,
-			}
+		if hasBusinessContactRole(c) {
+			business = appendUniqueEmail(business, Contact{Name: c.Name, Email: c.Email})
 		}
 	}
+	if len(business) > 0 {
+		return Resolution{CustomerContacts: business, ResolvedVia: ResolvedViaBusinessContact}
+	}
 
+	var primary []Contact
 	for _, c := range accountContacts {
-		if c.IsPrimary && c.Email != "" {
-			return Resolution{
-				CustomerContact: &Contact{Name: c.Name, Email: c.Email},
-				ResolvedVia:     ResolvedViaPrimaryContact,
-			}
+		if c.IsPrimary {
+			primary = appendUniqueEmail(primary, Contact{Name: c.Name, Email: c.Email})
 		}
+	}
+	if len(primary) > 0 {
+		return Resolution{CustomerContacts: primary, ResolvedVia: ResolvedViaPrimaryContact}
 	}
 
 	return Resolution{NeedsAMNudge: true, ResolvedVia: ResolvedViaNone}
+}
+
+// appendUniqueEmail appends c unless its email is empty or already in list.
+func appendUniqueEmail(list []Contact, c Contact) []Contact {
+	if c.Email == "" {
+		return list
+	}
+	for _, existing := range list {
+		if strings.EqualFold(existing.Email, c.Email) {
+			return list
+		}
+	}
+	return append(list, c)
 }
 
 // PersonRef mirrors entity-service's person-reference shape (technicalOwner/

@@ -126,6 +126,7 @@ type projectContactDTO struct {
 
 type projectContactSearchResponse struct {
 	Contacts []projectContactDTO `json:"contacts"`
+	Total    int                 `json:"total"`
 }
 
 type accountContactDTO struct {
@@ -136,6 +137,13 @@ type accountContactDTO struct {
 
 type accountContactSearchResponse struct {
 	Contacts []accountContactDTO `json:"contacts"`
+	Total    int                 `json:"total"`
+}
+
+// searchContactsRequest is the body for both contacts searches
+// (/projects/{id}/contacts/search and /accounts/{id}/contacts/search).
+type searchContactsRequest struct {
+	Pagination pagination `json:"pagination"`
 }
 
 // personRefDTO mirrors entity-service's PersonRef shape as it appears
@@ -184,6 +192,7 @@ type opportunityDTO struct {
 	Account            *entityRefDTO `json:"account"`
 	EulaVersion        *string       `json:"eulaVersion"`
 	EulaVersionDecimal *string       `json:"eulaVersionDecimal"`
+	Stage              *string       `json:"stage"`
 }
 
 type searchOpportunitiesResponse struct {
@@ -207,6 +216,7 @@ type invoiceDTO struct {
 	InvoicedDueDate  *string       `json:"invoicedDueDate"`
 	Opportunity      *entityRefDTO `json:"opportunity"`
 	Classification   *string       `json:"classification"`
+	SfID             *string       `json:"sfId"`
 }
 
 type searchInvoicesResponse struct {

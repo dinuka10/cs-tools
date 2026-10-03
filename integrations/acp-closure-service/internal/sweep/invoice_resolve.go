@@ -20,7 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -29,11 +31,16 @@ import (
 // eligible ones), plus its opportunity's EULA version, which is what
 // closure.DecideInvoice/InvoiceSuspendDate need alongside it.
 type resolvedInvoice struct {
-	ID                 string
+	ID string
+	// Number is what the notice shows as "Invoice Id": the invoice's name
+	// (ServiceNow u_name, e.g. US20268838), as legacy shows it. Falls back to
+	// ID, the internal record ID, only when the invoice has no name.
+	Number             string
 	Opportunity        string
 	InvoiceDate        time.Time
 	DueDate            time.Time
 	EULAVersionDecimal float64
+	SfID               string
 }
 
 // excludedInvoiceClassifications mirrors the legacy fetchDueInvoicesByProject
@@ -46,24 +53,39 @@ type resolvedInvoice struct {
 var excludedInvoiceClassifications = map[string]bool{"PP": true, "CO": true, "TAM": true}
 
 // resolveDueInvoice finds the "immediate" due invoice for a project —
-// ported from the legacy ACPInvoiceUtils.fetchDueInvoicesByProject, minus
-// the opportunity-stage=Closed-Won check (the new Opportunity API doesn't
-// expose a stage field yet — see the epic issue's follow-up request to
-// Sajith; deliberately not faked here, this filter is simply not applied
-// until that field exists). Returns (nil, nil) when the project has no
-// eligible due invoice — a legitimate, common state, not an error.
+// ported from the legacy ACPInvoiceUtils.fetchDueInvoicesByProject,
+// including its opportunity eligibility check (see eligibleOpportunity).
+// Returns (nil, nil) when the project has no eligible due invoice — a
+// legitimate, common state, not an error. The returned invoice is the first
+// of resolveDueInvoices: the earliest due, which drives the cascade's timing.
 func resolveDueInvoice(ctx context.Context, reader entityReader, proj project) (*resolvedInvoice, error) {
+	all, err := resolveDueInvoices(ctx, reader, proj)
+	if err != nil || len(all) == 0 {
+		return nil, err
+	}
+	return &all[0], nil
+}
+
+// resolveDueInvoices returns every eligible due invoice for a project,
+// earliest due first, each once. Legacy fetchDueInvoicesByProject returns
+// this same list (orderBy u_invoiced_due_date); it decides the cascade's
+// timing from the first and passes the whole list to the internal email,
+// which shows one box per invoice.
+func resolveDueInvoices(ctx context.Context, reader entityReader, proj project) ([]resolvedInvoice, error) {
 	links, err := fetchAllProjectOpportunityLinks(ctx, reader, proj.ID)
 	if err != nil {
 		return nil, err
 	}
 
-	var best *resolvedInvoice
+	var all []resolvedInvoice
+	seenOpp := map[string]bool{}
+	seenInvoice := map[string]bool{}
 
 	for _, link := range links {
-		if link.Opportunity == nil || link.Opportunity.ID == "" {
+		if link.Opportunity == nil || link.Opportunity.ID == "" || seenOpp[link.Opportunity.ID] {
 			continue
 		}
+		seenOpp[link.Opportunity.ID] = true
 
 		oppRaw, err := reader.GetOpportunity(ctx, link.Opportunity.ID)
 		if err != nil {
@@ -107,20 +129,26 @@ func resolveDueInvoice(ctx context.Context, reader entityReader, proj project) (
 				}
 			}
 
-			candidate := &resolvedInvoice{
+			if seenInvoice[inv.ID] {
+				continue
+			}
+			seenInvoice[inv.ID] = true
+			all = append(all, resolvedInvoice{
 				ID:                 inv.ID,
+				Number:             invoiceNumber(inv),
 				Opportunity:        oppName,
 				InvoiceDate:        invoiceDate,
 				DueDate:            dueDate,
 				EULAVersionDecimal: eulaDecimal,
-			}
-			if best == nil || candidate.DueDate.Before(best.DueDate) {
-				best = candidate
-			}
+				SfID:               stringValue(inv.SfID),
+			})
 		}
 	}
 
-	return best, nil
+	// Stable, so invoices due on the same day keep the order they were found
+	// in, as the earlier "first strictly-earlier wins" selection did.
+	sort.SliceStable(all, func(i, j int) bool { return all[i].DueDate.Before(all[j].DueDate) })
+	return all, nil
 }
 
 // fetchAllProjectOpportunityLinks pages through /project-opportunity-links/search
@@ -189,12 +217,20 @@ func fetchAllInvoicesForOpportunity(ctx context.Context, reader entityReader, op
 	return all, nil
 }
 
+// closedWonStage is the only opportunity stage whose invoices count —
+// the exact literal legacy compares u_stage against.
+const closedWonStage = "50 - Closed Won"
+
 // eligibleOpportunity mirrors the legacy fetchDueInvoicesByProject
-// eligibility check on the opportunity's text EULA field — non-null and
-// not "Customer contract". Kept literal (see excludedInvoiceClassifications'
-// doc comment) rather than adjusted against unverified staging data.
+// eligibility check exactly: stage is "50 - Closed Won", and the text EULA
+// field is non-null and not "Customer contract". A null or any other stage
+// is ineligible, as in legacy's equality check. See CLAUDE.md ("Only Closed
+// Won opportunities' invoices count"). Kept literal (see
+// excludedInvoiceClassifications' doc comment) rather than adjusted against
+// unverified staging data.
 func eligibleOpportunity(opp opportunityDTO) bool {
-	return opp.EulaVersion != nil && *opp.EulaVersion != "Customer contract"
+	return opp.Stage != nil && *opp.Stage == closedWonStage &&
+		opp.EulaVersion != nil && *opp.EulaVersion != "Customer contract"
 }
 
 // eligibleInvoice mirrors the legacy fetchDueInvoicesByProject invoice
@@ -242,4 +278,16 @@ func parseEULAVersionDecimal(s *string) (float64, error) {
 		return 0, nil
 	}
 	return strconv.ParseFloat(*s, 64)
+}
+
+// invoiceNumber returns the value the notice shows as "Invoice Id". Legacy
+// shows the invoice's name (ServiceNow u_name, e.g. US20268838). The API's
+// "id" is an internal record ID nobody recognises, and the Salesforce ID is
+// used only for the "Open in Salesforce" link. Falls back to the record ID
+// only when there's no name, so the field is never blank.
+func invoiceNumber(inv invoiceDTO) string {
+	if inv.Name != nil && strings.TrimSpace(*inv.Name) != "" {
+		return strings.TrimSpace(*inv.Name)
+	}
+	return inv.ID
 }

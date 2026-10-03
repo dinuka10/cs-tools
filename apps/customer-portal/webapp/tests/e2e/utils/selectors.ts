@@ -27,12 +27,24 @@
  * menu. */
 export const GET_HELP_BUTTON = "Get Help";
 
+import { RECORD_ID_PATTERN } from "./ids";
+
 /** Case-creation form. Its field labels are sibling <Typography> nodes rather
  * than real <label for>, so `getByLabel` does not work here — the MUI Selects
  * are located by the placeholder text their `renderValue` emits, and the
  * inputs by their stable ids. */
 export const CREATE_CASE = {
   heading: "Complete Case Details",
+  /** Shown under Product Version when the chosen deployment has no products
+   * attached. The rest of the form does not render until a product is picked,
+   * so a deployment in this state blocks case creation entirely — and the
+   * project's deployments are not uniform: the auto-created "Automation Test
+   * Deployment <timestamp>" records left by the add-deployment spec frequently
+   * have none. */
+  noProductsMessage: "No products found for this deployment.",
+  /** The route the form lives at, under a project. Shared with the
+   * chat-originated variant, which is why the form arrives pre-populated. */
+  pathSegment: "support/chat/create-case",
   submitButton: "Create Support Case",
   successMessage: "Case created successfully",
   /** Maximum title length enforced by CreateCasePage's handleSubmit and shown
@@ -52,6 +64,11 @@ export const CREATE_CASE = {
     /** Reads "Select deployment first" until a deployment is chosen, and
      * "Select Product..." on Cloud Support projects. */
     productVersion: /Select Product Version|Select Product|Select deployment first/,
+    /** The gate specifically: shown while the product field is waiting on a
+     * deployment. It disappears once one is chosen — including when the
+     * deployment has exactly one product and the form auto-selects it, which is
+     * why "the product placeholder is now enabled" is NOT a safe assertion. */
+    productGatedOnDeployment: "Select deployment first",
   },
   ids: {
     title: "#title",
@@ -202,6 +219,11 @@ export const SETTINGS = {
        * is the section's label text. */
       toggleName: "AI Chat Assistant (Novera)",
       successMessage: "AI Chat Assistant (Novera) was updated successfully.",
+      /** Shown on the AI Assistant tab to anyone without the ServiceNow
+       * customer_admin role. The tab itself is visible to everyone — it is the
+       * SWITCH that is gated, by being rendered disabled, so a non-admin sees
+       * the setting and cannot change it. */
+      adminOnlyHint: "Users with Admin role can only update this setting",
       /**
        * Where Get Help leads once the assistant is on.
        *
@@ -362,7 +384,7 @@ export const NOVERA_CHAT = {
    * creation, leaving no chat entry behind. The id is the signal that it is
    * real.
    */
-  conversationIdPattern: /\/support\/chat\/[0-9a-f]{32}$/,
+  conversationIdPattern: new RegExp(`/support/chat/${RECORD_ID_PATTERN}$`),
   conversation: {
     /** Offered in two places on the chat page — beside the input and in the
      * escalation banner — both reading "Create Case", so a locator for it takes
@@ -477,7 +499,9 @@ export const NOVERA_CHAT = {
    * the Resume action from it, so a direct visit to the same URL renders a
    * read-only view with no input. Verified live.
    */
-  resumedConversationPattern: /\/support\/conversations\/[0-9a-f]{32}$/,
+  resumedConversationPattern: new RegExp(
+    `/support/conversations/${RECORD_ID_PATTERN}$`,
+  ),
   /** The message box on an open conversation. */
   message: {
     inputPlaceholder: "Type your message...",
@@ -1161,9 +1185,15 @@ export const DASHBOARD = {
    * Shares its title with the severity donut above it, so the subtitle is what
    * identifies this card specifically.
    *
-   * Each row is a `role="row"` carrying the case's number as "ID: CS…" — not as
-   * a bare "CS…", which is how the case detail page renders it. Clicking a row
-   * opens that case.
+   * Each row is a `role="row"` carrying the case's identifier as
+   * "ID: <number> | <WSO2 id>" — e.g. "ID: CS0441444 | AUTOMATIONTESTCUSSUB-53"
+   * — not as a bare "CS…", which is how the case detail page renders it.
+   * Clicking a row opens that case.
+   *
+   * ⚠️ The table is populated by its own request and takes appreciably longer
+   * than the 5s default assertion timeout to fill. Waiting for a row needs an
+   * explicit, generous timeout; without one the failure reads "element(s) not
+   * found", which looks like a wrong selector and is not.
    */
   casesTable: {
     subtitle: "Track and manage all active support tickets",
@@ -1221,6 +1251,10 @@ export const DASHBOARD = {
        * the match. */
       displayedRowsPattern: /(\d+)[–-](\d+) of (\d+)/,
     },
+    /** Shown in place of rows when the current view has none — notably after
+     * switching to My Cases as an account that raised no cases on this
+     * project, which is a legitimate state and not a failed filter. */
+    emptyMessage: "No outstanding cases.",
     /** Marks a data row; the header row has no case id. */
     rowIdPattern: /ID: CS\d+/,
     /** Captures the case number out of a row's text. */
@@ -1500,6 +1534,28 @@ export const CASES_LIST = {
   /** A filter offered on every cases list, whatever the query string. Used to
    * prove the panel is open, so "Created By is absent" cannot pass merely
    * because nothing is rendered. */
+  /** The Export control on the cases list (CaseListCsvExportButton).
+   *
+   * A button that opens a menu, not a direct download — so clicking "Export"
+   * alone does nothing but reveal the two formats. Its label flips to
+   * "Exporting..." while a file is being built, which is also when it is
+   * disabled.
+   *
+   * Both formats resolve to an anchor with a `download` attribute
+   * (`utils/csv.ts` and `utils/pdf.ts`), so Playwright observes them as real
+   * download events rather than navigations. */
+  export: {
+    button: "Export",
+    /** Shown while an export is in flight; the control is disabled meanwhile. */
+    busyButton: "Exporting...",
+    csvItem: "Export to CSV",
+    pdfItem: "Export to PDF",
+    /** `cases[-<project>]-YYYY-MM-DD.<ext>` — see downloadCaseListCsv. */
+    filenamePattern: (extension: string): RegExp =>
+      new RegExp(`^cases.*-\\d{4}-\\d{2}-\\d{2}\\.${extension}$`),
+    /** Shown instead of a download when the result set is empty. */
+    emptyMessagePattern: /no .*(cases|results)/i,
+  },
   severityFilterLabel: "Severity",
 } as const;
 
@@ -1509,6 +1565,30 @@ export const CASES_LIST = {
  * case offers the "Closed" action, rendered in present tense as "Close" by
  * `toPresentTenseActionLabel`. Clicking it opens a confirmation dialog rather
  * than closing outright. */
+/** The Knowledge Base tab of a case (CaseKnowledgeBaseRecommendations).
+ *
+ * Articles are recommended by the backend from the case's title, description
+ * and activity — so a case raised from a Novera conversation, which carries the
+ * question as its description, is the reliable way to get recommendations.
+ *
+ * Like Attachments and Calls, the tab label carries a live count, so it is
+ * matched by prefix and never exactly. */
+export const CASE_KNOWLEDGE_BASE = {
+  /** "Knowledge Base (3)" — matched by prefix. */
+  tab: /^Knowledge Base/,
+  /** The same label with the count captured. */
+  tabCountPattern: /^Knowledge Base \((\d+)\)/,
+  /** Shown when the backend returned no recommendations. */
+  emptyMessage: "No matching knowledge base articles were found for this case.",
+  /** The endpoint the tab calls. Asserting on it separates "the UI failed to
+   * render articles" from "the service returned none" — two very different
+   * defects that look identical on screen. */
+  recommendationsPath: "/conversations/recommendations/search",
+  /** Shown when the case carries too little text to recommend from. */
+  needsContentMessage:
+    "Add a title or description, or post activity on this case, to request",
+} as const;
+
 /** The Escalate Case action and its modal (CaseDetailsActionRow +
  * EscalateCaseModal).
  *

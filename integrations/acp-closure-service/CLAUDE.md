@@ -40,9 +40,11 @@ session, ever, so that code path would be permanently dead here.
   signal (`closureStatus`) isn't a parameter this function receives at all;
   callers must check it themselves (`sweep.suspend` does).
 - `internal/recipients` — pure customer-contact and Account-Manager-email
-  resolution. `ResolveCustomerContact` implements the three-tier fallback
-  (business-contact-role Project Contact → account-level Primary Contact →
-  signal to nudge the Account Manager instead). `AccountManagerEmail`
+  resolution. `ResolveCustomerContacts` implements the three-tier fallback
+  (business-contact-role Project Contacts → account-level Primary Contacts →
+  signal to nudge the Account Manager instead). Each tier returns **every**
+  match, not the first — see "The customer notice goes to every customer
+  contact" below. `AccountManagerEmail`
   extracts an email from an already-fetched `PersonRef`, treating "no AM
   assigned" and "AM assigned but no email" both as legitimate absence
   (`""`), not errors — many real accounts have incomplete role assignments.
@@ -128,8 +130,25 @@ Suspend itself is **not** affected by any of this: `suspend`/`suspendInvoice`
 guard on their own per-dimension field (`EndDateClosureState`/
 `InvoiceDueDateClosureState`), fetched once from `proj` — these are
 genuinely independent per-reason dimensions, so one cascade's suspend can
-never be mistaken for the other's. Only the shared, rolled-up notify gate
-needed the same-run tracking.
+never be mistaken for the other's.
+
+**`suspensionProcessState` needs the same in-memory tracking.** Each
+cascade's record write (`recordNoticeSent` / `recordInvoiceNoticeSent`)
+replaces the *whole* object, keeping the other cascade's section as it
+finds it. Both used to build from `proj.SuspensionProcessState`, the
+start-of-run snapshot, so when both fired in one run the second write put
+the first cascade's section back to its pre-run value. This was seen on
+staging (project `81953721…`, 2026-09-28, reproduced deliberately): the
+invoice cascade recorded `suspend`, then the subscription cascade's
+`IGNORED` record reset `based_on_due_invoices` to `open`. ServiceNow then
+set the project's closure states back to `Open` (evidently re-deriving
+them from this history), and the next run suspended it and emailed the
+customer again, every day. `processProject` now keeps one `history` copy
+for the run and passes it to each cascade's `act`; each record write
+builds on it and updates it after a successful PATCH.
+`TestProcessProject_BothCascadesFireSameRun_HistoryWritesDoNotClobberEachOther`
+covers both orders. As with `alreadyClosed`, don't fix this with a live
+re-fetch: the backend isn't read-after-write consistent.
 
 ## isPartner does not gate the invoice cascade on its own
 
@@ -156,6 +175,22 @@ you're tempted to reintroduce an early `isPartner` check for efficiency
 (skip fetching invoice data for obviously-disabled accounts), don't — there
 is no way to know the cascade is actually disabled without `hasPrimaryPartner`,
 which requires the same `GetAccount` call regardless.
+
+## Only Closed Won opportunities' invoices count
+
+`eligibleOpportunity` (`invoice_resolve.go`) applies legacy's full check
+from `ACPInvoiceUtils.fetchDueInvoicesByProject`: `stage` must equal
+`"50 - Closed Won"` exactly, and the text EULA field must be non-null and
+not `"Customer contract"`. A null or any other stage is ineligible, as in
+legacy's equality check.
+
+The stage half was missing until the Opportunity API started returning
+`stage` (added by Sajith; confirmed present on both `GET /opportunities/{id}`
+and `/opportunities/search`). Before that, an unpaid invoice on a
+not-yet-won opportunity (e.g. `"45 - Proposal"`) could drive invoice
+notices and suspension, which legacy never did. The shared test
+opportunity ("ACP Partner Opportunity") is Closed Won in staging, so the
+test projects' invoice cascade is unaffected.
 
 ## Invoice-side searches must paginate
 
@@ -370,14 +405,63 @@ isn't lost or re-litigated:
   design.)
 - **`DryRunProjectUpdater` intentionally logs nothing** (`dryrun.go`) — per
   explicit user direction, the only log line that should exist for a dry
-  run is `notify.LoggingNotifier`'s `"notice"` line (the actual email
-  content: subject, body, recipients). A separate `"dry-run: would update
+  run is `notify.LoggingNotifier`'s `"notice"` line (which notice would
+  go out, and to how many recipients). A separate `"dry-run: would update
   project"` line describing the raw PATCH body used to exist here and was
   removed deliberately — it's noise once every window produces a real
   notice log, and stays noise once real email sending (Sajith's team, still
   pending) replaces `LoggingNotifier` as the thing this component
   ultimately integrates with. Don't re-add logging to this type without
   confirming that direction has changed.
+- **No log line carries personal data, in any mode.** Rashmika asked on PR
+  #2134 whether emails or other PII are logged on success or failure. The
+  answer now is no:
+  - The `"notice"` line (log-only mode) logs project details, the subject,
+    and `toCount`/`ccCount`/`customerCount`. No addresses, no names (staff
+    or customer) and no body. It used to log masked addresses
+    (`maskEmail`), customer initials (`maskName`), staff names in full and
+    the whole body, which names the Account Manager; masking was an
+    earlier fix after staging logs showed full addresses, and was replaced
+    by dropping the fields entirely.
+  - `EmailNotifier` logs only recipient counts, as before.
+  - The startup line logs `standingRecipientsCount`, not the addresses.
+  - `apierror.Error()` is `upstream returned <status>` only. The upstream
+    body excerpt stays in `Error.Body` for code, but isn't in the message,
+    because the message is what `"project failed"` logs, and an upstream
+    body can echo a recipient address.
+
+  The subject and project name are still logged: they name the project and
+  the customer company, not a person. `TestLoggingNotifier_Send_LogsNoPersonalData`
+  checks every attribute of the notice line, so a new attribute can't bring
+  personal data back unnoticed. Don't add a name, address or body to any log
+  line.
+
+## The customer notice goes to every customer contact
+
+`ResolveCustomerContacts` returns all business contacts on the project, or,
+when there are none, all Primary Contacts on the account. It doesn't return
+just the first. `notify.Recipients.Customers` is a list, and
+`EmailNotifier` puts every entry in `to` on one email (internal people stay
+in `cc`). Each address appears once, compared case-insensitively; contacts
+with no email are skipped, as before.
+
+Until 2026-09-29 it stopped at the first match, so a project with several
+business contacts told only one of them, chosen by API order. The rule came
+from our own design, not legacy: legacy picks recipients inside the
+ServiceNow Flow Designer subflow `acp_send_project_suspension_email_20`
+(called from `ACPActionModules.js`), which isn't in
+`docs/legacy-servicenow-reference/`. The user confirmed from real legacy
+emails that the ServiceNow system sends to several customer addresses. Real
+accounts can also have more than one Primary Contact (the staging ACP Test
+Partner Account has two).
+
+**Both contact searches are paged.** `/projects/{id}/contacts/search` and
+`/accounts/{id}/contacts/search` return 20 rows unless a limit is sent, 50 at
+most (51 is a 400), and report `total` but no `hasMore`, all confirmed
+against staging. `fetchContacts` used to send `{}` and read only the first
+page, which mattered little while one contact was picked but would drop
+recipients now. `pageContacts` sends `pagination` and stops on an empty page
+or once `offset` reaches `total`.
 
 ## Project Name links to Salesforce (internal notices only)
 
@@ -406,14 +490,53 @@ rendered as plain bold text) until caught against the real reference.
   or `projectNameFieldRowHTML` at all — there's no shared code path that
   could accidentally leak the link onto a customer copy.
 
-**Not yet implemented**: the real reference email also has a second,
-separate "Open in Salesforce" button near the invoice-details box, linking
-to what appears to be the *invoice's own* Salesforce ID (a different ID
-prefix than the project's). Deliberately not added — `invoiceDTO`
-(`types.go`) has no sfId-equivalent field, and none is documented in
-`csm-integration-service`'s `openapi.yaml` either. Needs confirming via a
-real `SearchInvoices`/`GetInvoice` Postman response before implementing;
-don't guess a field name.
+**Project `sfId` in the broad sweep:** `/projects/search` items now carry
+an `sfId` key, but as of 2026-09-26 it is `null` for every project in
+staging, even where `GET /projects/{id}` returns a real value. So the
+Project Name link only appears in `TEST_PROJECT_ID`-scoped runs until the
+API populates it. No change is needed here when it does: `project.SfID`
+already reads the field from both endpoints.
+
+**"Invoice Id" shows the invoice number, not a record ID.** The internal
+invoice notice's "Invoice Id:" field shows the invoice's `name` (ServiceNow
+`u_name`, e.g. `US20268838`), which is what the real legacy email shows. The
+API's `id` is an internal record ID (a UUID) that nobody recognises. The
+invoice's Salesforce ID (ServiceNow `u_id`, the API's `sfId`) is used only
+for the "Open in Salesforce" link, as in the reference email. Confirmed by
+comparing a real staging invoice in ServiceNow: `u_name` = `2166`, `u_id` =
+`a0IE200000AJuOvMAL`. `invoiceNumber` (`invoice_resolve.go`) falls back to
+the record ID only when an invoice has no name. The field showed the UUID
+until 2026-09-28.
+
+**The internal invoice notice lists every due invoice.** Legacy
+`fetchDueInvoicesByProject` returns all eligible due invoices ordered by
+due date; `decideActionBasedOnDueInvoices` takes timing from the first
+(`dueInvoiceList[0]`) but passes the whole list on, and the real legacy
+email shows one box per invoice, each with its own Salesforce link
+(`local-docs/actual_invoice_email.png`). `resolveDueInvoices`
+(`invoice_resolve.go`) returns that list, earliest due first, each invoice
+once even when reached through two links to the same opportunity. The
+cascade's timing still comes from the first; `dueInvoice.Listed` carries
+all of them to `internalInvoiceNoticeBody`, which writes one Invoice Id /
+Opportunity / Due Date group per invoice. `Notice.InvoiceSfIDs` holds their
+Salesforce IDs in the same order. On the notify side, `isInvoiceBodyShape`
+recognises 12 + 3k paragraphs and `renderInternalInvoiceEmailHTML` renders
+one `invoiceBoxHTML` per group. Customer-facing invoice notices list no
+invoices, in legacy or here; they only mention the first invoice's date.
+
+**"Open in Salesforce" (invoice notices, internal only):** the real
+reference email also has a separate "Open in Salesforce" link inside the
+invoice box, pointing at the *invoice's own* Salesforce record (an `a0I…`
+ID, not the project's `a0d…`). `invoiceDTO.SfID` (`sfId`, confirmed on both
+`GET /invoices/{id}` and `/invoices/search`) flows through
+`resolvedInvoice` → `dueInvoice` → `notifyForWindow`'s `invoiceSfID`, which
+sets `Notice.InvoiceSfID` on the **internal notice only**.
+`openInSalesforceLinkHTML` renders it at the start of the invoice box's
+right half (the box is split into two equal halves, as in the reference),
+using table cells rather than the reference's `display:flex`, which email
+clients don't all support. There's no link when the invoice has no `sfId`, and
+never on customer or nudge notices. The reference's small external-link
+icon is deliberately left out, as for the Project Name link.
 
 ## suspensionProcessState's real shape
 
@@ -488,14 +611,29 @@ wrong answer:
   testing against real data shows this role is rarely configured in
   practice regardless — most real resolutions land on `primary_contact` or
   `am_nudge`, not `business_contact`.
-- **`internal/entity.Client` doesn't validate its configured URLs use
-  `https`** — the same gap `internal/emailservice.Client.NewClient` was
-  given a fix for (per CodeRabbit; see `requireHTTPS` there). Deliberately
-  not fixed here — scoped out to keep that change focused on the email code
-  it was actually about. `entity.Client` carries
-  the same category of risk (its `ClientSecret` flows through the same
-  kind of token request) and should get the equivalent check in its own
-  follow-up.
+
+## Both HTTP clients share one set of transport guards
+
+`internal/entity` and `internal/emailservice` both build their OAuth2
+client through `internal/httpsec`, and must keep doing so:
+
+- `httpsec.RequireHTTPS` makes `NewClient` refuse a non-https `TokenURL` or
+  `BaseURL`, and one with no host (a bare `https://` parses cleanly and
+  would otherwise only fail on the first request; CodeRabbit, PR #2008).
+  Loopback is exempt, since `httptest` servers bind there. The
+  token request carries the real client secret, and every API call carries
+  the bearer token and real customer data.
+- `httpsec.RefuseRedirects` goes on **both** the token client (the one in
+  `tokenCtx`, which POSTs the secret) **and** the API client (where
+  `oauth2.Transport` would re-attach the bearer token to a followed
+  redirect). Guarding only the API client leaves the secret exposed; this
+  exact mistake happened once in the email client.
+
+These checks were first added to the email client alone (CodeRabbit, PR
+#1657). The entity client went without them until they were moved into the
+shared package, which is why they live in one place now. If you add a third
+HTTP client, build it the same way. `TestTokenFetchRejectsRedirects` in each
+client package was confirmed to fail with the token-client guard removed.
 
 ## Real email sending
 
@@ -525,18 +663,27 @@ plain authenticated HTTP call.
   re-confirming that's changed.
 - **`FromAddress` is fixed at config level**, not a per-`Notice` value —
   `no-reply@wso2.com`.
-- **`EmailNotifier` maps `Recipients` onto to/cc**: when `Customer` is
-  present, the customer is the primary `to` and the three internal people
-  are `cc`'d; otherwise (internal-only notices, and the no-business-contact
+- **`EmailNotifier` maps `Recipients` onto to/cc**: when `Customers` is
+  non-empty, every customer is in `to` and the three internal people are
+  `cc`'d; otherwise (internal-only notices, and the no-business-contact
   notice) all populated internal recipients go in `to`. This is a design
   decision made in this codebase, not something Rashmika's API dictates —
   reconsider if it turns out wrong in practice.
-- **`StandingCC` (`STANDING_CC_RECIPIENTS`) cc's a fixed address list on
-  every notice**, uniformly — internal, customer-facing, and the
-  no-business-contact nudge alike, subscription and invoice cascades alike,
-  added in `Send` right after `recipientsToToCC` and before filtering. This
-  was a real gap in the initial port, caught late: every real legacy
-  reference email this project has (both internal and customer-facing) cc's
+- **`StandingRecipients` (`STANDING_CC_RECIPIENTS`) adds a fixed address
+  list to every notice**, subscription and invoice cascades alike, in
+  `Send` right after `recipientsToToCC` and before filtering. Where the
+  addresses go matches the ServiceNow system, as the user confirmed from
+  real legacy emails on 2026-09-29:
+
+  | Notice | `to` | `cc` |
+  |---|---|---|
+  | Internal, and the no-business-contact nudge | internal people + standing list | none |
+  | Customer-facing | customers + standing list | internal people + standing list |
+
+  Until then the list went in `cc` on every notice. The env var keeps its
+  original `_CC_` name because it is already in the deployment notes and
+  security documents. This was a real gap in the initial port, caught late:
+  every real legacy reference email carries
   `customer-lifecycle-notification@wso2.com` and `billing@wso2.com`, and
   this component never sent to either until this field existed. Deliberately
   env-configurable rather than a hardcoded constant like `wso2LogoURL` —
@@ -544,7 +691,7 @@ plain authenticated HTTP call.
   this empty for the same reason `EMAIL_SERVICE_ALLOW_NON_WSO2_RECIPIENTS`
   defaults false: real people/teams must not receive test traffic. Entries
   still pass through `filterRecipients` like any other recipient — this is
-  additive cc, not a bypass of the WSO2-only staging safeguard.
+  not a bypass of the WSO2-only staging safeguard.
 - **The WSO2-only staging safeguard is a hard requirement from Rashmika's
   team**, not a suggestion: "make sure emails aren't being sent in staging
   environment for any non-wso2 emails." `EMAIL_SERVICE_ALLOW_NON_WSO2_RECIPIENTS`
@@ -606,7 +753,7 @@ plain authenticated HTTP call.
   project/account) — this catches shape mismatches that a hand-written
   trivial fixture would silently paper over.
 - TDD throughout: red before green, one seam at a time. Seams under test:
-  `closure.Decide`, `recipients.ResolveCustomerContact` /
+  `closure.Decide`, `recipients.ResolveCustomerContacts` /
   `AccountManagerEmail`, `suspensionstate.LastNoticeWindow` /
   `WithSubscriptionEndDateState`, `sweep.processProject`, `sweep.Run`, the
   pure subject/body builders (`internalNoticeSubject`,

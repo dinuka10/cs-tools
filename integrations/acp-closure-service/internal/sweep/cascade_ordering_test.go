@@ -42,7 +42,7 @@ func bothCascadesReader(t *testing.T, invoiceDueDate time.Time) *mockEntityReade
 			return oppLinksResponse("p1", "opp1"), nil
 		},
 		getOpportunityFn: func(ctx context.Context, id string) ([]byte, error) {
-			return []byte(`{"id":"opp1","name":"Opp One","eulaVersion":"EULA 3.4","eulaVersionDecimal":"3.4"}`), nil
+			return []byte(`{"id":"opp1","name":"Opp One","stage":"50 - Closed Won","eulaVersion":"EULA 3.4","eulaVersionDecimal":"3.4"}`), nil
 		},
 		searchInvoicesFn: func(ctx context.Context, body []byte) ([]byte, error) {
 			return []byte(`{"invoices":[{
@@ -200,4 +200,95 @@ func wroteField(calls []updateCall, field string) bool {
 		}
 	}
 	return false
+}
+
+// TestProcessProject_BothCascadesFireSameRun_HistoryWritesDoNotClobberEachOther
+// reproduces a real staging bug (project 81953721…, 2026-09-28). Each
+// cascade saves suspensionProcessState by rewriting the whole object. Both
+// used to build that object from the snapshot fetched at the start of the
+// run, so the second cascade's save wrote back the first cascade's section
+// as it was before the run: the invoice cascade recorded "suspend", then the
+// subscription cascade's IGNORED record reset the invoice section to "open".
+// ServiceNow then reopened the project, and the next run suspended it and
+// emailed the customer again. The final saved history must carry both
+// cascades' updates, whichever order they ran in.
+func TestProcessProject_BothCascadesFireSameRun_HistoryWritesDoNotClobberEachOther(t *testing.T) {
+	now := time.Date(2026, 9, 28, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name           string
+		endDate        time.Time
+		invoiceDueDate time.Time
+		startState     string
+		wantSub        string
+		wantInvoice    string
+	}{
+		{
+			// The staging case: invoice long overdue (acts first, suspends),
+			// subscription exactly at its 30-day window (acts second, IGNORED).
+			name:           "invoice first then subscription",
+			endDate:        now.AddDate(0, 0, 30),
+			invoiceDueDate: now.AddDate(0, 0, -77),
+			startState:     `{"based_on_subscription_end_date":{"event_type":"60_days_notice"},"based_on_due_invoices":{"event_type":"open"}}`,
+			wantSub:        "30_days_notice",
+			wantInvoice:    "suspend",
+		},
+		{
+			name:           "subscription first then invoice",
+			endDate:        now.AddDate(0, 0, -100),
+			invoiceDueDate: now.AddDate(0, 0, -10),
+			startState:     `{"based_on_subscription_end_date":{"event_type":"7_days_notice"},"based_on_due_invoices":{"event_type":"open"}}`,
+			wantSub:        "suspend",
+			wantInvoice:    "suspend",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := bothCascadesReader(t, tt.invoiceDueDate)
+			updater := &mockProjectUpdater{}
+			ntf := &mockNotifier{sendFn: func(ctx context.Context, n notify.Notice) (bool, error) { return true, nil }}
+			endDate := tt.endDate
+			proj := project{
+				ID:                     "p1",
+				Name:                   "Test Project",
+				Account:                &projectAccountRef{ID: "a1"},
+				EndDate:                &endDate,
+				SuspensionProcessState: json.RawMessage(tt.startState),
+			}
+
+			if err := processProject(context.Background(), reader, updater, ntf, now, proj); err != nil {
+				t.Fatalf("processProject() error = %v, want nil", err)
+			}
+
+			var last json.RawMessage
+			writes := 0
+			for _, c := range updater.calls {
+				var body map[string]json.RawMessage
+				if err := json.Unmarshal(c.body, &body); err != nil {
+					t.Fatalf("parse update body: %v", err)
+				}
+				if s, ok := body["suspensionProcessState"]; ok {
+					last = s
+					writes++
+				}
+			}
+			if writes != 2 {
+				t.Fatalf("suspensionProcessState written %d times, want 2 (one per cascade)", writes)
+			}
+			var state struct {
+				Sub struct {
+					EventType string `json:"event_type"`
+				} `json:"based_on_subscription_end_date"`
+				Inv struct {
+					EventType string `json:"event_type"`
+				} `json:"based_on_due_invoices"`
+			}
+			if err := json.Unmarshal(last, &state); err != nil {
+				t.Fatalf("parse final suspensionProcessState: %v", err)
+			}
+			if state.Sub.EventType != tt.wantSub || state.Inv.EventType != tt.wantInvoice {
+				t.Errorf("final saved history: subscription=%q invoice=%q, want subscription=%q invoice=%q\n(the second cascade's save must build on the first's, not the start-of-run snapshot)\nfinal: %s",
+					state.Sub.EventType, state.Inv.EventType, tt.wantSub, tt.wantInvoice, last)
+			}
+		})
+	}
 }

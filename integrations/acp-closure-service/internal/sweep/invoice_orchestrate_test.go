@@ -19,6 +19,7 @@ package sweep
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,7 +38,7 @@ func invoiceLinkedReader(t *testing.T, now time.Time) *mockEntityReader {
 			return oppLinksResponse("p1", "opp1"), nil
 		},
 		getOpportunityFn: func(ctx context.Context, id string) ([]byte, error) {
-			return []byte(`{"id":"opp1","name":"Opp One","eulaVersion":"EULA 3.4","eulaVersionDecimal":"3.4"}`), nil
+			return []byte(`{"id":"opp1","name":"Opp One","stage":"50 - Closed Won","eulaVersion":"EULA 3.4","eulaVersionDecimal":"3.4"}`), nil
 		},
 		searchInvoicesFn: func(ctx context.Context, body []byte) ([]byte, error) {
 			return []byte(`{"invoices":[{
@@ -259,7 +260,7 @@ func TestProcessProject_InvoiceCascade_HasPrimaryPartnerForcesGracePeriod(t *tes
 			return oppLinksResponse("p1", "opp1"), nil
 		},
 		getOpportunityFn: func(ctx context.Context, id string) ([]byte, error) {
-			return []byte(`{"id":"opp1","name":"Opp One","eulaVersion":"EULA 3.4","eulaVersionDecimal":"3.4"}`), nil
+			return []byte(`{"id":"opp1","name":"Opp One","stage":"50 - Closed Won","eulaVersion":"EULA 3.4","eulaVersionDecimal":"3.4"}`), nil
 		},
 		searchInvoicesFn: func(ctx context.Context, body []byte) ([]byte, error) {
 			return []byte(`{"invoices":[{
@@ -287,5 +288,133 @@ func TestProcessProject_InvoiceCascade_HasPrimaryPartnerForcesGracePeriod(t *tes
 		if _, ok := body["invoiceDueDateClosureState"]; ok {
 			t.Error("invoiceDueDateClosureState should not be written yet — day 60 from the invoice date hasn't arrived, hasPrimaryPartner should still protect this project despite the raw due date having passed")
 		}
+	}
+}
+
+// TestProcessProject_InvoiceCascade_PassesInvoiceSfIDToInternalNoticeOnly
+// covers the plumbing for the internal notice's "Open in Salesforce" link:
+// the invoice's sfId from the API must reach the internal invoice notice,
+// and no other notice (customer-facing or no-business-contact nudge) sent
+// for the same window.
+func TestProcessProject_InvoiceCascade_PassesInvoiceSfIDToInternalNoticeOnly(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	reader := invoiceLinkedReader(t, now)
+	dueDate := now.Format("2006-01-02")
+	reader.searchInvoicesFn = func(ctx context.Context, body []byte) ([]byte, error) {
+		return []byte(`{"invoices":[{
+			"id":"inv1","invoiceDate":"2026-01-01","invoicedDueDate":"` + dueDate + `",
+			"opportunity":{"id":"opp1","name":"Opp One"},"sfId":"a0IE2000006XBu5MAG"
+		}]}`), nil
+	}
+	ntf := &mockNotifier{sendFn: func(ctx context.Context, n notify.Notice) (bool, error) { return true, nil }}
+	proj := project{ID: "p1", Name: "Test Project", Account: &projectAccountRef{ID: "a1"}}
+
+	if err := processProject(context.Background(), reader, &mockProjectUpdater{}, ntf, now, proj); err != nil {
+		t.Fatalf("processProject() error = %v, want nil", err)
+	}
+
+	sawInternal := false
+	for _, n := range ntf.sent {
+		if n.Subject == "[ACP] Project Suspension Notice of Test Project" {
+			sawInternal = true
+			if strings.Join(n.InvoiceSfIDs, ",") != "a0IE2000006XBu5MAG" {
+				t.Errorf("internal notice InvoiceSfIDs = %v, want [a0IE2000006XBu5MAG]", n.InvoiceSfIDs)
+			}
+			continue
+		}
+		if len(n.InvoiceSfIDs) != 0 {
+			t.Errorf("notice %q has InvoiceSfIDs = %v, want none (internal notice only)", n.Subject, n.InvoiceSfIDs)
+		}
+	}
+	if !sawInternal {
+		t.Fatalf("no internal invoice notice sent; got %+v", ntf.sent)
+	}
+}
+
+// TestProcessProject_InvoiceNoticeShowsInvoiceNumber covers the internal
+// invoice notice's "Invoice Id:" field. Legacy shows the invoice number
+// (ServiceNow u_name, the API's "name", e.g. US20268838); the Salesforce ID is
+// only used for the "Open in Salesforce" link, and the API's "id" is an
+// internal record ID no reader recognises. Falls back to that internal ID
+// only when an invoice has no name, so the field is never blank.
+func TestProcessProject_InvoiceNoticeShowsInvoiceNumber(t *testing.T) {
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	dueDate := now.Format("2006-01-02")
+	tests := []struct {
+		name        string
+		invoiceJSON string
+		want        string
+	}{
+		{
+			name:        "shows the invoice name",
+			invoiceJSON: `{"id":"bab87559-1bc7-6650-182c-0dc5604bcb5d","name":"US20268838","invoiceDate":"2026-01-01","invoicedDueDate":"` + dueDate + `","opportunity":{"id":"opp1","name":"Opp One"}}`,
+			want:        "Invoice Id: US20268838",
+		},
+		{
+			name:        "falls back to the record ID without a name",
+			invoiceJSON: `{"id":"bab87559-1bc7-6650-182c-0dc5604bcb5d","invoiceDate":"2026-01-01","invoicedDueDate":"` + dueDate + `","opportunity":{"id":"opp1","name":"Opp One"}}`,
+			want:        "Invoice Id: bab87559-1bc7-6650-182c-0dc5604bcb5d",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := invoiceLinkedReader(t, now)
+			reader.searchInvoicesFn = func(ctx context.Context, body []byte) ([]byte, error) {
+				return []byte(`{"invoices":[` + tt.invoiceJSON + `]}`), nil
+			}
+			ntf := &mockNotifier{sendFn: func(ctx context.Context, n notify.Notice) (bool, error) { return true, nil }}
+			proj := project{ID: "p1", Name: "Test Project", Account: &projectAccountRef{ID: "a1"}}
+
+			if err := processProject(context.Background(), reader, &mockProjectUpdater{}, ntf, now, proj); err != nil {
+				t.Fatalf("processProject() error = %v, want nil", err)
+			}
+			for _, n := range ntf.sent {
+				if n.Subject == "[ACP] Project Suspension Notice of Test Project" {
+					if !strings.Contains(n.Body, tt.want) {
+						t.Errorf("internal invoice notice body missing %q\nbody: %s", tt.want, n.Body)
+					}
+					return
+				}
+			}
+			t.Fatalf("no internal invoice notice sent; got %+v", ntf.sent)
+		})
+	}
+}
+
+// TestProcessProject_InternalInvoiceNoticeListsEveryDueInvoice covers legacy's
+// internal invoice email, which lists every due invoice for the project (each
+// in its own box with its own Salesforce link), while timing is still
+// decided by the earliest-due one and the customer-facing notice lists none.
+func TestProcessProject_InternalInvoiceNoticeListsEveryDueInvoice(t *testing.T) {
+	now := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC) // the earlier invoice's due date: day 0
+	reader := twoInvoiceReader()
+	reader.getAccountFn = func(ctx context.Context, id string) ([]byte, error) {
+		return []byte(`{"hasPrimaryPartner":false}`), nil
+	}
+	ntf := &mockNotifier{sendFn: func(ctx context.Context, n notify.Notice) (bool, error) { return true, nil }}
+	proj := project{ID: "p1", Name: "Test Project", Account: &projectAccountRef{ID: "a1"}}
+
+	if err := processProject(context.Background(), reader, &mockProjectUpdater{}, ntf, now, proj); err != nil {
+		t.Fatalf("processProject() error = %v, want nil", err)
+	}
+
+	var internal *notify.Notice
+	for i := range ntf.sent {
+		if ntf.sent[i].Subject == "[ACP] Project Suspension Notice of Test Project" {
+			internal = &ntf.sent[i]
+		} else if strings.Contains(ntf.sent[i].Body, "Invoice Id:") {
+			t.Errorf("notice %q lists invoices; only the internal notice should", ntf.sent[i].Subject)
+		}
+	}
+	if internal == nil {
+		t.Fatalf("no internal invoice suspension notice sent; got %+v", ntf.sent)
+	}
+	earlier := strings.Index(internal.Body, "Invoice Id: US-EARLIER")
+	later := strings.Index(internal.Body, "Invoice Id: US-LATER")
+	if earlier < 0 || later < 0 || earlier > later {
+		t.Errorf("internal body should list both invoices, earliest due first\nbody: %s", internal.Body)
+	}
+	if strings.Join(internal.InvoiceSfIDs, ",") != "a0I-earlier,a0I-later" {
+		t.Errorf("InvoiceSfIDs = %v, want [a0I-earlier a0I-later] (one per listed invoice, same order)", internal.InvoiceSfIDs)
 	}
 }

@@ -35,14 +35,22 @@ import (
 // always populated for a day-count reminder — an individual Contact's Email
 // may legitimately be "" per recipients.AccountManagerEmail's existing
 // convention (role assigned but no email on file, or no role assigned at
-// all), which is not an error state. Customer is nil except on a resolved
-// 15/7/0-window notice; it is also nil (not a zero-value Contact) on the
-// separate no-business-contact notice, which names only an Account Owner.
+// all), which is not an error state. Customers is empty except on a resolved
+// 15/7/0-window notice, where it holds every resolved customer contact
+// (see recipients.ResolveCustomerContacts); it is also empty on the separate
+// no-business-contact notice.
 type Recipients struct {
 	AccountOwner   recipients.Contact
 	RenewalManager recipients.Contact
 	TechnicalOwner recipients.Contact
-	Customer       *recipients.Contact
+	Customers      []recipients.Contact
+}
+
+// IsCustomerFacing reports whether r is for a customer-facing notice: one
+// with at least one customer contact. Internal notices and the
+// no-business-contact nudge have none.
+func (r Recipients) IsCustomerFacing() bool {
+	return len(r.Customers) > 0
 }
 
 // Notice is everything a Notifier needs to send (or, today, log) one ACP
@@ -63,9 +71,17 @@ type Notice struct {
 	// don't get this link at all (confirmed absent from the real
 	// customer-facing reference email).
 	ProjectSfID string
-	StartDate   time.Time
-	EndDate     time.Time
-	Window      closure.NoticeWindow
+	// InvoiceSfIDs are the listed invoices' own Salesforce record IDs (a0I...
+	// IDs, distinct from ProjectSfID), one per invoice box in Body and in
+	// the same order, set only on the internal invoice notice. EmailNotifier
+	// renders each as that box's "Open in Salesforce" link, matching the real
+	// reference email. An empty entry, or a missing one, means no link for
+	// that box — and customer-facing notices never carry any (customers have
+	// no Salesforce access).
+	InvoiceSfIDs []string
+	StartDate    time.Time
+	EndDate      time.Time
+	Window       closure.NoticeWindow
 	// Subject is the notice's title line — one of five templates depending
 	// on notice type and window (see sweep.go's internalNoticeSubject/
 	// customerNoticeSubject for the exact wording): the internal day-count
@@ -83,7 +99,7 @@ type Notice struct {
 	Body       string
 	Recipients Recipients
 	// ResolvedVia records which tier of the three-tier customer-contact
-	// fallback was attempted (see recipients.ResolveCustomerContact). Left
+	// fallback was attempted (see recipients.ResolveCustomerContacts). Left
 	// at its zero value ("") only when the fallback was never attempted at
 	// all — an internal-only 90/60/30 notice. It IS set on the
 	// no-business-contact notice too, to recipients.ResolvedViaNone — the
@@ -93,7 +109,12 @@ type Notice struct {
 	ResolvedVia recipients.ResolvedVia
 }
 
-// LoggingNotifier logs what would have been sent instead of sending it.
+// LoggingNotifier logs that a notice would have been sent instead of
+// sending it. The log names the project and says how many recipients the
+// notice has, never who they are: no email address, no name (staff or
+// customer) and no body, masked or not, since logs must hold no personal
+// data in any mode (Rashmika's review of PR #2134). The subject stays: it
+// names only the project and the customer company.
 type LoggingNotifier struct {
 	Logger *slog.Logger
 }
@@ -102,7 +123,8 @@ type LoggingNotifier struct {
 // — it only logs what would have been sent, it never actually delivers a
 // notice to anyone.
 func (n *LoggingNotifier) Send(ctx context.Context, notice Notice) (bool, error) {
-	attrs := []any{
+	to, cc := recipientsToToCC(notice.Recipients)
+	n.Logger.InfoContext(ctx, "notice",
 		"subject", notice.Subject,
 		"window", notice.Window,
 		"projectID", notice.ProjectID,
@@ -110,21 +132,10 @@ func (n *LoggingNotifier) Send(ctx context.Context, notice Notice) (bool, error)
 		"projectKey", notice.ProjectKey,
 		"startDate", notice.StartDate,
 		"endDate", notice.EndDate,
-		"accountOwner", notice.Recipients.AccountOwner.Email,
-		"accountOwnerName", notice.Recipients.AccountOwner.Name,
-		"renewalManager", notice.Recipients.RenewalManager.Email,
-		"renewalManagerName", notice.Recipients.RenewalManager.Name,
-		"technicalOwner", notice.Recipients.TechnicalOwner.Email,
-		"technicalOwnerName", notice.Recipients.TechnicalOwner.Name,
+		"toCount", len(to),
+		"ccCount", len(cc),
+		"customerCount", len(notice.Recipients.Customers),
 		"resolvedVia", notice.ResolvedVia,
-	}
-	if notice.Recipients.Customer != nil {
-		attrs = append(attrs, "customer", notice.Recipients.Customer.Email, "customerName", notice.Recipients.Customer.Name)
-	}
-	if notice.Body != "" {
-		attrs = append(attrs, "body", notice.Body)
-	}
-
-	n.Logger.InfoContext(ctx, "notice", attrs...)
+	)
 	return false, nil
 }

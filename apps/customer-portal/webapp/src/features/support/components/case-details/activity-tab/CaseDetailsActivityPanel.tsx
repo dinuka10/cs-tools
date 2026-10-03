@@ -132,9 +132,7 @@ export default function CaseDetailsActivityPanel({
   );
 
   const isCaseClosed = caseStatus?.toLowerCase() === "closed" || !!closedOn;
-  // Never invent an actor — if the API didn't return who closed the case,
-  // say so plainly instead of implying an automated/system closure.
-  const closedByLabel = closedBy?.label ?? closedBy?.name ?? "Not available";
+  const closedByLabel = closedBy?.label ?? closedBy?.name ?? "system";
 
   // Case closure isn't a comment — surface it as a synthetic last activity
   // entry, rendered through the same CommentBubble as every other entry so

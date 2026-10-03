@@ -345,12 +345,16 @@ type SearchSNUsersResponse struct {
 
 // GetUserMeResponse is the response for GET /users/me from the ServiceNow data source.
 type GetUserMeResponse struct {
-	ID        string   `json:"id"`
-	Email     string   `json:"email"`
-	FirstName *string  `json:"firstName,omitempty"`
-	LastName  string   `json:"lastName"`
-	TimeZone  *string  `json:"timeZone,omitempty"`
-	Roles     []string `json:"roles"`
+	ID        string  `json:"id"`
+	Email     string  `json:"email"`
+	FirstName *string `json:"firstName,omitempty"`
+	LastName  string  `json:"lastName"`
+	TimeZone  *string `json:"timeZone,omitempty"`
+	// UserType distinguishes staff from customer/partner contacts, matching SNUser's own
+	// field. Exposed for the same reason it is on SNUser -- a caller may need to tell them
+	// apart -- and also drives whether Groups below is populated.
+	UserType UserType `json:"userType,omitempty"`
+	Roles    []string `json:"roles"`
 	// Groups is every group the caller belongs to, which is what a caller
 	// holding the team registry needs to resolve their team. Empty when the
 	// membership lookup failed — it is best-effort and never fails the

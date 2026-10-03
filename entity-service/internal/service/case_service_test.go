@@ -2515,6 +2515,53 @@ func TestCaseService_CreateCase_DoesNotPublishWhenPostgresFails(t *testing.T) {
 	}
 }
 
+// TestCaseService_CreateCase_PlainPostgresPublishesCaseCreated is the
+// regression guard for a real gap: with no ServiceNow mirror configured at
+// all (s.snMirror == nil -- NewCaseService, not NewCaseServiceWithSNWriteback),
+// CreateCase's plain path used to return straight after s.repo.CreateCase
+// succeeded, with no call to publishCaseCreatedEvent at all -- case.created
+// was only ever published from createCaseSNFirst, the SN-mirror-only path.
+// So a case created with no mirror configured never published
+// case.created, regardless of how Event Hub was configured.
+func TestCaseService_CreateCase_PlainPostgresPublishesCaseCreated(t *testing.T) {
+	const caseID = "66666666-6666-6666-6666-666666666666"
+	repo := &stubCaseRepo{
+		createCase: func(_ context.Context, req domain.CreateCaseRequest) (domain.Case, error) {
+			respState := domain.CaseStateOpen
+			return domain.Case{ID: caseID, Number: "CS0023004", InternalID: "WSO2-CS-4", CreatedBy: req.CreatedBy, State: &respState}, nil
+		},
+		getCaseByID: func(context.Context, string, repository.SearchScope) (domain.CaseView, error) {
+			severity := domain.CaseSeverityHigh
+			return domain.CaseView{
+				ID: caseID, Number: "CS0023004", InternalID: "WSO2-CS-4", Subject: "s", Description: "d",
+				CreatedOn:      time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC),
+				ProjectDetails: &domain.EntityRef{ID: "proj-1", Name: "Project One"},
+				WatchList:      []domain.WatchListUser{{Email: "watcher@example.com"}},
+				Severity:       &severity,
+			}, nil
+		},
+	}
+	userRepo := stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) {
+			return domain.User{ID: "user-1", Email: "jane.doe@example.com"}, nil
+		},
+	}
+	publisher := &mockEventPublisher{}
+	svc := NewCaseService(repo, userRepo, publisher, alwaysUnrestrictedAccess{}, nil)
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	if _, err := svc.CreateCase(ctx, validCreateCaseRequest()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(publisher.calls) != 1 {
+		t.Fatalf("expected exactly 1 publish call on the plain Postgres path, got %d", len(publisher.calls))
+	}
+	if publisher.calls[0].eventType != events.TypeCaseCreated || publisher.calls[0].entityID != caseID {
+		t.Errorf("unexpected publish call: %+v", publisher.calls[0])
+	}
+}
+
 // TestCaseService_CreateCase_AnnouncementTypeReachesServiceNowMirror is the
 // regression guard for a real bug: CreateCase used to reject req.Type !=
 // "case" unconditionally, before ever checking whether an SN mirror was even

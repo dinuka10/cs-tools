@@ -45,7 +45,11 @@ import (
 // urgency order" shape matters, not just single-reason correctness.
 type cascadeDecision struct {
 	decision closure.Decision
-	act      func(ctx context.Context, alreadyClosed bool) error
+	// act carries out the cascade. history is the run's current
+	// suspensionProcessState: the cascade's own record write builds on it
+	// and updates it, so a later cascade in the same run never writes back a
+	// stale copy of an earlier one's section (see processProject).
+	act func(ctx context.Context, alreadyClosed bool, history *json.RawMessage) error
 }
 
 // processProject evaluates every closure reason this team handles —
@@ -75,6 +79,16 @@ type cascadeDecision struct {
 // Tracking the fact in memory — something this process already knows with
 // certainty, since decision.ShouldSuspend is computed locally, not read
 // back from the API — sidesteps that entirely.
+//
+// suspensionProcessState is tracked the same way, for the same reason. Each
+// cascade's record write replaces the whole object, so each must build on
+// the previous cascade's write, not on the snapshot fetched at the start of
+// the run. Building both from the snapshot let the second write reset the
+// first cascade's section: a real staging run recorded an invoice "suspend"
+// and then the subscription cascade's IGNORED record wrote the invoice
+// section back to "open", after which ServiceNow reopened the project and
+// the next run suspended and emailed it again. history is that in-memory
+// copy, updated after every successful record write.
 //
 // A failure *acting* on one cascade (in the execution loop below) returns
 // immediately without attempting the next — matching how a failure partway
@@ -123,8 +137,9 @@ func processProject(ctx context.Context, reader entityReader, updater projectUpd
 	})
 
 	alreadyClosed := proj.ClosureState != nil && *proj.ClosureState != "Open"
+	history := proj.SuspensionProcessState
 	for _, c := range cascades {
-		if err := c.act(ctx, alreadyClosed); err != nil {
+		if err := c.act(ctx, alreadyClosed, &history); err != nil {
 			return err
 		}
 		if c.decision.ShouldSuspend {
@@ -156,8 +171,8 @@ func buildSubscriptionCascade(reader entityReader, updater projectUpdater, ntf n
 
 	return &cascadeDecision{
 		decision: decision,
-		act: func(ctx context.Context, alreadyClosed bool) error {
-			return actSubscription(ctx, reader, updater, ntf, proj, decision, alreadyClosed)
+		act: func(ctx context.Context, alreadyClosed bool, history *json.RawMessage) error {
+			return actSubscription(ctx, reader, updater, ntf, proj, decision, alreadyClosed, history)
 		},
 	}, nil
 }
@@ -170,17 +185,17 @@ func buildSubscriptionCascade(reader entityReader, updater projectUpdater, ntf n
 // from notify returns immediately — this ordering, not a separate flag, is
 // what guarantees suspend never proceeds after a failed notify (the day-0
 // "email first, stop on failure" contract).
-func actSubscription(ctx context.Context, reader entityReader, updater projectUpdater, ntf notifier, proj project, decision closure.Decision, alreadyClosed bool) error {
+func actSubscription(ctx context.Context, reader entityReader, updater projectUpdater, ntf notifier, proj project, decision closure.Decision, alreadyClosed bool, history *json.RawMessage) error {
 	if decision.ShouldNotify {
 		delivered := false
 		var err error
 		if !alreadyClosed {
-			delivered, err = notifyForWindow(ctx, reader, ntf, proj, decision.Window, internalNoticeBody, customerNoticeSubject, customerNoticeBody)
+			delivered, err = notifyForWindow(ctx, reader, ntf, proj, decision.Window, nil, internalNoticeBody, customerNoticeSubject, customerNoticeBody)
 			if err != nil {
 				return fmt.Errorf("sweep: notify project %s: %w", proj.ID, err)
 			}
 		}
-		if err := recordNoticeSent(ctx, updater, proj, decision.Window, delivered); err != nil {
+		if err := recordNoticeSent(ctx, updater, proj.ID, history, decision.Window, delivered); err != nil {
 			return fmt.Errorf("sweep: record notice for project %s: %w", proj.ID, err)
 		}
 	}
@@ -402,7 +417,7 @@ func accountName(proj project) string {
 // their recipient list.
 //
 // For a customer-audience window, contact resolution (fetchContacts +
-// ResolveCustomerContact) happens BEFORE the internal notice sends, not
+// ResolveCustomerContacts) happens BEFORE the internal notice sends, not
 // after — deliberately. A transient fetchContacts failure must leave zero
 // notices sent, not an internal notice sent with no corresponding
 // suspensionProcessState record: the caller (processProject) skips
@@ -433,6 +448,7 @@ type customerBodyBuilder func(window closure.NoticeWindow, proj project) string
 
 func notifyForWindow(
 	ctx context.Context, reader entityReader, ntf notifier, proj project, window closure.NoticeWindow,
+	invoiceSfIDs []string,
 	buildInternalBody internalBodyBuilder,
 	buildCustomerSubject customerSubjectBuilder,
 	buildCustomerBody customerBodyBuilder,
@@ -452,6 +468,9 @@ func notifyForWindow(
 	internalNotice.Subject = internalNoticeSubject(window, proj.Name, accountName(proj))
 	internalNotice.Body = buildInternalBody(window, proj, contacts.AccountOwner.Name)
 	internalNotice.Recipients = internalRecipients
+	// Only the internal notice links to the invoices' Salesforce records;
+	// customer and nudge notices never carry them.
+	internalNotice.InvoiceSfIDs = invoiceSfIDs
 
 	if !needsCustomerAudience(window) {
 		delivered, err := ntf.Send(ctx, internalNotice)
@@ -465,7 +484,7 @@ func notifyForWindow(
 	if err != nil {
 		return false, err
 	}
-	resolution := recipients.ResolveCustomerContact(projectContacts, accountContactsList)
+	resolution := recipients.ResolveCustomerContacts(projectContacts, accountContactsList)
 
 	internalDelivered, err := ntf.Send(ctx, internalNotice)
 	if err != nil {
@@ -477,7 +496,7 @@ func notifyForWindow(
 		customerNotice.Subject = buildCustomerSubject(window, proj.Name)
 		customerNotice.Body = buildCustomerBody(window, proj)
 		customerNotice.Recipients = internalRecipients
-		customerNotice.Recipients.Customer = resolution.CustomerContact
+		customerNotice.Recipients.Customers = resolution.CustomerContacts
 		customerNotice.ResolvedVia = resolution.ResolvedVia
 		customerDelivered, err := ntf.Send(ctx, customerNotice)
 		if err != nil {
@@ -561,39 +580,75 @@ func contactFromPersonRef(p *personRefDTO) recipients.Contact {
 	return recipients.Contact{Name: p.Name, Email: recipients.AccountManagerEmail(&ref)}
 }
 
+// fetchContacts reads every page of the project's contacts and the
+// account's contacts. Both searches return one page at a time (20 rows
+// unless a limit is sent, 50 at most, confirmed against staging) and report
+// total but no hasMore, so each is paged until a page comes back empty or
+// offset reaches total. Without this, a contact past the first page would
+// never get the customer notice.
 func fetchContacts(ctx context.Context, reader entityReader, proj project) ([]recipients.ProjectContact, []recipients.AccountContact, error) {
-	pcRaw, err := reader.SearchProjectContacts(ctx, proj.ID, []byte(`{}`))
+	var projectContacts []recipients.ProjectContact
+	err := pageContacts(func(body []byte) (int, int, error) {
+		raw, err := reader.SearchProjectContacts(ctx, proj.ID, body)
+		if err != nil {
+			return 0, 0, fmt.Errorf("search project contacts: %w", err)
+		}
+		var page projectContactSearchResponse
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return 0, 0, fmt.Errorf("parse project contacts: %w", err)
+		}
+		for _, c := range page.Contacts {
+			projectContacts = append(projectContacts, recipients.ProjectContact{Name: c.Name, Email: c.Email, Roles: c.Roles})
+		}
+		return len(page.Contacts), page.Total, nil
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("search project contacts: %w", err)
-	}
-	var pcResp projectContactSearchResponse
-	if err := json.Unmarshal(pcRaw, &pcResp); err != nil {
-		return nil, nil, fmt.Errorf("parse project contacts: %w", err)
-	}
-
-	projectContacts := make([]recipients.ProjectContact, len(pcResp.Contacts))
-	for i, c := range pcResp.Contacts {
-		projectContacts[i] = recipients.ProjectContact{Name: c.Name, Email: c.Email, Roles: c.Roles}
+		return nil, nil, err
 	}
 
 	if proj.accountID() == "" {
 		return projectContacts, nil, nil
 	}
 
-	acRaw, err := reader.SearchAccountContacts(ctx, proj.accountID(), []byte(`{}`))
+	var accountContacts []recipients.AccountContact
+	err = pageContacts(func(body []byte) (int, int, error) {
+		raw, err := reader.SearchAccountContacts(ctx, proj.accountID(), body)
+		if err != nil {
+			return 0, 0, fmt.Errorf("search account contacts: %w", err)
+		}
+		var page accountContactSearchResponse
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return 0, 0, fmt.Errorf("parse account contacts: %w", err)
+		}
+		for _, c := range page.Contacts {
+			accountContacts = append(accountContacts, recipients.AccountContact{Name: c.Name, Email: c.Email, IsPrimary: c.IsPrimary})
+		}
+		return len(page.Contacts), page.Total, nil
+	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("search account contacts: %w", err)
-	}
-	var acResp accountContactSearchResponse
-	if err := json.Unmarshal(acRaw, &acResp); err != nil {
-		return nil, nil, fmt.Errorf("parse account contacts: %w", err)
-	}
-
-	accountContacts := make([]recipients.AccountContact, len(acResp.Contacts))
-	for i, c := range acResp.Contacts {
-		accountContacts[i] = recipients.AccountContact{Name: c.Name, Email: c.Email, IsPrimary: c.IsPrimary}
+		return nil, nil, err
 	}
 	return projectContacts, accountContacts, nil
+}
+
+// pageContacts calls fetch once per page, passing the request body for that
+// page. fetch returns how many rows the page held and the reported total.
+func pageContacts(fetch func(body []byte) (rows, total int, err error)) error {
+	offset := 0
+	for {
+		body, err := json.Marshal(searchContactsRequest{Pagination: pagination{Limit: pageSize, Offset: offset}})
+		if err != nil {
+			return fmt.Errorf("build contacts search request: %w", err)
+		}
+		rows, total, err := fetch(body)
+		if err != nil {
+			return err
+		}
+		offset += rows
+		if rows == 0 || offset >= total {
+			return nil
+		}
+	}
 }
 
 // recordNoticeSent writes the new window into suspensionProcessState's
@@ -601,13 +656,15 @@ func fetchContacts(ctx context.Context, reader entityReader, proj project) ([]re
 // actionSendEmailNotification records "SUCCESSFUL" only when delivered is
 // true (the notifier in use actually sends real notices); otherwise it
 // records "IGNORED" — the notice was logged, not sent, and the state must
-// not claim a delivery that never happened.
-func recordNoticeSent(ctx context.Context, updater projectUpdater, proj project, window closure.NoticeWindow, delivered bool) error {
+// not claim a delivery that never happened. It builds on, and after a
+// successful write updates, history: the run's current suspensionProcessState
+// (see processProject), never the start-of-run snapshot.
+func recordNoticeSent(ctx context.Context, updater projectUpdater, projectID string, history *json.RawMessage, window closure.NoticeWindow, delivered bool) error {
 	action := "IGNORED"
 	if delivered {
 		action = "SUCCESSFUL"
 	}
-	newState, err := suspensionstate.WithSubscriptionEndDateState(proj.SuspensionProcessState, window, map[string]string{
+	newState, err := suspensionstate.WithSubscriptionEndDateState(*history, window, map[string]string{
 		"actionSendEmailNotification": action,
 	})
 	if err != nil {
@@ -619,8 +676,11 @@ func recordNoticeSent(ctx context.Context, updater projectUpdater, proj project,
 		return fmt.Errorf("marshal update request: %w", err)
 	}
 
-	_, err = updater.UpdateProject(ctx, proj.ID, body)
-	return err
+	if _, err := updater.UpdateProject(ctx, projectID, body); err != nil {
+		return err
+	}
+	*history = newState
+	return nil
 }
 
 // suspend writes endDateClosureState=Suspended, unless this dimension has
