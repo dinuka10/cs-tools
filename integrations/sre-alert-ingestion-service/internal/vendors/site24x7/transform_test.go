@@ -26,7 +26,7 @@ func samplePayload(overrides map[string]any) []byte {
 		"STATUS":      "DOWN",
 		"MONITORNAME": "Global-Error-Threshold (Site24x7)",
 		"MONITOR_ID":  "mon-987",
-		"TAGS":        []string{"svc:client-medlineprod-alert-integration", "cat:service_interruption", "env:production"},
+		"TAGS":        []string{"svc:client-example-alert-integration", "cat:service_interruption", "env:production"},
 	}
 	for k, v := range overrides {
 		fields[k] = v
@@ -89,8 +89,8 @@ func TestTransform_TagExtractionWithConfiguredPrefixes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
 	}
-	if a.Service != "client-medlineprod-alert-integration" {
-		t.Errorf("Service = %q, want client-medlineprod-alert-integration", a.Service)
+	if a.Service != "client-example-alert-integration" {
+		t.Errorf("Service = %q, want client-example-alert-integration", a.Service)
 	}
 	if a.Category != "service_interruption" {
 		t.Errorf("Category = %q, want service_interruption", a.Category)

@@ -132,6 +132,15 @@ type ChangeRequestRepository interface {
 	// identified by id, using actorEmail as work_item.updated_by. Returns a
 	// NotFoundError if id does not exist.
 	PatchChangeRequest(ctx context.Context, id string, req domain.PatchChangeRequestRequest, actorEmail string) (domain.ChangeRequest, error)
+	// CreateChangeRequest inserts a new change request row (both work_item
+	// and change_request) for the plain-Postgres data source (no ServiceNow
+	// at all) -- createChangeRequestPortalQuery's own doc comment has the
+	// full field-by-field reasoning, which mirrors CreateChangeRequestFromServiceNow's
+	// exactly except identity (id/number) is generated here via
+	// gen_random_uuid()/next_portal_work_item_number() instead of being
+	// supplied by a prior ServiceNow response, and createdBy is the calling
+	// user's own resolved email rather than ServiceNow's echoed value.
+	CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error)
 	// CreateChangeRequestFromServiceNow inserts a new change request row
 	// (both work_item and change_request), for
 	// DATA_SOURCE=postgres-servicenow-dual-write's SN-first change request
@@ -1323,6 +1332,114 @@ func patchChangeRequestTx(ctx context.Context, tx pgx.Tx, id string, req domain.
 	}
 
 	return wiID, nil
+}
+
+// createChangeRequestPortalQuery is CreateChangeRequest's (the plain-Postgres,
+// caller-initiated path) query -- structurally identical to
+// createChangeRequestFromServiceNowQuery except id/number are generated here
+// (gen_random_uuid()/next_portal_work_item_number(), migration 0140) instead
+// of supplied by a prior ServiceNow response, and there is no wso2_id column
+// at all either way (change_request is excluded from
+// work_item_wso2_id_required_by_type, per this file's own package doc
+// comment on CreateChangeRequestFromServiceNow). state is hardcoded to NEW
+// for the identical reason given there: it is the one value the org's
+// Change Management process always assigns on creation, not a guess.
+//
+// Column/output order matches the trailing SELECT exactly.
+const createChangeRequestPortalQuery = `
+	WITH inserted_work_item AS (
+		INSERT INTO work_item (
+			id, created_on, updated_on, created_by, updated_by,
+			number, subject, description, type, assigned_to_id
+		)
+		VALUES (
+			gen_random_uuid(), NOW(), NOW(), $1, $1,
+			next_portal_work_item_number(), $2, $3, 'CHANGE_REQUEST'::work_item_type_enum, $4::uuid
+		)
+		RETURNING id, number, subject, created_on, updated_on, created_by
+	),
+	inserted_change_request AS (
+		INSERT INTO change_request (
+			id, state, service_id, service_offering_id, impact, risk, priority, change_model,
+			justification, implementation_plan, risk_impact_analysis, backout_plan, test_plan,
+			start_on, end_on, requested_by_user_id, customer_group_id,
+			is_planning_visible_to_customers, affected_services, affected_component, rollback_duration
+		)
+		SELECT id, 'NEW'::change_request_state_enum, $5::uuid, $6::uuid, $7::change_request_impact_enum, $8::change_request_risk_enum,
+		       $9::change_request_priority_enum, $10::change_request_change_model_enum,
+		       $11, $12, $13, $14, $15,
+		       $16::text::timestamptz, $17::text::timestamptz, $18::uuid, $19::uuid,
+		       $20, $21, $22, $23
+		FROM inserted_work_item
+		RETURNING id
+	)
+	SELECT iwi.id, iwi.number, iwi.subject, iwi.created_on, iwi.updated_on, iwi.created_by
+	FROM inserted_work_item iwi
+	JOIN inserted_change_request icr ON icr.id = iwi.id`
+
+// CreateChangeRequest implements ChangeRequestRepository.
+func (r *changeRequestRepo) CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error) {
+	var changeModel *string
+	if req.Type != nil {
+		v, ok := changeRequestTypeToChangeModel[*req.Type]
+		if !ok {
+			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("type %q is not supported on the PostgreSQL data source", *req.Type)}
+		}
+		changeModel = &v
+	}
+
+	var impact, risk, priority *string
+	if req.Impact != nil {
+		v := strings.ToUpper(string(*req.Impact))
+		impact = &v
+	}
+	if req.Risk != nil {
+		v := strings.ToUpper(string(*req.Risk))
+		risk = &v
+	}
+	if req.Priority != nil {
+		v := strings.ToUpper(string(*req.Priority))
+		priority = &v
+	}
+
+	var (
+		outID, outNumber, outSubject, outCreatedBy string
+		outCreatedOn, outUpdatedOn                 time.Time
+	)
+	err := r.db.QueryRow(ctx, createChangeRequestPortalQuery,
+		createdBy, req.Subject, req.Description, req.AssignedEngineerID,
+		req.ServiceID, req.ServiceOfferingID, impact, risk, priority, changeModel,
+		req.Justification, req.ImplementationPlan, req.RiskImpactAnalysis, req.BackoutPlan, req.TestPlan,
+		req.PlannedStartDate, req.PlannedEndDate, req.RequestedByID, req.CustomerGroupID,
+		req.IsPlanningVisibleToCustomers, req.AffectedServicesText, req.AffectedComponentsText, req.RollbackDurationText,
+	).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
+	if err != nil {
+		// change_request_write_internal_only (migration 0145) permits only an
+		// internal caller to INSERT -- POST /change-requests is gated
+		// internalOnly at the route (routes.go), so this should not be
+		// reachable in practice, but map it the same defensive way
+		// PatchChangeRequest already does rather than leaving a theoretical
+		// 42501 to surface as a raw 500.
+		if IsRLSPolicyViolation(err) {
+			return domain.CreateChangeRequestResponse{}, &apierror.NotFoundError{Msg: "change request not found"}
+		}
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503": // foreign_key_violation -- one of the referenced IDs does not exist
+				return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
+			case "P0001": // raise_exception from integrity triggers
+				return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: pgErr.Message}
+			}
+		}
+		return domain.CreateChangeRequestResponse{}, fmt.Errorf("create change request: %w", err)
+	}
+
+	resp := domain.CreateChangeRequestResponse{Message: "Change request created successfully."}
+	resp.ChangeRequest.ID = outID
+	resp.ChangeRequest.Number = outNumber
+	resp.ChangeRequest.CreatedOn = outCreatedOn.UTC().Format(time.RFC3339)
+	resp.ChangeRequest.CreatedBy = outCreatedBy
+	return resp, nil
 }
 
 // createChangeRequestFromServiceNowQuery inserts both halves of a change

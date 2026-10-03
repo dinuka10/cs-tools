@@ -170,4 +170,20 @@ describe("UsageAndMetricsTabContent deployment tab scroll affordance", () => {
 
     expect(scrollBy).toHaveBeenCalledWith({ left: 320, behavior: "smooth" });
   });
+
+  it("uses theme CSS variable in fade mask backgrounds to support dark mode", () => {
+    renderContent();
+    const scrollEl = getTabScrollContainer();
+    mockScrollContainer(scrollEl, { scrollWidth: 1200, clientWidth: 400, scrollLeft: 400 });
+    fireEvent.scroll(scrollEl);
+
+    const leftButton = screen.getByRole("button", { name: "Scroll deployment tabs left" });
+    const rightButton = screen.getByRole("button", { name: "Scroll deployment tabs right" });
+
+    const leftMask = leftButton.parentElement!;
+    const rightMask = rightButton.parentElement!;
+
+    expect(getComputedStyle(leftMask).background).toContain("var(--oxygen-palette-background-paper");
+    expect(getComputedStyle(rightMask).background).toContain("var(--oxygen-palette-background-paper");
+  });
 });

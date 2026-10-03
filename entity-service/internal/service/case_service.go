@@ -429,20 +429,14 @@ func (s *caseService) CreateCase(ctx context.Context, req domain.CreateCaseReque
 	if err := validateCreateCaseRequest(&req); err != nil {
 		return domain.CreateCaseResponse{}, err
 	}
-	// announcement/service_request/engagement/security_report_analysis only
-	// exist on the SN-first path (s.snMirror != nil): case_repo's direct
-	// Postgres insert only knows how to write a "CASE" work_item row, so on
-	// a pure-Postgres data source (s.snMirror == nil) these four would either
-	// hit an untyped uuid cast error (announcement's empty deployment id) or
-	// a missing work_item.number generator, both surfacing as an opaque
-	// 500/503 instead of a clean validation error.
+	// announcement/service_request/engagement/security_report_analysis used to
+	// exist only on the SN-first path (s.snMirror != nil): case_repo's direct
+	// Postgres insert only knew how to write a "CASE" work_item row. CaseRepository.CreateCase
+	// now has a dedicated query per type (case_repo.go's createCaseTx dispatch), so all five
+	// are supported on both the plain-Postgres and dual-write paths alike.
 	switch req.Type {
-	case "case":
-		// supported unconditionally
-	case "announcement", "service_request", "engagement", "security_report_analysis":
-		if s.snMirror == nil {
-			return domain.CreateCaseResponse{}, &apierror.ValidationError{Msg: "type \"" + req.Type + "\" is supported only for DATA_SOURCE=postgres-servicenow-dual-write"}
-		}
+	case "case", "announcement", "service_request", "engagement", "security_report_analysis":
+		// supported unconditionally, on every data source
 	default:
 		return domain.CreateCaseResponse{}, &apierror.ValidationError{Msg: "only type \"case\", \"announcement\", \"service_request\", \"engagement\", or \"security_report_analysis\" is supported for the Postgres data source"}
 	}
@@ -468,17 +462,11 @@ func (s *caseService) CreateCase(ctx context.Context, req domain.CreateCaseReque
 		return s.createCaseSNFirst(ctx, req)
 	}
 
-	// Only the pure-Postgres path below (no ServiceNow mirror at all) is
-	// genuinely limited to type "case" — it writes directly into the
-	// work_item+"case" tables, which have no equivalent extension table for
-	// engagement/service_request/security_report_analysis/announcement yet
-	// (see CaseRepository's own doc comment). This check used to run before
-	// the snMirror branch above, unconditionally rejecting "announcement"
-	// even when ServiceNow (which does support it — snCaseTypeMap has a real
-	// entry) was about to handle the actual create.
-	if req.Type != "case" {
-		return domain.CreateCaseResponse{}, &apierror.ValidationError{Msg: "only type \"case\" is supported for the Postgres data source"}
-	}
+	// The pure-Postgres path below (no ServiceNow mirror at all) now writes
+	// every one of the five case-like types -- CaseRepository.CreateCase
+	// dispatches on req.Type to its own query per type (case_repo.go), so
+	// there is no longer a narrower type restriction here than the one
+	// already enforced above.
 
 	if req.CreatedBy == "" {
 		token := middleware.UserIDTokenFromContext(ctx)

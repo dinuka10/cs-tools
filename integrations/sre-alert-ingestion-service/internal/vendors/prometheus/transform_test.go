@@ -37,7 +37,7 @@ func sampleAlert(overrides map[string]any) map[string]any {
 		"labels": map[string]any{
 			"alertname": "HighCPU",
 			"severity":  "critical",
-			"service":   "client-medlineprod-alert-integration",
+			"service":   "client-example-alert-integration",
 			"category":  "service_interruption",
 			"cluster":   "prod-1",
 		},
@@ -75,7 +75,7 @@ func TestTransform_SingleAlertBasicFields(t *testing.T) {
 		t.Fatalf("len(alerts) = %d, want 1", len(alerts))
 	}
 	a := alerts[0]
-	if a.Service != "client-medlineprod-alert-integration" {
+	if a.Service != "client-example-alert-integration" {
 		t.Errorf("Service = %q", a.Service)
 	}
 	if a.MetricName != "HighCPU" {

@@ -79,7 +79,7 @@ type Alert struct {
 // Config holds Tier-2 operator overrides (the analog of the ServiceNow
 // "edge.api.elasticsearch.alert.config" system property). Any field left empty
 // falls back to the Tier-3 default. Keyed by canonical field name, e.g.
-// {"ENVIRONMENT": "staging", "SERVICE": "client-medline"}.
+// {"ENVIRONMENT": "staging", "SERVICE": "client-example"}.
 type Config map[string]string
 
 // LoadConfig reads Tier-2 overrides from the ELASTICSEARCH_ALERT_CONFIG env var

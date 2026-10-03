@@ -36,7 +36,7 @@ func spanAt(h1, m1, h2, m2 int, repeat string) repository.ScheduleSpanRow {
 // collapse to AlwaysOn, both because that is exact and because the
 // day-walking path is pointless for it.
 func TestNewSpanSchedule_TwentyFourSevenCollapsesToAlwaysOn(t *testing.T) {
-	got, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(0, 0, 24, 0, "daily")})
+	got, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(0, 0, 24, 0, "daily")}, time.UTC)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestNewSpanSchedule_TwentyFourSevenCollapsesToAlwaysOn(t *testing.T) {
 }
 
 func TestNewSpanSchedule_NoSpansIsUnrestricted(t *testing.T) {
-	got, err := NewSpanSchedule(nil)
+	got, err := NewSpanSchedule(nil, time.UTC)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestNewSpanSchedule_RefusesWhatItCannotModel(t *testing.T) {
 
 	for name, span := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewSpanSchedule([]repository.ScheduleSpanRow{span}); err == nil {
+			if _, err := NewSpanSchedule([]repository.ScheduleSpanRow{span}, time.UTC); err == nil {
 				t.Fatalf("accepted a span it cannot model; it would publish a wrong percentage")
 			}
 		})
@@ -88,7 +88,7 @@ func TestNewSpanSchedule_RefusesWhatItCannotModel(t *testing.T) {
 }
 
 func TestSpanSchedule_BusinessHoursCoverage(t *testing.T) {
-	sched, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(9, 0, 17, 0, "daily")})
+	sched, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(9, 0, 17, 0, "daily")}, time.UTC)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestSpanSchedule_TwoWindowsInOneDay(t *testing.T) {
 	sched, err := NewSpanSchedule([]repository.ScheduleSpanRow{
 		spanAt(9, 0, 12, 0, "daily"),
 		spanAt(13, 0, 17, 0, "daily"),
-	})
+	}, time.UTC)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -143,7 +143,7 @@ func TestSpanSchedule_SurvivesADSTTransition(t *testing.T) {
 	if err != nil {
 		t.Skipf("tzdata unavailable: %v", err)
 	}
-	sched, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(9, 0, 17, 0, "daily")})
+	sched, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(9, 0, 17, 0, "daily")}, time.UTC)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -156,5 +156,52 @@ func TestSpanSchedule_SurvivesADSTTransition(t *testing.T) {
 	// fact that one of them is 25 hours long.
 	if got := sched.Covered(begin, end); got != 24*time.Hour {
 		t.Errorf("three days across a DST change = %v, want 24h", got)
+	}
+}
+
+// Windows are wall-clock in the schedule's zone. On a 25-hour day (London,
+// clocks back on 2026-10-25) a 09:00-17:00 window must still sit at 09:00-17:00
+// local -- midnight plus nine hours would put it at 08:00-16:00.
+func TestSpanSchedule_WindowsStayOnWallClockAcrossDST(t *testing.T) {
+	london, err := time.LoadLocation("Europe/London")
+	if err != nil {
+		t.Skip("tzdata unavailable")
+	}
+	sched, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(9, 0, 17, 0, "daily")}, london)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := func(h int) time.Time { return time.Date(2026, 10, 25, h, 0, 0, 0, london) }
+	if got := sched.Covered(at(8), at(9)); got != 0 {
+		t.Errorf("08:00-09:00 local on the DST day covered %v, want 0", got)
+	}
+	if got := sched.Covered(at(16), at(17)); got != time.Hour {
+		t.Errorf("16:00-17:00 local on the DST day covered %v, want 1h", got)
+	}
+	if got := sched.Covered(at(0), time.Date(2026, 10, 26, 0, 0, 0, 0, london)); got != 8*time.Hour {
+		t.Errorf("whole DST day covered %v, want 8h", got)
+	}
+}
+
+// The day walk is anchored in the schedule's zone, not in whatever zone the
+// caller's times carry: the same instants passed in UTC or in Colombo give the
+// same answer.
+func TestSpanSchedule_AnchorsInScheduleZoneNotCallerZone(t *testing.T) {
+	colombo, err := time.LoadLocation("Asia/Colombo")
+	if err != nil {
+		t.Skip("tzdata unavailable")
+	}
+	sched, err := NewSpanSchedule([]repository.ScheduleSpanRow{spanAt(9, 0, 17, 0, "daily")}, colombo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 09:00-10:00 in Colombo is inside the window; 03:30-04:30 UTC is the
+	// same hour. A walk anchored on the arguments' (UTC) midnight would put the
+	// window at 14:30-22:30 Colombo and count this hour as uncovered.
+	nine := time.Date(2026, 10, 1, 9, 0, 0, 0, colombo)
+	inColombo := sched.Covered(nine, nine.Add(time.Hour))
+	inUTC := sched.Covered(nine.UTC(), nine.Add(time.Hour).UTC())
+	if inColombo != time.Hour || inUTC != time.Hour {
+		t.Errorf("09:00-10:00 Colombo covered %v (Colombo-zoned args) / %v (UTC-zoned args), want 1h both", inColombo, inUTC)
 	}
 }

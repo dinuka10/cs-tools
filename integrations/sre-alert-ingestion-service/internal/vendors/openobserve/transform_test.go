@@ -25,13 +25,13 @@ import (
 
 func samplePayload(overrides map[string]string) []byte {
 	fields := map[string]string{
-		"short_description": "High CPU on client-medlineprod",
+		"short_description": "High CPU on client-example",
 		"description":       "CPU usage exceeded 90% for 5 minutes",
 		"urgency":           "1",
 		"impact":            "2",
 		"correlation_id":    "cpu-alert-xyz",
 		"caller_id":         "openobserve",
-		"service":           "client-medlineprod-alert-integration",
+		"service":           "client-example-alert-integration",
 		"category":          "service_interruption",
 		"environment":       "production",
 	}
@@ -85,7 +85,7 @@ func TestTransform_MetricNameIsShortDescription(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
 	}
-	if a.MetricName != "High CPU on client-medlineprod" {
+	if a.MetricName != "High CPU on client-example" {
 		t.Errorf("MetricName = %q, want the short_description", a.MetricName)
 	}
 }

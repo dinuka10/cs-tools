@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
@@ -260,11 +261,30 @@ func (s *availabilityService) scheduleFor(
 	if subject.ScheduleID == nil {
 		return AlwaysOn{}, nil
 	}
-	spans, err := s.repo.ScheduleSpans(ctx, *subject.ScheduleID)
-	if err != nil {
-		return nil, err
+	if subject.ScheduleName != nil && isTwentyFourSeven(*subject.ScheduleName) {
+		return AlwaysOn{}, nil
 	}
-	return NewSpanSchedule(spans)
+
+	// *** ANY OTHER SCHEDULE FAILS THE SUBJECT, ON PURPOSE. ***
+	// Its spans cannot be read: cmn_schedule_span.yaml syncs only CSM rota
+	// span types, so a commitment schedule's spans never reach schedule_span,
+	// and the repeat/show-as columns NewSpanSchedule needs are not mirrored
+	// either. Computing such a subject as 24x7 would publish a wrong figure
+	// with no error anywhere; failing it shows up in the sweep's `failed`
+	// count and names the schedule. NewSpanSchedule is ready for the day
+	// those spans are synced.
+	name := "(unknown)"
+	if subject.ScheduleName != nil {
+		name = *subject.ScheduleName
+	}
+	return nil, fmt.Errorf("availability: commitment %s is measured against schedule %q, which is not modelled: "+
+		"only \"24 x 7\" is supported until commitment schedules' spans are synced", subject.ServiceCommitmentID, name)
+}
+
+// isTwentyFourSeven reports whether a schedule name is ServiceNow's stock
+// "24 x 7" schedule, tolerating case and spacing ("24x7", "24 X 7").
+func isTwentyFourSeven(name string) bool {
+	return strings.ReplaceAll(strings.ToLower(name), " ", "") == "24x7"
 }
 
 // availabilityStoredDecimals is the scale ServiceNow stores availability

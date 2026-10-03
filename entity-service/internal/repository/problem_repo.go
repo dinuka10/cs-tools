@@ -115,6 +115,18 @@ type ProblemRepository interface {
 	// problem_subcategory.value within that category; unmatched values remain
 	// NULL.
 	CreateProblemFromServiceNow(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error)
+	// CreateProblem inserts a new problem row (both work_item and "problem")
+	// for the plain-Postgres data source (no ServiceNow at all) --
+	// createProblemPortalQuery's own doc comment has the full field-by-field
+	// reasoning, which mirrors CreateProblemFromServiceNow's exactly except
+	// identity (id/number) is generated here via
+	// gen_random_uuid()/next_portal_work_item_number() instead of being
+	// supplied by a prior ServiceNow response, createdBy is the calling
+	// user's own resolved email, and state is hardcoded to NEW (there is no
+	// ServiceNow response to confirm one from, and problem.state has no
+	// column default of its own -- confirmed against the live schema --
+	// unlike incident's).
+	CreateProblem(ctx context.Context, req domain.CreateProblemRequest, createdBy string) (domain.ProblemDetail, error)
 
 	// UpdateProblemFields writes any subset of the PATCH /problems/{id}
 	// fields that have an unambiguous, established Postgres column mapping --
@@ -433,6 +445,92 @@ func (r *problemRepo) GetProblem(ctx context.Context, id string) (domain.Problem
 	}
 
 	return d, nil
+}
+
+// createProblemPortalQuery is CreateProblem's (the plain-Postgres,
+// caller-initiated path) query -- structurally identical to
+// createProblemFromServiceNowQuery except id/number are generated here
+// (gen_random_uuid()/next_portal_work_item_number(), migration 0140) instead
+// of supplied by a prior ServiceNow response, and state is a fixed literal
+// ('NEW') rather than a parameter -- there is no ServiceNow response to
+// confirm one from on this path, and problem.state has no column default of
+// its own (confirmed against the live schema, unlike incident's).
+//
+// Column/output order matches the trailing SELECT exactly.
+const createProblemPortalQuery = `
+	WITH inserted_work_item AS (
+		INSERT INTO work_item (
+			id, created_on, updated_on, created_by, updated_by,
+			number, subject, description, type, parent_id
+		)
+		VALUES (
+			gen_random_uuid(), NOW(), NOW(), $1, $1,
+			next_portal_work_item_number(), $2, $6, 'PROBLEM'::work_item_type_enum, $3::uuid
+		)
+		RETURNING id, number, subject, description, created_on, updated_on, created_by
+	),
+	inserted_problem AS (
+		INSERT INTO problem (
+			id, state, incident_id, opened_on, category, subcategory_id
+		)
+		SELECT id, 'NEW'::problem_state_enum, $4::uuid, NOW(), $7::problem_category_enum,
+		       -- subcategory is matched on problem_subcategory.value (lower-case
+		       -- free text) within the chosen category; an unmatched value stays NULL.
+		       (SELECT psc.id FROM problem_subcategory psc WHERE psc.category = $7::problem_category_enum AND psc.value = LOWER($5::text))
+		FROM inserted_work_item
+		RETURNING id
+	)
+	SELECT iwi.id, iwi.number, iwi.subject, iwi.description, iwi.created_on, iwi.updated_on, iwi.created_by
+	FROM inserted_work_item iwi
+	JOIN inserted_problem ip ON ip.id = iwi.id`
+
+// CreateProblem implements ProblemRepository.
+func (r *problemRepo) CreateProblem(ctx context.Context, req domain.CreateProblemRequest, createdBy string) (domain.ProblemDetail, error) {
+	var category *string
+	if req.Category != nil && strings.TrimSpace(*req.Category) != "" {
+		v := strings.ToUpper(strings.TrimSpace(*req.Category))
+		category = &v
+	}
+	var (
+		outID, outNumber, outSubject, outCreatedBy string
+		outDescription                             *string
+		outCreatedOn, outUpdatedOn                 time.Time
+	)
+	err := r.db.QueryRow(ctx, createProblemPortalQuery,
+		createdBy, req.Subject, req.OriginCaseID,
+		req.PrimaryIncidentID, req.Subcategory, req.Description,
+		category,
+	).Scan(&outID, &outNumber, &outSubject, &outDescription, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
+	if err != nil {
+		// problem_deny_all_insert (migration 0148) permits only an internal
+		// caller -- problem has no project concept at all, same as incident.
+		// POST /problems is already gated internalOnly at the route, so this
+		// should not be reachable in practice, but map it defensively rather
+		// than leaving a theoretical 42501 to surface as a raw 500.
+		if IsRLSPolicyViolation(err) {
+			return domain.ProblemDetail{}, &apierror.NotFoundError{Msg: "problem not found"}
+		}
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "22001": // string_data_right_truncation -- e.g. subject over work_item.subject's VARCHAR(512)
+				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "a field value is too long: " + pgErr.Message}
+			case "23503": // foreign_key_violation -- one of the referenced IDs does not exist
+				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
+			case "P0001": // raise_exception from integrity triggers
+				return domain.ProblemDetail{}, &apierror.ValidationError{Msg: pgErr.Message}
+			}
+		}
+		return domain.ProblemDetail{}, fmt.Errorf("create problem: %w", err)
+	}
+
+	state := "NEW"
+	return domain.ProblemDetail{
+		ID:          &outID,
+		Number:      &outNumber,
+		Subject:     &outSubject,
+		Description: outDescription,
+		State:       &state,
+	}, nil
 }
 
 // createProblemFromServiceNowQuery inserts both halves of a problem row

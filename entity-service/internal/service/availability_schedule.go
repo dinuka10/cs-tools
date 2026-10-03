@@ -45,9 +45,12 @@ import (
 
 // SpanSchedule covers the intervals its spans describe.
 type SpanSchedule struct {
-	// windows are the daily covered ranges as offsets from local midnight.
-	// A 24x7 schedule is one window of [0, 24h).
+	// windows are the daily covered ranges as wall-clock offsets from local
+	// midnight. A 24x7 schedule is one window of [0, 24h).
 	windows []dayWindow
+	// loc is the zone the spans' wall-clock times are in. Every day walk and
+	// window boundary is built in it, whatever zone the caller's times carry.
+	loc *time.Location
 }
 
 type dayWindow struct {
@@ -57,7 +60,10 @@ type dayWindow struct {
 
 // NewSpanSchedule builds a schedule from mirrored spans, or reports that the
 // spans describe something it will not guess at.
-func NewSpanSchedule(spans []repository.ScheduleSpanRow) (AvailabilitySchedule, error) {
+func NewSpanSchedule(spans []repository.ScheduleSpanRow, loc *time.Location) (AvailabilitySchedule, error) {
+	if loc == nil {
+		loc = time.UTC
+	}
 	// No spans at all is an unrestricted schedule, which is what
 	// ServiceNow does with an empty cmn_schedule.
 	if len(spans) == 0 {
@@ -106,7 +112,7 @@ func NewSpanSchedule(spans []repository.ScheduleSpanRow) (AvailabilitySchedule, 
 		return AlwaysOn{}, nil
 	}
 
-	return &SpanSchedule{windows: windows}, nil
+	return &SpanSchedule{windows: windows, loc: loc}, nil
 }
 
 // Covered implements AvailabilitySchedule by walking the period a day at a
@@ -117,13 +123,19 @@ func (s *SpanSchedule) Covered(begin, end time.Time) time.Duration {
 	}
 
 	var total time.Duration
-	loc := begin.Location()
-	day := time.Date(begin.Year(), begin.Month(), begin.Day(), 0, 0, 0, 0, loc)
+	// Walk days in the schedule's own zone. The caller's times may carry any
+	// location (pgx returns timestamptz in the process zone, usually UTC), so
+	// anchoring on begin.Location() would start the walk at the wrong midnight.
+	local := begin.In(s.loc)
+	day := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, s.loc)
 
 	for day.Before(end) {
 		for _, w := range s.windows {
-			ws := day.Add(w.start)
-			we := day.Add(w.end)
+			// Wall-clock boundaries via time.Date, not midnight plus a
+			// duration: on a daylight-saving change day midnight+9h is 08:00
+			// or 10:00 local, not 09:00.
+			ws := wallClock(day, w.start, s.loc)
+			we := wallClock(day, w.end, s.loc)
 			if ws.Before(begin) {
 				ws = begin
 			}
@@ -136,9 +148,19 @@ func (s *SpanSchedule) Covered(begin, end time.Time) time.Duration {
 		}
 		// AddDate rather than Add(24h): across a DST transition a day is not
 		// 24 hours, and stepping by a fixed 24h would drift the window.
-		day = day.AddDate(0, 0, 1)
+		day = time.Date(day.Year(), day.Month(), day.Day()+1, 0, 0, 0, 0, s.loc)
 	}
 	return total
+}
+
+// wallClock is the instant at which the clock in loc reads `offset` past the
+// start of day's date. An offset of 24h is the next day's midnight (time.Date
+// normalises it).
+func wallClock(day time.Time, offset time.Duration, loc *time.Location) time.Time {
+	h := int(offset / time.Hour)
+	m := int((offset % time.Hour) / time.Minute)
+	sec := int((offset % time.Minute) / time.Second)
+	return time.Date(day.Year(), day.Month(), day.Day(), h, m, sec, 0, loc)
 }
 
 func sinceMidnight(t time.Time) time.Duration {

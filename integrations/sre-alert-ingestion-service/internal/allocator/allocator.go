@@ -121,6 +121,8 @@ type Config struct {
 	// ClaimJitter bounds the random pause before retrying a rejected compare-and-set, so two
 	// replicas that collided don't collide again in lockstep.
 	ClaimJitter time.Duration
+	// ReadBack confirms each insert with a read before counting the alert stored.
+	ReadBack bool
 }
 
 // Result is what a submitter receives: its ids, in submission order, or an error.
@@ -165,6 +167,11 @@ type Allocator struct {
 	drainCh   chan struct{}
 	drainOnce sync.Once
 	stopAt    atomic.Int64 // unix nanos; 0 until a drain deadline is set
+
+	// lastSeq is alert_seq as of this replica's last claim; only the claimer touches it. Valid
+	// while seqKnown, so a claim skips reading alert_seq first.
+	lastSeq  int64
+	seqKnown bool
 }
 
 // New starts the claimer goroutine. notifier and waker may be nil.
@@ -432,7 +439,9 @@ func (a *Allocator) claimLoop() {
 }
 
 // claim reserves n consecutive ids with one compare-and-set and returns the first. A rejected
-// compare-and-set returns the row's current value, which the retry uses directly.
+// compare-and-set returns the row's current value, which the retry uses directly. It starts
+// from the value this replica last set, so alert_seq is only read when that is unknown; if
+// another replica moved it since, the rejection costs what the read would have.
 //
 // A throttled read or compare-and-set was rejected by Cosmos DB and did not apply, so it is
 // retried without counting an attempt. Any other compare-and-set error may still have applied
@@ -440,10 +449,13 @@ func (a *Allocator) claimLoop() {
 func (a *Allocator) claim(n int) (start int64, attempts int, err error) {
 	ctx := context.Background()
 	giveUp := time.Now().Add(a.cfg.WriteDeadline)
-	current, err := a.readSeq(ctx, giveUp)
-	if err != nil {
-		return 0, 0, err
+	current := a.lastSeq
+	if !a.seqKnown {
+		if current, err = a.readSeq(ctx, giveUp); err != nil {
+			return 0, 0, err
+		}
 	}
+	a.seqKnown = false // set again only by an applied claim
 	var lastErr error
 	for attempt := 1; attempt <= a.cfg.ClaimMaxAttempts; {
 		applied, seen, err := a.store.CompareAndSet(ctx, current, current+int64(n))
@@ -462,6 +474,7 @@ func (a *Allocator) claim(n int) (start int64, attempts int, err error) {
 				lastErr = err
 			}
 		case applied:
+			a.lastSeq, a.seqKnown = current+int64(n), true
 			return current + 1, attempt, nil
 		default:
 			current = seen
@@ -603,8 +616,8 @@ func (a *Allocator) writeBatch(batch []*submission, start int64, held int, claim
 	}
 }
 
-// writeOne writes one alert under its claimed id and confirms it by reading it back. Throttled
-// inserts and read-backs are retried on the same id until the write deadline without counting
+// writeOne writes one alert under its claimed id and, with ReadBack, confirms it by reading it
+// back. Throttled inserts and read-backs are retried on the same id until the write deadline without counting
 // an attempt; other errors get InsertAttempts attempts. Then it falls back to a filler row.
 // ok reports whether the real alert was stored.
 func (a *Allocator) writeOne(job alertJob) (id string, ok bool) {
@@ -642,6 +655,10 @@ func (a *Allocator) writeOne(job alertJob) (id string, ok bool) {
 			if cassandra.IsThrottled(err) {
 				w.throttled(err)
 				continue
+			}
+			if err == nil && !a.cfg.ReadBack {
+				w.stored()
+				return id, true
 			}
 			if err == nil {
 				inserted = true

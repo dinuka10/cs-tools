@@ -151,6 +151,7 @@ func main() {
 		QueryTimeout:     cfg.Store.QueryTimeout.Duration(),
 		WriteDeadline:    cfg.Store.WriteDeadline.Duration(),
 		ClaimJitter:      claimJitter,
+		ReadBack:         cfg.Store.ReadBack,
 	})
 
 	srv := server.New(server.Options{

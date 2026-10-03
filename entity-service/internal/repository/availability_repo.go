@@ -48,6 +48,10 @@ type AvailabilitySubject struct {
 	Timezone string
 	// ScheduleID is nullable: no schedule means unrestricted (24x7).
 	ScheduleID *string
+	// ScheduleName is the referenced schedule's name, nil when ScheduleID is
+	// nil or the schedule row is missing. Only "24 x 7" is modelled today --
+	// see availabilityService.scheduleFor.
+	ScheduleName *string
 }
 
 // SubjectID is whichever of the two subject columns is set. ServiceNow's
@@ -101,7 +105,6 @@ type ComputedAvailabilityRow struct {
 type AvailabilityRepository interface {
 	Subjects(ctx context.Context) ([]AvailabilitySubject, error)
 	OutagesFor(ctx context.Context, subjectID string, begin, end time.Time) ([]AvailabilityOutageRow, error)
-	ScheduleSpans(ctx context.Context, scheduleID string) ([]ScheduleSpanRow, error)
 	UpsertFixed(ctx context.Context, rows []ComputedAvailabilityRow) error
 	ReplaceRolling(ctx context.Context, subjectID string, commitmentID string, types []string, rows []ComputedAvailabilityRow) error
 }
@@ -138,9 +141,11 @@ const availabilitySubjectsSQL = `
            soc.service_commitment_id,
            COALESCE(sc.percentage_avail, 100),
            COALESCE(sc.timezone, ''),
-           sc.schedule_id
+           sc.schedule_id,
+           sch.name
       FROM service_offering_commitment soc
       JOIN service_commitment sc ON sc.id = soc.service_commitment_id
+      LEFT JOIN schedule sch ON sch.id = sc.schedule_id
       LEFT JOIN service_offering so ON so.id = soc.service_offering_id
      WHERE sc.type = 'AVAILABILITY'
        AND (soc.cmdb_ci_id IS NOT NULL
@@ -158,7 +163,7 @@ func (r *availabilityRepository) Subjects(ctx context.Context) ([]AvailabilitySu
 	for rows.Next() {
 		var s AvailabilitySubject
 		if err := rows.Scan(&s.ServiceOfferingID, &s.CmdbCiID, &s.ServiceCommitmentID,
-			&s.TargetPercent, &s.Timezone, &s.ScheduleID); err != nil {
+			&s.TargetPercent, &s.Timezone, &s.ScheduleID, &s.ScheduleName); err != nil {
 			return nil, fmt.Errorf("scan availability subject: %w", err)
 		}
 		out = append(out, s)
@@ -206,29 +211,6 @@ func (r *availabilityRepository) OutagesFor(ctx context.Context, subjectID strin
 			return nil, fmt.Errorf("scan outage for availability: %w", err)
 		}
 		out = append(out, o)
-	}
-	return out, rows.Err()
-}
-
-const scheduleSpansSQL = `
-    SELECT start_on, end_on, COALESCE(span_type, ''), COALESCE(repeat_type, ''), COALESCE(show_as, '')
-      FROM schedule_span
-     WHERE schedule_id = $1::uuid`
-
-func (r *availabilityRepository) ScheduleSpans(ctx context.Context, scheduleID string) ([]ScheduleSpanRow, error) {
-	rows, err := r.db.Query(ctx, scheduleSpansSQL, scheduleID)
-	if err != nil {
-		return nil, fmt.Errorf("query schedule spans: %w", err)
-	}
-	defer rows.Close()
-
-	var out []ScheduleSpanRow
-	for rows.Next() {
-		var s ScheduleSpanRow
-		if err := rows.Scan(&s.StartOn, &s.EndOn, &s.SpanType, &s.RepeatType, &s.ShowAs); err != nil {
-			return nil, fmt.Errorf("scan schedule span: %w", err)
-		}
-		out = append(out, s)
 	}
 	return out, rows.Err()
 }

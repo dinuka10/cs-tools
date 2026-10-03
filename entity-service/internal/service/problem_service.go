@@ -195,12 +195,35 @@ func (s *problemService) CreateProblem(ctx context.Context, req domain.CreatePro
 	if s.snMirror != nil {
 		return s.createProblemSNFirst(ctx, req)
 	}
-	// CreateProblem is not supported for the plain PostgreSQL data source:
-	// like CaseRepository.CreateCase, work_item.number has no DB default and
-	// no backing sequence anywhere in migrations/.
-	return domain.ProblemDetail{}, &apierror.ServiceUnavailableError{
-		Msg: "creating a problem is not available on this data source: work_item.number has no generation strategy defined here",
+	return s.createProblemPortal(ctx, req)
+}
+
+// createProblemPortal implements CreateProblem's plain-Postgres path
+// (s.snMirror == nil, no ServiceNow at all) -- unblocked by migration 0140's
+// next_portal_work_item_number(), the same product decision that used to
+// defer this (see CLAUDE.md, "CreateCase and case numbers"). Validates the
+// same two fields createProblemSNFirst validates before ever reaching
+// ServiceNow -- there is no ServiceNow call on this path at all, but the
+// checks still belong before the repository call, same "validate before
+// writing" convention every service method here follows. createdBy is
+// resolved from the caller's own JWT email claim, same chain
+// createProblemSNFirst already uses.
+func (s *problemService) createProblemPortal(ctx context.Context, req domain.CreateProblemRequest) (domain.ProblemDetail, error) {
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.ProblemDetail{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
 	}
+	createdBy, err := emailFromJWT(token)
+	if err != nil {
+		return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	if utf8.RuneCountInString(req.Subject) > maxWorkItemSubjectLength {
+		return domain.ProblemDetail{}, &apierror.ValidationError{Msg: fmt.Sprintf("subject cannot exceed %d characters", maxWorkItemSubjectLength)}
+	}
+	if req.Category != nil && strings.TrimSpace(*req.Category) != "" && !validProblemCategoryPG[strings.ToUpper(strings.TrimSpace(*req.Category))] {
+		return domain.ProblemDetail{}, &apierror.ValidationError{Msg: "category contains invalid value: " + *req.Category}
+	}
+	return s.repo.CreateProblem(ctx, req, createdBy)
 }
 
 // createProblemSNFirst implements CreateProblem's

@@ -30,7 +30,7 @@ func sampleIncident(overrides map[string]any) map[string]any {
 		"condition_name": "CPU usage above 90%",
 		"resource": map[string]any{
 			"labels": map[string]any{
-				"service":     "client-medlineprod-alert-integration",
+				"service":     "client-example-alert-integration",
 				"category":    "service_interruption",
 				"environment": "production",
 			},
@@ -135,7 +135,7 @@ func TestTransform_FieldsFromResourceLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
 	}
-	if a.Service != "client-medlineprod-alert-integration" {
+	if a.Service != "client-example-alert-integration" {
 		t.Errorf("Service = %q", a.Service)
 	}
 	if a.Category != "service_interruption" {

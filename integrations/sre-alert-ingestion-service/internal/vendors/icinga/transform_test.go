@@ -240,7 +240,7 @@ func TestTransform_MetricNameDefaultIsUnreachable(t *testing.T) {
 
 func TestTransform_ConfigOverridesBeatDefaults(t *testing.T) {
 	raw := []byte(`{"notification_type":"PROBLEM","host_name":"db-01"}`)
-	cfg := Config{"ENVIRONMENT": "staging", "SERVICE": "client-medline"}
+	cfg := Config{"ENVIRONMENT": "staging", "SERVICE": "client-example"}
 	a, err := Transform(raw, cfg)
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
@@ -248,8 +248,8 @@ func TestTransform_ConfigOverridesBeatDefaults(t *testing.T) {
 	if a.Environment != "staging" {
 		t.Errorf("Environment = %q, want staging", a.Environment)
 	}
-	if a.Service != "client-medline" {
-		t.Errorf("Service = %q, want client-medline", a.Service)
+	if a.Service != "client-example" {
+		t.Errorf("Service = %q, want client-example", a.Service)
 	}
 }
 

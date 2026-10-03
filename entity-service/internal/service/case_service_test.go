@@ -2680,37 +2680,50 @@ func TestCaseService_CreateCase_RejectsUnsupportedTypesOnPostgres(t *testing.T) 
 	}
 }
 
-// TestCaseService_CreateCase_RejectsSNOnlyTypesWithoutMirror is the
-// regression guard for a CodeRabbit finding on PR #1930: announcement/
-// service_request/engagement/security_report_analysis only exist on the
-// SN-first path. On a pure-Postgres data source (s.snMirror == nil,
-// NewCaseService rather than NewCaseServiceWithSNWriteback), reaching
-// caseRepo's direct-Postgres insert with one of these four types would
-// surface as an opaque 500 (announcement's empty deployment id cast as
-// ::uuid) or 503 (no work_item.number generator for the other three)
-// instead of a clean validation error -- the type guard must reject them up
-// front instead.
-func TestCaseService_CreateCase_RejectsSNOnlyTypesWithoutMirror(t *testing.T) {
+// TestCaseService_CreateCase_SNOnlyTypesNowSupportedWithoutMirror used to be
+// TestCaseService_CreateCase_RejectsSNOnlyTypesWithoutMirror, the regression
+// guard for a CodeRabbit finding on PR #1930: announcement/service_request/
+// engagement/security_report_analysis used to exist only on the SN-first
+// path, so reaching caseRepo's direct-Postgres insert with one of these four
+// types on a pure-Postgres data source (s.snMirror == nil, NewCaseService
+// rather than NewCaseServiceWithSNWriteback) would surface as an opaque 500
+// (announcement's empty deployment id cast as ::uuid) or 503 (no
+// work_item.number generator for the other three) instead of a clean
+// validation error. CaseRepository.CreateCase now has a dedicated query per
+// type (case_repo.go's createCaseTx dispatch, unblocked by migration 0140's
+// next_portal_work_item_number()/next_portal_wso2_id()), so these four are no
+// longer rejected here at all -- this test now asserts the opposite: they
+// reach repo.CreateCase and succeed, exactly like "case" always has.
+func TestCaseService_CreateCase_SNOnlyTypesNowSupportedWithoutMirror(t *testing.T) {
+	var gotTypes []string
 	repo := &stubCaseRepo{
-		createCase: func(context.Context, domain.CreateCaseRequest) (domain.Case, error) {
-			t.Fatal("repo.CreateCase should not be reached for an SN-only type without a mirror")
-			return domain.Case{}, nil
+		createCase: func(_ context.Context, req domain.CreateCaseRequest) (domain.Case, error) {
+			gotTypes = append(gotTypes, req.Type)
+			return domain.Case{ID: "case-1", Number: "CS-PORTAL-000001", CreatedBy: req.CreatedBy}, nil
 		},
 	}
 	svc := NewCaseService(repo, stubUserRepo{}, nil, alwaysUnrestrictedAccess{}, nil)
 
 	for _, req := range []domain.CreateCaseRequest{
-		{Type: "announcement", ProjectID: testDeploymentUUID, Subject: "x", Description: "y"},
-		validServiceRequestCreateCaseRequest(),
+		{CreatedBy: "user-1", Type: "announcement", ProjectID: testDeploymentUUID, Subject: "x", Description: "y"},
+		withCreatedBy(validServiceRequestCreateCaseRequest(), "user-1"),
 	} {
 		t.Run(req.Type, func(t *testing.T) {
-			_, err := svc.CreateCase(context.Background(), req)
-			var ve *apierror.ValidationError
-			if !asValidationError(err, &ve) {
-				t.Fatalf("expected *apierror.ValidationError for type %q without an SN mirror, got %T: %v", req.Type, err, err)
+			if _, err := svc.CreateCase(context.Background(), req); err != nil {
+				t.Fatalf("expected type %q to succeed without an SN mirror, got %T: %v", req.Type, err, err)
 			}
 		})
 	}
+	if len(gotTypes) != 2 {
+		t.Fatalf("expected repo.CreateCase to be reached for both types, got %v", gotTypes)
+	}
+}
+
+// withCreatedBy returns a copy of req with CreatedBy set, so a test can skip
+// CreateCase's x-user-id-token resolution path entirely.
+func withCreatedBy(req domain.CreateCaseRequest, createdBy string) domain.CreateCaseRequest {
+	req.CreatedBy = createdBy
+	return req
 }
 
 // validServiceRequestCreateCaseRequest returns a minimally valid,

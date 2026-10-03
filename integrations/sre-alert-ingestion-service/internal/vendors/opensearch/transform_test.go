@@ -30,7 +30,7 @@ func samplePayload(overrides map[string]string) []byte {
 		"state":        "ACTIVE",
 		"alert_id":     "abc123",
 		"severity":     "1",
-		"service":      "client-medlineprod-alert-integration",
+		"service":      "client-example-alert-integration",
 		"category":     "service_interruption",
 	}
 	for k, v := range overrides {

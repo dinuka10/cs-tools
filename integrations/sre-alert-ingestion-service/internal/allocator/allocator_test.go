@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
@@ -43,6 +44,8 @@ type fakeStore struct {
 	inserts map[string]int // insert calls per id, filler included
 
 	casCalls atomic.Int64
+	reads    atomic.Int64 // ReadSeq calls
+	exists   atomic.Int64 // read-backs
 	claims   atomic.Int64 // applied compare-and-sets
 	casDelay time.Duration
 
@@ -84,6 +87,7 @@ func newFakeStore() *fakeStore {
 }
 
 func (f *fakeStore) ReadSeq(context.Context) (int64, error) {
+	f.reads.Add(1)
 	if f.readEntered != nil {
 		select {
 		case f.readEntered <- struct{}{}:
@@ -160,6 +164,7 @@ func (f *fakeStore) InsertFiller(ctx context.Context, id, vendor, filler string)
 }
 
 func (f *fakeStore) Exists(_ context.Context, id string) (bool, error) {
+	f.exists.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.neverVisible {
@@ -378,7 +383,9 @@ func TestFillerRetried_UntilWritten(t *testing.T) {
 func TestReadBackMiss_RetriesOnSameID(t *testing.T) {
 	store := newFakeStore()
 	store.hideOnce["ALT000000001"] = true
-	a := newTestAllocator(t, store, nil, nil, testConfig())
+	cfg := testConfig()
+	cfg.ReadBack = true
+	a := newTestAllocator(t, store, nil, nil, cfg)
 
 	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
 	if err != nil {
@@ -386,6 +393,49 @@ func TestReadBackMiss_RetriesOnSameID(t *testing.T) {
 	}
 	if ids[0] != "ALT000000001" || store.inserts["ALT000000001"] != 2 {
 		t.Errorf("ids = %v, inserts = %d; want the same id re-inserted once", ids, store.inserts["ALT000000001"])
+	}
+}
+
+func TestNoReadBack_ByDefault(t *testing.T) {
+	store := newFakeStore()
+	a := newTestAllocator(t, store, nil, nil, testConfig())
+	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if n := store.exists.Load(); n != 0 {
+		t.Errorf("read-backs = %d, want 0 with ReadBack off", n)
+	}
+}
+
+func TestClaim_ReadsSeqOnlyOnce(t *testing.T) {
+	store := newFakeStore()
+	a := newTestAllocator(t, store, nil, nil, testConfig())
+	for i := range 3 {
+		ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
+		if err != nil || ids[0] != fmt.Sprintf("ALT%09d", i+1) {
+			t.Fatalf("Submit %d = %v, %v", i, ids, err)
+		}
+	}
+	if n := store.reads.Load(); n != 1 {
+		t.Errorf("alert_seq reads = %d, want 1: later claims start from the value last set", n)
+	}
+}
+
+func TestClaim_StaleCachedSeqUsesReturnedValue(t *testing.T) {
+	store := newFakeStore()
+	a := newTestAllocator(t, store, nil, nil, testConfig())
+	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	store.mu.Lock()
+	store.seq += 5 // another replica claimed 2..6
+	store.mu.Unlock()
+	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "v")})
+	if err != nil || ids[0] != "ALT000000007" {
+		t.Fatalf("ids = %v, err = %v; want ALT000000007", ids, err)
+	}
+	if n := store.reads.Load(); n != 1 {
+		t.Errorf("alert_seq reads = %d, want 1: the rejection returns the current value", n)
 	}
 }
 
@@ -628,7 +678,9 @@ func TestReadBackAlwaysMisses_KeepsStoredAlert(t *testing.T) {
 	store := newFakeStore()
 	store.neverVisible = true
 	notifier := &recordingNotifier{}
-	a := newTestAllocator(t, store, notifier, nil, testConfig())
+	cfg := testConfig()
+	cfg.ReadBack = true
+	a := newTestAllocator(t, store, notifier, nil, cfg)
 
 	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
 	if err != nil {

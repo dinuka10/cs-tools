@@ -300,19 +300,41 @@ func (s *changeRequestService) PatchChangeRequest(ctx context.Context, id string
 // CreateChangeRequest implements ChangeRequestService.
 //
 // Under DATA_SOURCE=postgres-servicenow-dual-write (snMirror != nil), this
-// delegates to createChangeRequestSNFirst instead of the plain Postgres
-// path's ServiceUnavailableError below -- see that method's own doc comment.
+// delegates to createChangeRequestSNFirst; otherwise createChangeRequestPortal
+// -- see each method's own doc comment.
 func (s *changeRequestService) CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
 	if s.snMirror != nil {
 		return s.createChangeRequestSNFirst(ctx, req)
 	}
-	// CreateChangeRequest is not supported for the plain PostgreSQL data
-	// source: like CaseRepository.CreateCase, work_item.number has no DB
-	// default and no backing sequence anywhere in migrations/. Generating it
-	// requires a product decision (a new migration adding a sequence, vs.
-	// Go-side generation, and the exact number format) this change does not
-	// make unilaterally.
-	return domain.CreateChangeRequestResponse{}, &apierror.ServiceUnavailableError{Msg: "creating change requests is not yet supported on the Postgres data source (no number-generation sequence)"}
+	return s.createChangeRequestPortal(ctx, req)
+}
+
+// createChangeRequestPortal implements CreateChangeRequest's plain-Postgres
+// path (s.snMirror == nil, no ServiceNow at all) -- unblocked by migration
+// 0140's next_portal_work_item_number(), the same product decision that used
+// to defer this (see CLAUDE.md, "CreateCase and case numbers", and
+// ChangeRequestRepository's own doc comment on CreateChangeRequestFromServiceNow
+// for why a change request specifically needs no wso2ID the way case/incident
+// do). createdBy is resolved from the caller's own JWT email claim -- the
+// same middleware.UserIDTokenFromContext + emailFromJWT chain
+// problemService.createProblemSNFirst already uses -- since there is no
+// ServiceNow response to take it from on this path.
+func (s *changeRequestService) createChangeRequestPortal(ctx context.Context, req domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.CreateChangeRequestResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	createdBy, err := emailFromJWT(token)
+	if err != nil {
+		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	// Same type check createChangeRequestSNFirst runs before calling
+	// ServiceNow -- deterministic, no I/O, so there's no reason to defer it
+	// to the repository's own identical check.
+	if req.Type != nil && !repository.ChangeRequestTypeSupported(*req.Type) {
+		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("type %q is not supported on the PostgreSQL data source", *req.Type)}
+	}
+	return s.repo.CreateChangeRequest(ctx, req, createdBy)
 }
 
 // createChangeRequestSNFirst implements CreateChangeRequest's

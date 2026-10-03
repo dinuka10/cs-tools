@@ -7,7 +7,7 @@ order and turns them into incidents. This service does not create incidents and 
 alerts-core's own tables (`alert_cursor`, `incidents_*`, `processor_lease`).
 
 ```
-vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids → insert + read back) ──▶ alerts
+vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids → insert) ──▶ alerts
                                            │                                               ▲
                                            └── POST /alertz (wake-up) ──▶ alerts-core ──reads┘
 ```
@@ -20,9 +20,11 @@ vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids →
 - **Ids**: every replica claims ranges of ids from the `alert_seq` row with a lightweight
   transaction (compare-and-set), so ids never repeat across replicas. One claim covers everything
   queued at that moment (up to `allocator.max_batch`), so a burst costs a handful of transactions.
+  Each replica starts a claim from the value it last set, so `alert_seq` is only read after a
+  restart or a failed claim.
   Ids are only claimed for alerts that have a free writer (`allocator.write_concurrency`); the
   rest wait in the queue, unclaimed.
-- **Writes**: each alert is inserted, then read back. When Cosmos DB throttles ("Request rate is
+- **Writes**: each alert is inserted (read back as well with `store.read_back`). When Cosmos DB throttles ("Request rate is
   large"), the write is retried on the same id after the delay Cosmos asks for, until
   `store.write_deadline` (5m from the claim); throttling doesn't use up `store.insert_attempts`.
   After the deadline, or `store.insert_attempts` other failures, a `VOID: <reason>` filler row is
@@ -36,7 +38,7 @@ vendor ──POST──▶ ingestion (transform → allocator: CAS-claim ids →
   logs a CRITICAL error.
 - **Memory**: everything accepted but not finished is capped at `allocator.queue_max_bytes`; past
   it, new webhooks get `503` at once.
-- **Response**: `201` only after every alert in the request has been written and read back.
+- **Response**: `201` only after every alert in the request has been written.
 - **Wake-up**: one `POST /alertz` to alerts-core per written batch. Calls are coalesced so at most
   one is in flight. If it fails, alerts-core's own 10-second poll still picks the rows up.
 - **Chat cards** (Google Chat, cardsV2): a *rejected webhook* card (at most one per vendor + error
@@ -156,6 +158,7 @@ default and a comment. The main knobs:
 | `allocator.write_concurrency` | `16` | Parallel inserts per replica; ids are only claimed for free writers |
 | `store.insert_attempts` | `5` | Attempts for errors other than throttling before the filler row (`insert_base_delay` 250ms, doubling) |
 | `store.write_deadline` | `5m` | How long, from the claim, a throttled write keeps retrying; must stay under alerts-core's `gap_timeout` (10m) |
+| `store.read_back` | `false` | Read each row back before `201`. Costs 2 RU per alert; a Cosmos DB write is durable once acknowledged |
 | `store.claim_timeout` | `5s` | Timeout for the `alert_seq` read and compare-and-set (inserts use `store.query_timeout`, 1.5s) |
 | `reject.window` | `15m` | Rejected-webhook card window: one per vendor + error class, 10 in total, per replica |
 | `fallback.cards_per_minute` | `5` | DB-failure cards per minute, per replica, before summarising |
@@ -171,34 +174,34 @@ payload for each vendor, are in [`internal/vendors/testdata/`](internal/vendors/
 
 ```sh
 # AWS (SNS notification wrapping a CloudWatch alarm)
-curl -sS -X POST "$BASE/aws" -H 'Content-Type: application/json' -d '{"Type":"Notification","MessageId":"7a3f9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","TopicArn":"arn:aws:sns:us-east-1:487629103847:prod-cloudwatch-alarms","Message":"{\"AlarmName\":\"prod-rds-cpu-utilization-high\",\"AlarmArn\":\"arn:aws:cloudwatch:us-east-1:487629103847:alarm:prod-rds-cpu-utilization-high\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Threshold Crossed: 1 datapoint [92.4] was greater than the threshold (90.0)\",\"AlarmDescription\":\"{\\\"service\\\":\\\"client-medlineprod-alert-integration\\\",\\\"category\\\":\\\"service_interruption\\\",\\\"environment\\\":\\\"production\\\",\\\"severity\\\":\\\"critical\\\"}\"}","Timestamp":"2026-09-24T05:12:33.512Z"}'
+curl -sS -X POST "$BASE/aws" -H 'Content-Type: application/json' -d '{"Type":"Notification","MessageId":"7a3f9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","TopicArn":"arn:aws:sns:us-east-1:487629103847:prod-cloudwatch-alarms","Message":"{\"AlarmName\":\"prod-rds-cpu-utilization-high\",\"AlarmArn\":\"arn:aws:cloudwatch:us-east-1:487629103847:alarm:prod-rds-cpu-utilization-high\",\"NewStateValue\":\"ALARM\",\"NewStateReason\":\"Threshold Crossed: 1 datapoint [92.4] was greater than the threshold (90.0)\",\"AlarmDescription\":\"{\\\"service\\\":\\\"client-example-alert-integration\\\",\\\"category\\\":\\\"service_interruption\\\",\\\"environment\\\":\\\"production\\\",\\\"severity\\\":\\\"critical\\\"}\"}","Timestamp":"2026-09-24T05:12:33.512Z"}'
 
 # Azure Monitor (common alert schema)
-curl -sS -X POST "$BASE/azure" -H 'Content-Type: application/json' -d '{"schemaId":"azureMonitorCommonAlertSchema","data":{"essentials":{"alertId":"/subscriptions/4c9e2a1f-8b3d-4e7c-9f1a-2b6d8e3c5a9f/providers/Microsoft.AlertsManagement/alerts/7f3a9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","alertRule":"prod-app-service-response-time-high","severity":"Sev1","signalType":"Metric","monitorCondition":"Fired","monitoringService":"Platform","firedDateTime":"2026-09-24T05:12:33.481Z"},"customProperties":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"},"alertContext":{}}}'
+curl -sS -X POST "$BASE/azure" -H 'Content-Type: application/json' -d '{"schemaId":"azureMonitorCommonAlertSchema","data":{"essentials":{"alertId":"/subscriptions/4c9e2a1f-8b3d-4e7c-9f1a-2b6d8e3c5a9f/providers/Microsoft.AlertsManagement/alerts/7f3a9c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","alertRule":"prod-app-service-response-time-high","severity":"Sev1","signalType":"Metric","monitorCondition":"Fired","monitoringService":"Platform","firedDateTime":"2026-09-24T05:12:33.481Z"},"customProperties":{"service":"client-example-alert-integration","category":"service_interruption","environment":"production"},"alertContext":{}}}'
 
 # Datadog
-curl -sS -X POST "$BASE/datadog" -H 'Content-Type: application/json' -d '{"event_name":"prod-web high memory usage","trigger_name":"avg(last_5m):avg:system.mem.pct_usable{env:production} < 0.1","transition":"Triggered","alert_id":"148502937","service":"client-medlineprod-alert-integration","category":"service_interruption","tags":"env:production,severity:1,team:sre"}'
+curl -sS -X POST "$BASE/datadog" -H 'Content-Type: application/json' -d '{"event_name":"prod-web high memory usage","trigger_name":"avg(last_5m):avg:system.mem.pct_usable{env:production} < 0.1","transition":"Triggered","alert_id":"148502937","service":"client-example-alert-integration","category":"service_interruption","tags":"env:production,severity:1,team:sre"}'
 
 # Elasticsearch
-curl -sS -X POST "$BASE/elasticsearch" -H 'Content-Type: application/json' -d '{"rule_id":"a8f2c9e1-3b7d-4f6a-9c1e-8d2b5f7a3c9e","rule_name":"prod-cluster-disk-watermark-exceeded","trigger_name":"disk.watermark.flood_stage","state":"ACTIVE","alert_id":"ZQ79cZ0B6qTDiYX-WKue","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
+curl -sS -X POST "$BASE/elasticsearch" -H 'Content-Type: application/json' -d '{"rule_id":"a8f2c9e1-3b7d-4f6a-9c1e-8d2b5f7a3c9e","rule_name":"prod-cluster-disk-watermark-exceeded","trigger_name":"disk.watermark.flood_stage","state":"ACTIVE","alert_id":"ZQ79cZ0B6qTDiYX-WKue","severity":"1","service":"client-example-alert-integration","category":"service_interruption"}'
 
 # GCP Cloud Monitoring
-curl -sS -X POST "$BASE/gcp" -H 'Content-Type: application/json' -d '{"incident":{"incident_id":"0.mzq9x7k2j8h4","state":"open","severity":"critical","policy_name":"prod-api-5xx-error-rate","condition_name":"5xx error rate above 5% for 5 minutes","resource":{"type":"gce_instance","labels":{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}},"started_at":1758700800},"version":"1.2"}'
+curl -sS -X POST "$BASE/gcp" -H 'Content-Type: application/json' -d '{"incident":{"incident_id":"0.mzq9x7k2j8h4","state":"open","severity":"critical","policy_name":"prod-api-5xx-error-rate","condition_name":"5xx error rate above 5% for 5 minutes","resource":{"type":"gce_instance","labels":{"service":"client-example-alert-integration","category":"service_interruption","environment":"production"}},"started_at":1758700800},"version":"1.2"}'
 
 # Icinga
-curl -sS -X POST "$BASE/icinga" -H 'Content-Type: application/json' -d '{"notification_type":"PROBLEM","host_name":"prod-db-primary-01","host_display_name":"prod-db-primary-01.medlineprod.internal","host_state":"UP","service_name":"postgres-replication-lag","service_state":"CRITICAL","vars":{"service":"client-medlineprod-alert-integration","environment":"production"}}'
+curl -sS -X POST "$BASE/icinga" -H 'Content-Type: application/json' -d '{"notification_type":"PROBLEM","host_name":"prod-db-primary-01","host_display_name":"prod-db-primary-01.example.internal","host_state":"UP","service_name":"postgres-replication-lag","service_state":"CRITICAL","vars":{"service":"client-example-alert-integration","environment":"production"}}'
 
 # OpenObserve
-curl -sS -X POST "$BASE/openobserve" -H 'Content-Type: application/json' -d '{"short_description":"prod-api-gateway: p99 latency above 2000ms","description":"p99 latency has been above 2000ms for 5 minutes","urgency":"1","impact":"1","correlation_id":"9f3a7c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","caller_id":"openobserve","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production"}'
+curl -sS -X POST "$BASE/openobserve" -H 'Content-Type: application/json' -d '{"short_description":"prod-api-gateway: p99 latency above 2000ms","description":"p99 latency has been above 2000ms for 5 minutes","urgency":"1","impact":"1","correlation_id":"9f3a7c2e-4b1d-4e8a-9c3f-2b8d5e6f1a9c","caller_id":"openobserve","service":"client-example-alert-integration","category":"service_interruption","environment":"production"}'
 
 # OpenSearch
-curl -sS -X POST "$BASE/opensearch" -H 'Content-Type: application/json' -d '{"monitor_id":"T3x9mZQBv8h5k2j4L7n1","monitor_name":"prod-cluster-jvm-heap-usage-critical","trigger_name":"jvm-heap-above-90pct","state":"ACTIVE","alert_id":"xY29Y5oB7fN3k1L8Qm4R","severity":"1","service":"client-medlineprod-alert-integration","category":"service_interruption"}'
+curl -sS -X POST "$BASE/opensearch" -H 'Content-Type: application/json' -d '{"monitor_id":"T3x9mZQBv8h5k2j4L7n1","monitor_name":"prod-cluster-jvm-heap-usage-critical","trigger_name":"jvm-heap-above-90pct","state":"ACTIVE","alert_id":"xY29Y5oB7fN3k1L8Qm4R","severity":"1","service":"client-example-alert-integration","category":"service_interruption"}'
 
 # Prometheus Alertmanager (one id per alert in "alerts")
-curl -sS -X POST "$BASE/prometheus" -H 'Content-Type: application/json' -d '{"receiver":"sre-alert-integration","status":"firing","alerts":[{"status":"firing","labels":{"alertname":"PodCrashLoopBackOff","severity":"critical","service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production","namespace":"medlineprod"},"annotations":{"summary":"Pod restarted 5 times in 10 minutes"},"startsAt":"2026-09-24T05:12:33Z","fingerprint":"a1b2c3d4e5f6a7b8"}]}'
+curl -sS -X POST "$BASE/prometheus" -H 'Content-Type: application/json' -d '{"receiver":"sre-alert-integration","status":"firing","alerts":[{"status":"firing","labels":{"alertname":"PodCrashLoopBackOff","severity":"critical","service":"client-example-alert-integration","category":"service_interruption","environment":"production","namespace":"example"},"annotations":{"summary":"Pod restarted 5 times in 10 minutes"},"startsAt":"2026-09-24T05:12:33Z","fingerprint":"a1b2c3d4e5f6a7b8"}]}'
 
 # Site24x7 (needs SITE24X7_ALERT_CONFIG={"TagList":{"Service":"svc","Category":"cat","Environment":"env"}})
-curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STATUS":"DOWN","MONITORNAME":"prod-medlineprod-api-https-check","MONITOR_ID":"100004312589","TAGS":["svc:client-medlineprod-alert-integration","cat:service_interruption","env:production"]}'
+curl -sS -X POST "$BASE/site24x7" -H 'Content-Type: application/json' -d '{"STATUS":"DOWN","MONITORNAME":"prod-example-api-https-check","MONITOR_ID":"100004312589","TAGS":["svc:client-example-alert-integration","cat:service_interruption","env:production"]}'
 ```
 
 ## Deploying on Choreo

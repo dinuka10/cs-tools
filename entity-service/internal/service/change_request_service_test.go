@@ -31,6 +31,7 @@ import (
 // whose unconfigured methods panic if called -- same convention as
 // stubIncidentRepo (incident_service_test.go).
 type stubChangeRequestRepo struct {
+	createChangeRequest               func(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error)
 	createChangeRequestFromServiceNow func(ctx context.Context, req domain.CreateChangeRequestRequest, id, number, createdBy string) (domain.CreateChangeRequestResponse, error)
 	patchChangeRequest                func(ctx context.Context, id string, req domain.PatchChangeRequestRequest, email string) (domain.ChangeRequest, error)
 	getChangeRequestApprovals         func(ctx context.Context, id string) (domain.ChangeRequestApprovals, error)
@@ -71,6 +72,13 @@ func (s *stubChangeRequestRepo) CreateChangeRequestFromServiceNow(ctx context.Co
 		return s.createChangeRequestFromServiceNow(ctx, req, id, number, createdBy)
 	}
 	panic("CreateChangeRequestFromServiceNow called unexpectedly: Postgres must stay untouched when ServiceNow never accepts the change request")
+}
+
+func (s *stubChangeRequestRepo) CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest, createdBy string) (domain.CreateChangeRequestResponse, error) {
+	if s.createChangeRequest != nil {
+		return s.createChangeRequest(ctx, req, createdBy)
+	}
+	panic("CreateChangeRequest called unexpectedly")
 }
 
 // stubMirrorChangeRequestService embeds ChangeRequestService (nil) and

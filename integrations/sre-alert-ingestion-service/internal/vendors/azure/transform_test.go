@@ -107,7 +107,7 @@ func TestTransform_CostAlertUsesBudgetName(t *testing.T) {
 
 func TestTransform_CustomPropertiesSupplyFields(t *testing.T) {
 	props := map[string]any{
-		"service":     "client-medlineprod-alert-integration",
+		"service":     "client-example-alert-integration",
 		"category":    "service_interruption",
 		"environment": "production",
 	}
@@ -116,8 +116,8 @@ func TestTransform_CustomPropertiesSupplyFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
 	}
-	if a.Service != "client-medlineprod-alert-integration" {
-		t.Errorf("Service = %q, want client-medlineprod-alert-integration", a.Service)
+	if a.Service != "client-example-alert-integration" {
+		t.Errorf("Service = %q, want client-example-alert-integration", a.Service)
 	}
 	if a.Category != "service_interruption" {
 		t.Errorf("Category = %q, want service_interruption", a.Category)
@@ -155,7 +155,7 @@ func TestTransform_DefaultsWhenNothingProvided(t *testing.T) {
 }
 
 func TestTransform_ConfigOverridesBeatDefaults(t *testing.T) {
-	cfg := Config{"environment": "staging", "service": "client-medline"}
+	cfg := Config{"environment": "staging", "service": "client-example"}
 	raw := sampleEnvelope(map[string]any{}, nil, nil)
 	a, err := Transform(raw, cfg)
 	if err != nil {
@@ -164,8 +164,8 @@ func TestTransform_ConfigOverridesBeatDefaults(t *testing.T) {
 	if a.Environment != "staging" {
 		t.Errorf("Environment = %q, want staging", a.Environment)
 	}
-	if a.Service != "client-medline" {
-		t.Errorf("Service = %q, want client-medline", a.Service)
+	if a.Service != "client-example" {
+		t.Errorf("Service = %q, want client-example", a.Service)
 	}
 }
 

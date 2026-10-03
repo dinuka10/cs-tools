@@ -176,6 +176,12 @@ schedule `0 3 * * *`. The Go port of ServiceNow's `Calculate Availability`
 job, which has run nightly since 2022-11-01 and whose 212,904 rows the Cloud
 Status Dashboard reads on every page load.
 
+**Off unless `AVAILABILITY_RECALC_ENABLED=true`** (default false): neither the client nor the
+task is created otherwise. ServiceNow's "Calculate Availability" job keeps writing the same
+table through csm-sync-service, and `service_availability` has no unique constraint on a
+period's natural key, so both running can leave two rows for one period. Turn it on in the
+same change that switches ServiceNow's job off (the `CLOUD_STATUS_ENABLED` pattern).
+
 *** THIS IS THE PRODUCER FOR THREE ALREADY-PORTED ENDPOINTS. ***
 `/cloud-status/monitors`, `/availabilities` and `/availability-history` all
 read that table and were ported long before anything wrote it: the rows come

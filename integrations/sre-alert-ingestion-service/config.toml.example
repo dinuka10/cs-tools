@@ -53,6 +53,9 @@ query_timeout = "1.5s"
 claim_timeout = "5s"
 # How long a throttled write retries before the filler row; must stay under alerts-core's gap_timeout (10m).
 write_deadline = "5m"
+# Read every inserted row back before answering 201. Costs 2 RU per alert; a Cosmos DB write is
+# already durable when acknowledged, and alerts-core waits on an id it can't see yet.
+read_back = false
 
 [cassandra]
 # Startup connection retry, so a transient blip doesn't crash-loop the pod.

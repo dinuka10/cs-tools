@@ -79,6 +79,7 @@ func TestIncidentPriorityToEnum(t *testing.T) {
 // unconfigured methods panic if called -- same convention as stubCaseRepo
 // (case_service_test.go).
 type stubIncidentRepo struct {
+	createIncident               func(ctx context.Context, req domain.CreateIncidentRequest, createdBy string) (domain.CreateIncidentResponse, error)
 	createIncidentFromServiceNow func(ctx context.Context, req domain.CreateIncidentRequest, id, number, createdBy string) (domain.CreateIncidentResponse, error)
 	createIncidentComment        func(ctx context.Context, incidentID string, commentType domain.CommentType, content, createdBy string) (domain.CaseComment, error)
 	getIncidentByID              func(ctx context.Context, id string) (domain.IncidentView, error)
@@ -110,6 +111,12 @@ func (s *stubIncidentRepo) CreateIncidentFromServiceNow(ctx context.Context, req
 		return s.createIncidentFromServiceNow(ctx, req, id, number, createdBy)
 	}
 	panic("CreateIncidentFromServiceNow called unexpectedly: Postgres must stay untouched when ServiceNow never accepts the incident")
+}
+func (s *stubIncidentRepo) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest, createdBy string) (domain.CreateIncidentResponse, error) {
+	if s.createIncident != nil {
+		return s.createIncident(ctx, req, createdBy)
+	}
+	panic("CreateIncident called unexpectedly")
 }
 
 // stubMirrorIncidentService embeds IncidentService (nil) and overrides only

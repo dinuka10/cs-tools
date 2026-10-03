@@ -28,7 +28,7 @@ func TestTransform_CanonicalExample(t *testing.T) {
 		"state": "ACTIVE",
 		"alert_id": "ZQ79cZ0B6qTDiYX-WKue",
 		"severity": "1",
-		"service": "client-medlineprod-alert-integration",
+		"service": "client-example-alert-integration",
 		"environment": "production",
 		"category": "service_interruption",
 		"source": "ElasticSearch"
@@ -40,7 +40,7 @@ func TestTransform_CanonicalExample(t *testing.T) {
 	}
 
 	want := Alert{
-		Service:          "client-medlineprod-alert-integration",
+		Service:          "client-example-alert-integration",
 		MetricName:       "ElasticSearch Alert: Global-Error-Threshold (Elasticsearch)",
 		Severity:         "Critical",
 		Category:         "service_interruption",

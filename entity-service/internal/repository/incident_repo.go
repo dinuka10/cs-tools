@@ -142,6 +142,15 @@ type IncidentRepository interface {
 	// backing column (work_item.assignment_group_id, migration 0075) and
 	// IS written here.
 	CreateIncidentFromServiceNow(ctx context.Context, req domain.CreateIncidentRequest, id, number, createdBy string) (domain.CreateIncidentResponse, error)
+	// CreateIncident inserts a new incident row (both work_item and
+	// "incident") for the plain-Postgres data source (no ServiceNow at all)
+	// -- createIncidentPortalQuery's own doc comment has the full
+	// field-by-field reasoning, which mirrors CreateIncidentFromServiceNow's
+	// exactly except identity (id/number) is generated here via
+	// gen_random_uuid()/next_portal_work_item_number() instead of being
+	// supplied by a prior ServiceNow response, and createdBy is the calling
+	// user's own resolved email rather than ServiceNow's echoed value.
+	CreateIncident(ctx context.Context, req domain.CreateIncidentRequest, createdBy string) (domain.CreateIncidentResponse, error)
 }
 
 type incidentRepo struct {
@@ -727,6 +736,93 @@ func (r *incidentRepo) CreateIncidentComment(ctx context.Context, incidentID str
 	c.Type = caseCommentEnumType[typeRaw]
 	c.CreatedBy = domain.NewUserReference("", createdByEmail, "")
 	return c, nil
+}
+
+// createIncidentPortalQuery is CreateIncident's (the plain-Postgres,
+// caller-initiated path) query -- structurally identical to
+// createIncidentFromServiceNowQuery except id/number are generated here
+// (gen_random_uuid()/next_portal_work_item_number(), migration 0140) instead
+// of supplied by a prior ServiceNow response. incident.state is left to its
+// own column default ('NEW'), same reasoning createIncidentFromServiceNowQuery's
+// own doc comment gives.
+//
+// Column/output order matches the trailing SELECT exactly.
+const createIncidentPortalQuery = `
+	WITH inserted_work_item AS (
+		INSERT INTO work_item (
+			id, created_on, updated_on, created_by, updated_by,
+			number, subject, type, parent_id, assignment_group_id
+		)
+		VALUES (
+			gen_random_uuid(), NOW(), NOW(), $1, $1,
+			next_portal_work_item_number(), $2, 'INCIDENT'::work_item_type_enum, $3::uuid, $4::uuid
+		)
+		RETURNING id, number, subject, created_on, updated_on, created_by
+	),
+	inserted_incident AS (
+		INSERT INTO incident (
+			id, caller_id, category, impact, urgency,
+			service_id, service_offering_id, contact_type,
+			change_request_id, caused_by_id, parent_incident_id, problem_id,
+			opened_on, correlation_id, environment
+		)
+		SELECT id, $5::uuid, $6::incident_category_enum, $7::incident_impact_enum, $8::incident_urgency_enum,
+		       $9::uuid, $10::uuid, $11::incident_contact_type_enum,
+		       $12::uuid, $13::uuid, $14::uuid, $15::uuid,
+		       NOW(), $16, $17
+		FROM inserted_work_item
+		RETURNING id
+	)
+	SELECT iwi.id, iwi.number, iwi.subject, iwi.created_on, iwi.updated_on, iwi.created_by
+	FROM inserted_work_item iwi
+	JOIN inserted_incident ii ON ii.id = iwi.id`
+
+// CreateIncident implements IncidentRepository.
+func (r *incidentRepo) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest, createdBy string) (domain.CreateIncidentResponse, error) {
+	var contactType *string
+	if req.ContactType != nil {
+		v := incidentContactTypeToEnum(*req.ContactType)
+		contactType = &v
+	}
+
+	var (
+		outID, outNumber, outSubject, outCreatedBy string
+		outCreatedOn, outUpdatedOn                 time.Time
+	)
+	err := r.db.QueryRow(ctx, createIncidentPortalQuery,
+		createdBy, req.Subject, req.ParentID, req.AssignmentGroupID,
+		req.CallerID, string(req.Category), string(req.Impact), string(req.Urgency),
+		req.ServiceID, req.ServiceOfferingID, contactType,
+		req.ChangeRequestID, req.CausedByID, req.ParentIncidentID, req.ProblemID,
+		req.CorrelationID, req.Environment,
+	).Scan(&outID, &outNumber, &outSubject, &outCreatedOn, &outUpdatedOn, &outCreatedBy)
+	if err != nil {
+		// incident_deny_all_insert (migration 0148) permits only an internal
+		// caller -- incident has no project concept at all, so there is no
+		// project-member OR-branch the way case/change_request have.
+		// POST /incidents is already gated internalOnly at the route, so this
+		// should not be reachable in practice, but map it defensively rather
+		// than leaving a theoretical 42501 to surface as a raw 500.
+		if IsRLSPolicyViolation(err) {
+			return domain.CreateIncidentResponse{}, &apierror.NotFoundError{Msg: "incident not found"}
+		}
+		if pgErr := (*pgconn.PgError)(nil); errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "23503": // foreign_key_violation -- one of the referenced IDs does not exist
+				return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "one or more referenced IDs do not exist: " + pgErr.Detail}
+			case "P0001": // raise_exception from integrity triggers
+				return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: pgErr.Message}
+			}
+		}
+		return domain.CreateIncidentResponse{}, fmt.Errorf("create incident: %w", err)
+	}
+
+	resp := domain.CreateIncidentResponse{Message: "Incident created successfully."}
+	resp.Incident.ID = outID
+	resp.Incident.Number = outNumber
+	resp.Incident.CreatedOn = outCreatedOn.UTC().Format(time.RFC3339)
+	resp.Incident.CreatedBy = outCreatedBy
+	return resp, nil
 }
 
 // createIncidentFromServiceNowQuery inserts both halves of an incident row

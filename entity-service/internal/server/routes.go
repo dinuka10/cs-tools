@@ -1434,7 +1434,16 @@ func NewRouter(db *pgxpool.Pool, cfg *config.Config) (http.Handler, func()) {
 	mux.HandleFunc("GET /cases/{id}/escalations", caseEscalationHandler.SearchCaseEscalations)
 	mux.HandleFunc("POST /cases/{id}/escalations", caseEscalationHandler.CreateCaseEscalation)
 
-	mux.HandleFunc("POST /change-requests", changeRequestHandler.CreateChangeRequest)
+	// internalOnly: migration 0145's change_request_write_internal_only RLS
+	// policy only ever permits an internal caller to INSERT into
+	// change_request (CreateChangeRequestRequest has no projectId field at
+	// all to check membership against) -- same posture already established
+	// for POST /incidents and POST /problems below. A non-internal caller
+	// reaching changeRequestService.CreateChangeRequest's plain-Postgres
+	// path would otherwise fail the RLS check with a raw 42501 (mapped to a
+	// clean NotFoundError, but still a request that was never going to
+	// succeed) -- gating here rejects it before any write is attempted.
+	mux.HandleFunc("POST /change-requests", internalOnly(accessSvc, changeRequestHandler.CreateChangeRequest))
 	mux.HandleFunc("POST /change-requests/search", changeRequestHandler.SearchChangeRequests)
 	mux.HandleFunc("POST /change-requests/aggregate", changeRequestHandler.AggregateChangeRequests)
 	mux.HandleFunc("GET /change-requests/{id}", changeRequestHandler.GetChangeRequest)

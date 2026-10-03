@@ -77,6 +77,8 @@ type StoreConfig struct {
 	QueryTimeout    Duration `toml:"query_timeout"`
 	ClaimTimeout    Duration `toml:"claim_timeout"`
 	WriteDeadline   Duration `toml:"write_deadline"`
+	// ReadBack reads every inserted row back before answering 201: 2 RU per alert.
+	ReadBack bool `toml:"read_back"`
 }
 
 // CassandraConfig tunes startup connection retry, matching sre-alert-core-service.

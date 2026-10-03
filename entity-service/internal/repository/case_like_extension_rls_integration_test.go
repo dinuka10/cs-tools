@@ -34,6 +34,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
@@ -142,3 +143,48 @@ func TestCaseLikeExtensionRLSIntegration_MemberSeesAllThreeStrangerSeesNone(t *t
 		})
 	}
 }
+
+func TestCaseLikeExtension_UpdateCase_SucceedsForNonCaseTypes(t *testing.T) {
+	pool := caseStatsPool(t)
+	seedCaseLikeExtensionFixture(t, pool)
+	repo := repository.NewCaseRepository(repository.NewScoped(pool))
+
+	closed := domain.CaseStateClosed
+	cause := domain.CaseCauseUnknown
+	closeNotes := "Closing test non-case work item"
+
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{"engagement", cleEngagement},
+		{"service_request", cleServiceReq},
+		{"security_report_analysis", cleSecReport},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name+"/member updates state to closed", func(t *testing.T) {
+			ctx := repository.WithCallerIdentity(context.Background(), repository.SearchScope{Unrestricted: false, ViewerEmail: cleMember})
+			req := domain.UpdateCaseRequest{
+				ID:         c.id,
+				State:      &closed,
+				Cause:      &cause,
+				CloseNotes: &closeNotes,
+			}
+			updated, oldSev, err := repo.UpdateCase(ctx, req)
+			if err != nil {
+				t.Fatalf("UpdateCase(%s) as registered project member: unexpected error = %v", c.name, err)
+			}
+			if oldSev != nil {
+				t.Errorf("UpdateCase(%s) oldSeverity = %v, want nil", c.name, oldSev)
+			}
+			if updated.State == nil || *updated.State != domain.CaseStateClosed {
+				t.Errorf("UpdateCase(%s) State = %v, want closed", c.name, updated.State)
+			}
+			if updated.ClosedOn == nil {
+				t.Errorf("UpdateCase(%s) ClosedOn is nil, want timestamp", c.name)
+			}
+		})
+	}
+}
+

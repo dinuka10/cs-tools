@@ -32,6 +32,7 @@ import (
 // unconfigured methods panic if called -- same convention as
 // stubIncidentRepo (incident_service_test.go).
 type stubProblemRepo struct {
+	createProblem               func(ctx context.Context, req domain.CreateProblemRequest, createdBy string) (domain.ProblemDetail, error)
 	createProblemFromServiceNow func(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error)
 	getProblem                  func(ctx context.Context, id string) (domain.ProblemDetail, error)
 	updateProblemFields         func(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error)
@@ -54,6 +55,12 @@ func (s *stubProblemRepo) CreateProblemFromServiceNow(ctx context.Context, req d
 		return s.createProblemFromServiceNow(ctx, req, id, number, createdBy, state)
 	}
 	panic("CreateProblemFromServiceNow called unexpectedly: Postgres must stay untouched when ServiceNow never accepts the problem")
+}
+func (s *stubProblemRepo) CreateProblem(ctx context.Context, req domain.CreateProblemRequest, createdBy string) (domain.ProblemDetail, error) {
+	if s.createProblem != nil {
+		return s.createProblem(ctx, req, createdBy)
+	}
+	panic("CreateProblem called unexpectedly")
 }
 func (s *stubProblemRepo) UpdateProblemFields(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error) {
 	if s.updateProblemFields != nil {

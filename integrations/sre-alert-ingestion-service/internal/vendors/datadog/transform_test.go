@@ -125,13 +125,13 @@ func TestTransform_TagAliasesResolve(t *testing.T) {
 	a, err := Transform(samplePayload(baseFields(map[string]string{
 		"service":  "",
 		"category": "",
-		"tags":     "svc:client-medline,sev:2,environment:staging",
+		"tags":     "svc:client-example,sev:2,environment:staging",
 	})), Config{})
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
 	}
-	if a.Service != "client-medline" {
-		t.Errorf("Service = %q, want client-medline (svc: alias)", a.Service)
+	if a.Service != "client-example" {
+		t.Errorf("Service = %q, want client-example (svc: alias)", a.Service)
 	}
 	if a.Severity != "Major" {
 		t.Errorf("Severity = %q, want Major (sev: alias)", a.Severity)

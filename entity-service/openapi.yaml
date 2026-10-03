@@ -1501,6 +1501,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AvailabilitySweepResult'
+        "401":
+          description: >-
+            No valid internal client credential. The route is internal-only
+            (internalOnly in routes.go); customer user tokens are refused.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "403":
+          description: The caller is authenticated but is not an internal caller.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        "503":
+          description: The caller's identity could not be resolved right now; retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
         "500":
           description: InternalServerError.
           content:

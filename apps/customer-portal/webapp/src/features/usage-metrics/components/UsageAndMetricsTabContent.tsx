@@ -256,7 +256,9 @@ export default function UsageAndMetricsTabContent(): JSX.Element {
             </Box>
           </Box>
           {/* Fade + arrow on each edge that still hides a tab, so a cut-off
-              tab reads as "more to scroll to" instead of a hard clip. */}
+              tab reads as "more to scroll to" instead of a hard clip.
+              Uses CSS variable --oxygen-palette-background-paper so the
+              fade seamlessly adapts to both light and dark color schemes. */}
           {canScrollLeft && (
             <Box
               sx={{
@@ -267,7 +269,7 @@ export default function UsageAndMetricsTabContent(): JSX.Element {
                 display: "flex",
                 alignItems: "center",
                 pr: 2,
-                background: `linear-gradient(to right, ${theme.palette.background.paper} 40%, transparent)`,
+                background: `linear-gradient(to right, var(--oxygen-palette-background-paper, ${theme.palette.background.paper}) 40%, transparent)`,
               }}
             >
               <IconButton
@@ -290,7 +292,7 @@ export default function UsageAndMetricsTabContent(): JSX.Element {
                 display: "flex",
                 alignItems: "center",
                 pl: 2,
-                background: `linear-gradient(to left, ${theme.palette.background.paper} 40%, transparent)`,
+                background: `linear-gradient(to left, var(--oxygen-palette-background-paper, ${theme.palette.background.paper}) 40%, transparent)`,
               }}
             >
               <IconButton

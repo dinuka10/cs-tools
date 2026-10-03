@@ -384,12 +384,33 @@ func (s *incidentService) CreateIncident(ctx context.Context, req domain.CreateI
 		}
 		return s.createIncidentSNFirst(ctx, req)
 	}
-	// CreateIncident is not supported for the plain PostgreSQL data source:
-	// like CaseRepository.CreateCase, work_item.number has no DB default and
-	// no backing sequence anywhere in migrations/.
-	return domain.CreateIncidentResponse{}, &apierror.ServiceUnavailableError{
-		Msg: "creating an incident is not available on this data source: work_item.number has no generation strategy defined here",
+	if req.ConfigurationItemID != nil {
+		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "configurationItemId is not supported for this data source"}
 	}
+	return s.createIncidentPortal(ctx, req)
+}
+
+// createIncidentPortal implements CreateIncident's plain-Postgres path
+// (s.snMirror == nil, no ServiceNow at all) -- unblocked by migration 0140's
+// next_portal_work_item_number(), the same product decision that used to
+// defer this (see CLAUDE.md, "CreateCase and case numbers"). createdBy is
+// resolved from the caller's own JWT email claim -- the same
+// middleware.UserIDTokenFromContext + emailFromJWT chain
+// problemService.createProblemSNFirst already uses -- since there is no
+// ServiceNow response to take it from on this path. Unlike createIncidentSNFirst,
+// there is no publishIncidentCreatedEvent call here yet: that helper's own
+// payload assumes the ServiceNow-sourced fields this path never has (see its
+// own doc comment) -- left as a follow-up rather than guessed at.
+func (s *incidentService) createIncidentPortal(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.CreateIncidentResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	createdBy, err := emailFromJWT(token)
+	if err != nil {
+		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	return s.repo.CreateIncident(ctx, req, createdBy)
 }
 
 // createIncidentSNFirst implements CreateIncident's

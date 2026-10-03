@@ -46,7 +46,7 @@ func sampleAlarm(overrides map[string]any) map[string]any {
 		"AlarmName":        "HighCPUAlarm",
 		"AlarmArn":         "arn:aws:cloudwatch:us-east-1:123456789012:alarm:HighCPUAlarm",
 		"NewStateValue":    "ALARM",
-		"AlarmDescription": `{"service":"client-medlineprod-alert-integration","category":"service_interruption","environment":"production","severity":"critical"}`,
+		"AlarmDescription": `{"service":"client-example-alert-integration","category":"service_interruption","environment":"production","severity":"critical"}`,
 	}
 	for k, v := range overrides {
 		alarm[k] = v
@@ -59,7 +59,7 @@ func TestTransform_BasicFieldsFromAlarmDescription(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
 	}
-	if a.Service != "client-medlineprod-alert-integration" {
+	if a.Service != "client-example-alert-integration" {
 		t.Errorf("Service = %q", a.Service)
 	}
 	if a.Category != "service_interruption" {
@@ -158,7 +158,7 @@ func TestTransform_AlarmDescriptionBeatsConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Transform: %v", err)
 	}
-	if a.Service != "client-medlineprod-alert-integration" {
+	if a.Service != "client-example-alert-integration" {
 		t.Errorf("Service = %q, want the AlarmDescription value to beat config", a.Service)
 	}
 }

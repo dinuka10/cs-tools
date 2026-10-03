@@ -65,10 +65,6 @@ func (c *captureAvailabilityRepo) OutagesFor(_ context.Context, subjectID string
 	return out, nil
 }
 
-func (c *captureAvailabilityRepo) ScheduleSpans(context.Context, string) ([]repository.ScheduleSpanRow, error) {
-	return nil, nil
-}
-
 func (c *captureAvailabilityRepo) UpsertFixed(_ context.Context, rows []repository.ComputedAvailabilityRow) error {
 	c.written = append(c.written, rows...)
 	return nil
@@ -307,5 +303,46 @@ func TestAvailabilitySweep_CIOnlySubjectFails(t *testing.T) {
 	}
 	if len(repo.written) == 0 {
 		t.Error("the offering subject beside it was not written")
+	}
+}
+
+// *** A COMMITMENT ON ANY SCHEDULE OTHER THAN "24 x 7" MUST FAIL, NOT GUESS. ***
+// Its spans are not synced, so computing it as always-on would publish a
+// wrong figure silently. The sweep counts it as failed and still writes the
+// subjects it can compute.
+func TestAvailabilitySweep_ScheduleGuard(t *testing.T) {
+	str := func(s string) *string { return &s }
+	sched := str("38fa64ed-c0a8-0164-00f4-a5724b0434b8")
+	repo := &captureAvailabilityRepo{subjects: []repository.AvailabilitySubject{
+		{ServiceOfferingID: str("o-null"), ServiceCommitmentID: "c1", TargetPercent: 100},
+		{ServiceOfferingID: str("o-24x7"), ServiceCommitmentID: "c2", TargetPercent: 100, ScheduleID: sched, ScheduleName: str("24 x 7")},
+		{ServiceOfferingID: str("o-24X7"), ServiceCommitmentID: "c3", TargetPercent: 100, ScheduleID: sched, ScheduleName: str("24X7")},
+		{ServiceOfferingID: str("o-hours"), ServiceCommitmentID: "c4", TargetPercent: 100, ScheduleID: str("other"), ScheduleName: str("8-5 weekdays")},
+		{ServiceOfferingID: str("o-gone"), ServiceCommitmentID: "c5", TargetPercent: 100, ScheduleID: str("missing")},
+	}}
+	svc, err := NewAvailabilityService(repo, "UTC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := svc.Sweep(context.Background(), time.Date(2026, 10, 2, 3, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	if res.Failed != 2 {
+		t.Errorf("failed = %d, want 2 (the business-hours schedule and the unresolvable one)", res.Failed)
+	}
+	wrote := map[string]bool{}
+	for _, r := range repo.written {
+		wrote[*r.ServiceOfferingID] = true
+	}
+	for _, ok := range []string{"o-null", "o-24x7", "o-24X7"} {
+		if !wrote[ok] {
+			t.Errorf("%s: no rows written, want them computed as 24x7", ok)
+		}
+	}
+	for _, bad := range []string{"o-hours", "o-gone"} {
+		if wrote[bad] {
+			t.Errorf("%s: rows written for a schedule that is not modelled", bad)
+		}
 	}
 }

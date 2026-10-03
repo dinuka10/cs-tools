@@ -26,6 +26,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
 
 func TestOnboardingStatusEnumLabels(t *testing.T) {
@@ -164,3 +165,186 @@ func TestOnboardingStatusLabelsMatchMigration(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateUpdateCaseFieldsForType(t *testing.T) {
+	sev := domain.CaseSeverityHigh
+	ws := domain.CaseWorkStateOngoing
+	resCode := domain.CaseResolutionCodeSolvedFixedBySupportGuidanceProvided
+
+	tests := []struct {
+		name          string
+		workItemType  string
+		req           domain.UpdateCaseRequest
+		state         string
+		wantErrSubstr string
+	}{
+		{
+			name:         "CASE allows severity, workState, and resolutionCode",
+			workItemType: "CASE",
+			req: domain.UpdateCaseRequest{
+				Severity:       &sev,
+				WorkState:      &ws,
+				ResolutionCode: &resCode,
+			},
+			state: "CLOSED",
+		},
+		{
+			name:         "SECURITY_REPORT_ANALYSIS rejects severity",
+			workItemType: "SECURITY_REPORT_ANALYSIS",
+			req: domain.UpdateCaseRequest{
+				Severity: &sev,
+			},
+			wantErrSubstr: "severity is only supported for cases",
+		},
+		{
+			name:         "SECURITY_REPORT_ANALYSIS rejects workState",
+			workItemType: "SECURITY_REPORT_ANALYSIS",
+			req: domain.UpdateCaseRequest{
+				WorkState: &ws,
+			},
+			wantErrSubstr: "workState is only supported for cases",
+		},
+		{
+			name:         "SECURITY_REPORT_ANALYSIS rejects resolutionCode",
+			workItemType: "SECURITY_REPORT_ANALYSIS",
+			req: domain.UpdateCaseRequest{
+				ResolutionCode: &resCode,
+			},
+			wantErrSubstr: "resolutionCode is only supported for cases",
+		},
+		{
+			name:          "SERVICE_REQUEST rejects severity",
+			workItemType:  "SERVICE_REQUEST",
+			req:           domain.UpdateCaseRequest{Severity: &sev},
+			wantErrSubstr: "severity is only supported for cases",
+		},
+		{
+			name:          "ENGAGEMENT rejects workState",
+			workItemType:  "ENGAGEMENT",
+			req:           domain.UpdateCaseRequest{WorkState: &ws},
+			wantErrSubstr: "workState is only supported for cases",
+		},
+		{
+			name:          "ANNOUNCEMENT rejects resolutionCode",
+			workItemType:  "ANNOUNCEMENT",
+			req:           domain.UpdateCaseRequest{ResolutionCode: &resCode},
+			wantErrSubstr: "resolutionCode is only supported for cases",
+		},
+		{
+			name:         "ANNOUNCEMENT allows CLOSED state",
+			workItemType: "ANNOUNCEMENT",
+			req:          domain.UpdateCaseRequest{},
+			state:        "CLOSED",
+		},
+		{
+			name:         "ANNOUNCEMENT allows OPEN state",
+			workItemType: "ANNOUNCEMENT",
+			req:          domain.UpdateCaseRequest{},
+			state:        "OPEN",
+		},
+		{
+			name:          "ANNOUNCEMENT rejects other states",
+			workItemType:  "ANNOUNCEMENT",
+			req:           domain.UpdateCaseRequest{},
+			state:         "WORK_IN_PROGRESS",
+			wantErrSubstr: "announcements only support state open or closed",
+		},
+		{
+			name:         "SECURITY_REPORT_ANALYSIS allows state change without case-only fields",
+			workItemType: "SECURITY_REPORT_ANALYSIS",
+			req:          domain.UpdateCaseRequest{},
+			state:        "CLOSED",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateUpdateCaseFieldsForType(tc.workItemType, tc.req, tc.state)
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantErrSubstr)
+			}
+			var ve *apierror.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+			}
+			if !strings.Contains(ve.Error(), tc.wantErrSubstr) {
+				t.Errorf("error = %q, want substring %q", ve.Error(), tc.wantErrSubstr)
+			}
+		})
+	}
+}
+
+func TestExtensionUpdateQueriesMatchMigrations(t *testing.T) {
+	raw0024, err := os.ReadFile("../../migrations/0024_work_item_extensions.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m0024 := string(raw0024)
+
+	queries := []struct {
+		name      string
+		query     string
+		tableName string
+		stateEnum string
+		causeEnum string
+	}{
+		{
+			name:      "security_report_analysis",
+			query:     updateSecurityReportAnalysisQuery,
+			tableName: "security_report_analysis",
+			stateEnum: "security_report_analysis_state_enum",
+			causeEnum: "security_report_analysis_cause_enum",
+		},
+		{
+			name:      "service_request",
+			query:     updateServiceRequestQuery,
+			tableName: "service_request",
+			stateEnum: "service_request_state_enum",
+			causeEnum: "service_request_cause_enum",
+		},
+		{
+			name:      "engagement",
+			query:     updateEngagementQuery,
+			tableName: "engagement",
+			stateEnum: "engagement_state_enum",
+			causeEnum: "engagement_cause_enum",
+		},
+		{
+			name:      "announcement",
+			query:     updateAnnouncementQuery,
+			tableName: "announcement",
+			stateEnum: "announcement_state_enum",
+			causeEnum: "announcement_cause_enum",
+		},
+	}
+
+	for _, q := range queries {
+		t.Run(q.name, func(t *testing.T) {
+			if !strings.Contains(m0024, q.tableName) {
+				t.Errorf("table %s not found in migration 0024", q.tableName)
+			}
+			if !strings.Contains(m0024, q.stateEnum) {
+				t.Errorf("state enum %s not found in migration 0024", q.stateEnum)
+			}
+			if !strings.Contains(m0024, q.causeEnum) {
+				t.Errorf("cause enum %s not found in migration 0024", q.causeEnum)
+			}
+			if !strings.Contains(q.query, "UPDATE "+q.tableName) {
+				t.Errorf("query does not update %s", q.tableName)
+			}
+			if !strings.Contains(q.query, q.stateEnum) {
+				t.Errorf("query does not cast to %s", q.stateEnum)
+			}
+			if !strings.Contains(q.query, q.causeEnum) {
+				t.Errorf("query does not cast to %s", q.causeEnum)
+			}
+		})
+	}
+}
+
