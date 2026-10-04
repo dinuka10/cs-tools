@@ -17,6 +17,8 @@
 package config
 
 import (
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
@@ -597,4 +599,57 @@ func TestLoad_SalesforceIngestRetryInterval(t *testing.T) {
 			t.Errorf("SALESFORCE_INGEST_RETRY_INTERVAL=%q -> %v, want %v", value, got, want)
 		}
 	}
+}
+
+// dsnSearchPath extracts the search_path value DSN embedded in its "options"
+// query parameter, so a test can assert on the schema alone rather than the
+// whole connection string.
+func dsnSearchPath(t *testing.T, dsn string) string {
+	t.Helper()
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse DSN %q: %v", dsn, err)
+	}
+	return strings.TrimPrefix(u.Query().Get("options"), "-c search_path=")
+}
+
+// TestConfig_DSN_SchemaFallsBackToDBUserPlusPublic pins DSN's search_path
+// behavior: an explicit DBSchema wins verbatim (no "public" appended — an
+// operator who set one is assumed to mean it), and an empty one falls back
+// to "DBUser,public" (no space — see DSN's own doc comment on why), Postgres'
+// own default search_path. "public"
+// must survive the fallback: entity-service's migrations create every table
+// unqualified, so every deployment's real tables live there, and an explicit
+// search_path replaces Postgres' own default rather than extending it — a
+// fallback of DBUser alone would make every one of those tables unresolvable.
+func TestConfig_DSN_SchemaFallsBackToDBUserPlusPublic(t *testing.T) {
+	base := baseValidConfig()
+	base.DBHost = "localhost"
+	base.DBPort = "5432"
+
+	t.Run("explicit schema wins, verbatim", func(t *testing.T) {
+		c := base
+		c.DBSchema = "csm"
+		if got := dsnSearchPath(t, c.DSN()); got != "csm" {
+			t.Errorf("search_path = %q, want %q", got, "csm")
+		}
+	})
+
+	t.Run("unset schema falls back to DBUser, public", func(t *testing.T) {
+		c := base
+		c.DBSchema = ""
+		want := c.DBUser + ",public"
+		if got := dsnSearchPath(t, c.DSN()); got != want {
+			t.Errorf("search_path = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("unset schema and unset DBUser falls back to public alone", func(t *testing.T) {
+		c := base
+		c.DBSchema = ""
+		c.DBUser = ""
+		if got := dsnSearchPath(t, c.DSN()); got != "public" {
+			t.Errorf("search_path = %q, want %q", got, "public")
+		}
+	})
 }

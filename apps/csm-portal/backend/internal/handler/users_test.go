@@ -70,6 +70,12 @@ func TestGetMe(t *testing.T) {
 
 	t.Run("upstream errors from the entity service are mapped correctly", func(t *testing.T) {
 		for _, tc := range upstreamErrorsGeneric("Failed to fetch the current user.") {
+			// "apierror 404" is excluded: GetMe deliberately maps a 404 to 403
+			// instead of the generic table's 404->404 pass-through, asserted
+			// in its own test below.
+			if tc.name == "apierror 404" {
+				continue
+			}
 			t.Run(tc.name, func(t *testing.T) {
 				t.Parallel()
 				entityClient := &mockEntityUserClient{
@@ -86,6 +92,28 @@ func TestGetMe(t *testing.T) {
 				assertContentType(t, w, "application/json")
 			})
 		}
+	})
+
+	// Regression guard: a caller authenticated by a valid JWT whose email has
+	// no "user" row at all (never provisioned downstream) made entity-service
+	// 404 GetUserMe. Passing that 404 straight through used to leave the
+	// webapp's profile-fetch hook with nothing to render and no 403 state to
+	// fall into, spinning forever instead. GetMe now maps it to the same 403
+	// the UI already knows how to show, while the real reason is still logged
+	// server-side.
+	t.Run("entity 404 (user not found) maps to 403, not 404", func(t *testing.T) {
+		entityClient := &mockEntityUserClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusNotFound}
+			},
+		}
+		h := NewUsersHandler(&mockSCIMClient{}, entityClient, testDirectory(t), false, "")
+		r := withUser(httptest.NewRequest(http.MethodGet, "/users/me", nil))
+		w := httptest.NewRecorder()
+		h.GetMe(w, r)
+		assertStatus(t, w, http.StatusForbidden)
+		assertErrorMessage(t, w, ErrMsgForbidden)
+		assertContentType(t, w, "application/json")
 	})
 
 	t.Run("returns email from JWT when SCIM returns no user", func(t *testing.T) {

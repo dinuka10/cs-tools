@@ -22,12 +22,26 @@
 export class ApiError extends Error {
   public readonly status: number;
   public readonly statusText: string;
+  /**
+   * The request's correlation ID, for a support "Tracking ID" copy affordance
+   * (see `@utils/correlationId`'s `getErrorReferenceId`). Prefer the value
+   * echoed back in the response's `X-CSM-Correlation-ID` header; fall back to
+   * the one this client generated and sent, which the backend logged under
+   * regardless of whether the response header made it back across CORS.
+   */
+  public readonly correlationId?: string;
 
-  constructor(status: number, statusText: string, message?: string) {
+  constructor(
+    status: number,
+    statusText: string,
+    message?: string,
+    correlationId?: string,
+  ) {
     super(message ?? `${status} ${statusText}`);
     this.name = "ApiError";
     this.status = status;
     this.statusText = statusText;
+    this.correlationId = correlationId;
   }
 }
 

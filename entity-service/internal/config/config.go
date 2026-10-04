@@ -64,6 +64,18 @@ type Config struct {
 	DBPassword string
 	DBName     string
 	DBSSLMode  string
+	// DBSchema pins the connection's search_path (see DSN) so a role whose
+	// native search_path would otherwise resolve to a different same-named
+	// schema, or to "public", lands in the intended one instead — same
+	// purpose as operations/csm-sync-service's own DB_SCHEMA. Left empty,
+	// DSN falls back to "DBUser,public" — Postgres' own default
+	// search_path, made explicit here rather than left implicit,
+	// since this is the one of the two services that also sets a
+	// connection-level option (jit=off) through the same mechanism. The
+	// "public" half of that fallback matters: entity-service's migrations
+	// create every table unqualified, so every deployment's real tables
+	// live there today.
+	DBSchema   string
 	ServerPort string
 	// HealthPort is the listen port for the separate, minimal health
 	// server (internal/server.NewHealthServer). It is deliberately NOT
@@ -414,6 +426,7 @@ func Load() *Config {
 		DBPassword:                               os.Getenv("DB_PASSWORD"),
 		DBName:                                   os.Getenv("DB_NAME"),
 		DBSSLMode:                                os.Getenv("DB_SSLMODE"),
+		DBSchema:                                 os.Getenv("DB_SCHEMA"),
 		ServerPort:                               getEnvOrDefault("SERVER_PORT", "8080"),
 		HealthPort:                               getEnvOrDefault("HEALTH_PORT", "8081"),
 		DataSource:                               DataSource(getEnvOrDefault("DATA_SOURCE", string(DataSourcePostgres))),
@@ -738,6 +751,14 @@ func (c *Config) SalesEntityConfigured() bool {
 }
 
 // DSN constructs a PostgreSQL connection string from the config fields.
+//
+// Pins search_path to DBSchema via the "options" connection parameter, the
+// same mechanism operations/csm-sync-service's own withSchema uses. When
+// DBSchema is unset, falls back to "DBUser,public" (or just "public" with
+// no DBUser) — Postgres' own default search_path, made explicit here rather
+// than left to that default, since setting search_path at all replaces it
+// rather than extending it, and every deployment's tables today live in
+// "public" (unqualified migrations, no deployment sets DB_SCHEMA yet).
 func (c *Config) DSN() string {
 	u := &url.URL{
 		Scheme: "postgres",
@@ -748,6 +769,36 @@ func (c *Config) DSN() string {
 	q := u.Query()
 	q.Set("sslmode", c.DBSSLMode)
 	u.RawQuery = q.Encode()
+
+	schema := c.DBSchema
+	if schema == "" {
+		// No schema configured -- mirror Postgres' own default search_path
+		// ("$user", public) explicitly, not just the "$user" half of it.
+		// An explicit search_path completely replaces Postgres' own
+		// default rather than extending it, and every deployment's tables
+		// today live in "public" (entity-service's migrations create them
+		// unqualified, and no deployment sets DB_SCHEMA yet) -- dropping
+		// "public" here would make every one of those tables unresolvable
+		// the moment this shipped. No space after the comma: the "options"
+		// connection parameter tokenizes on whitespace to separate multiple
+		// "-c name=value" entries, so a space here splits "public" off into
+		// its own (invalid) token and Postgres sees a truncated search_path
+		// value instead of the full list -- confirmed against a real
+		// connection, which rejected "<user>," as an invalid value.
+		if c.DBUser != "" {
+			schema = c.DBUser + ",public"
+		} else {
+			schema = "public"
+		}
+	}
+	// url.Values.Encode() would percent-encode the space in
+	// "-c search_path=..." as "+" (the HTML-form convention) -- pgconn's own
+	// URI parser does not decode "+" back to a space, so Postgres received a
+	// literal "+" and rejected it as an unrecognized configuration parameter
+	// (confirmed against a real connection). Escape by hand with %20
+	// instead, which pgconn does handle.
+	opts := strings.ReplaceAll(url.QueryEscape("-c search_path="+schema), "+", "%20")
+	u.RawQuery += "&options=" + opts
 	return u.String()
 }
 

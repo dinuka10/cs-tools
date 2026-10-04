@@ -197,6 +197,23 @@ func (h *UsersHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 
 	entityRaw, err := h.entity.GetUserMe(r.Context())
 	if err != nil {
+		// entity-service 404s GetUserMe when the caller's email has no "user"
+		// row at all -- a real, reported case (an authenticated JWT whose
+		// identity was never provisioned downstream). A bare 404 reaching the
+		// webapp here isn't "page not found" the way it is for a resource id
+		// in a URL; the frontend's data-fetching hook had nothing to render
+		// and nothing resembling the 403 state it already knows how to show,
+		// so it spun forever instead. Map it to 403 (the already-handled
+		// "you don't have permission" case) rather than passing a 404
+		// through that the caller can't act on and the UI doesn't expect
+		// for this endpoint. The real reason is still logged, at ERROR
+		// specifically so it's not lost alongside routine 403s.
+		var apiErr *apierror.Error
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			slog.ErrorContext(r.Context(), "entity GetUserMe: user not found", "userID", user.UserID)
+			writeError(w, http.StatusForbidden, ErrMsgForbidden)
+			return
+		}
 		slog.ErrorContext(r.Context(), "entity GetUserMe failed", "userID", user.UserID, "err", err)
 		// A caller cannot distinguish "no roles/team" from "upstream identity
 		// resolution failed" if this falls through to a 200 with zeroed

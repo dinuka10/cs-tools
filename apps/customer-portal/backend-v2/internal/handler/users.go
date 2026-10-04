@@ -19,10 +19,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/dto"
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/entity"
 	"github.com/wso2-open-operations/cs-tools/apps/customer-portal/backend-v2/internal/middleware"
@@ -87,6 +89,23 @@ func (h *UserHandler) GetMe(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.entity.GetMe(r.Context())
 	if err != nil {
+		// entity-service 404s GetMe when the caller's email has no "user" row
+		// at all -- a real, reported case (an authenticated JWT whose identity
+		// was never provisioned downstream). A bare 404 reaching the webapp
+		// here isn't "page not found" the way it is for a resource id in a
+		// URL; the frontend's data-fetching hook had nothing to render and
+		// nothing resembling the 403 state it already knows how to show, so
+		// it spun forever instead. Map it to 403 (the already-handled "you
+		// don't have permission" case) rather than passing a 404 through
+		// that the caller can't act on and the UI doesn't expect for this
+		// endpoint. The real reason is still logged, at ERROR specifically
+		// so it's not lost alongside routine 403s.
+		var apiErr *apierror.Error
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			slog.ErrorContext(r.Context(), "entity GetMe: user not found", "userID", user.UserID)
+			writeError(w, http.StatusForbidden, ErrMsgForbidden)
+			return
+		}
 		slog.ErrorContext(r.Context(), "entity GetMe failed", "userID", user.UserID, "err", summarizeErr(err))
 		mapUpstreamError(w, err, "Failed to retrieve user profile.")
 		return

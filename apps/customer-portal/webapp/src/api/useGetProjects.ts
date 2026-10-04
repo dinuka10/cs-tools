@@ -22,6 +22,7 @@ import {
 import { useAsgardeo } from "@asgardeo/react";
 import { useAuthApiClient } from "@/hooks/useAuthApiClient";
 import { ApiError } from "@utils/ApiError";
+import { CORRELATION_ID_HEADER, newCorrelationId } from "@utils/correlationId";
 import { useLogger } from "@hooks/useLogger";
 import { ApiQueryKeys } from "@constants/apiConstants";
 import type {
@@ -85,9 +86,11 @@ export default function useInfiniteProjects({
           body.filters = { searchQuery: normalizedSearchQuery };
         }
 
+        const correlationId = newCorrelationId();
         const response = await authFetch(requestUrl, {
           method: "POST",
           body: JSON.stringify(body),
+          headers: { [CORRELATION_ID_HEADER]: correlationId },
         });
 
         logger.debug(
@@ -108,6 +111,7 @@ export default function useInfiniteProjects({
             response.status,
             response.statusText,
             apiMessage ?? `Error fetching projects: ${response.statusText}`,
+            response.headers.get(CORRELATION_ID_HEADER) ?? correlationId,
           );
         }
 

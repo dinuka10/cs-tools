@@ -44,6 +44,7 @@ The server loads `.env` automatically on startup (silently ignored if absent). P
 | `DB_PASSWORD` | yes*     | —       | Database password          |
 | `DB_NAME`     | yes*     | —       | Database name              |
 | `DB_SSLMODE`  | no       | —       | `disable` or `require`    |
+| `DB_SCHEMA`   | no       | `DB_USER,public` | Pins the connection's `search_path` (`DSN`'s `options=-c search_path=...`), same purpose as `operations/csm-sync-service`'s own `DB_SCHEMA` — see that config's `withSchema`. The fallback makes explicit what Postgres' own default `search_path` (`"$user", public`) would already do implicitly — `public` must survive it, since every deployment's tables live there today (unqualified migrations). An explicit value is used verbatim, with no `public` appended |
 | `SERVER_PORT` | no       | `8080`  | Main API listen port       |
 | `HEALTH_PORT` | no       | `8081`  | Health probe listen port; `Validate` rejects it being equal to `SERVER_PORT` (see "Health probes" below) |
 | `EVENT_HUB_BROKER` | no | — | Kafka-compatible bootstrap address; feature-gates `EventPublisherService` (see "Event Hub publishing" below) |
@@ -3250,8 +3251,9 @@ across whichever of the five extension tables actually matches (exactly one
 ever does, since each is a shared-PK extension keyed to a specific
 `wi.type`) — `announcement_state_enum`'s `CLOSE` (not `CLOSED`) is
 normalized to match the other four's vocabulary. `severity`/`issue_type`/
-`work_state`/`resolution_code`/`current_escalation_level`/`is_escalated`
-remain `"case"`-only, since no other extension table has those columns.
+`current_escalation_level`/`is_escalated` remain `"case"`-only, since no
+other extension table has those columns. `work_state`/`resolution_code` are
+not: see "Work state and resolution code on non-case types" below.
 `GetCaseByID` also now populates `Cause`/`ResolutionCode`/`ResolutionNotes`/
 `ResolvedOn`/`EscalationLevel`/`IsEscalated` for the first time — real
 columns that were simply never selected before, not previously believed
@@ -4173,10 +4175,17 @@ migration file). Timestamps are RFC3339 UTC like the rest of the Postgres code.
   don't specify one. Only active categories with at least one available item are returned;
   an unknown deployed product is a 404.
 - `GetCatalogItemVariables` 404s unless the item is linked to that catalog.
-  `catalog_variable` has no columns for `readOnly`/`hidden`/`maxLength`/
-  `referenceTable`/`validation`/`choices`, so those stay at their zero value
-  (TODO: choice-based variables render as free text until a choices table
-  exists). A NULL `is_active` counts as active.
+  `catalog_variable`'s `read_only`/`hidden`/`reference_table`/`max_length`/
+  `validation_name`/`validation_regex`/`validation_message` columns and the
+  sibling `catalog_variable_choice` table (migration 0125) back
+  `readOnly`/`hidden`/`maxLength`/`referenceTable`/`validation`/`choices` on
+  this data source now -- a NULL `read_only`/`hidden` reads as `false`, and
+  `Choices` is only set when the variable has at least one `is_inactive IS NOT
+  TRUE` choice row (an inactive choice is excluded entirely, not flagged). This
+  data is kept current by a separate sync service, not written here. A NULL
+  `is_active` counts as active. Under `postgres-servicenow-dual-write`, this
+  one endpoint reads Postgres directly (unlike `SearchCatalogs`, which still
+  falls back to ServiceNow -- see `catalogService.snMirror`'s own doc comment).
 
 ## Case search filters on the Postgres data source
 
@@ -4782,6 +4791,39 @@ Missing a `sysidToUUID()` call on a response ID means callers receive a bare sys
 
 - **Security fixes in PRs** — when a change is made to fix a security issue (gosec findings, input sanitization, etc.), do not mention it in the PR title or description; describe the change in neutral functional terms only
 - **Run govulncheck on every change** — `govulncheck ./...` (install once: `go install golang.org/x/vuln/cmd/govulncheck@latest`) must report no vulnerabilities before opening a PR. Most findings here are Go standard-library CVEs tied to the toolchain patch version pinned in `go.mod`'s `go` directive — bump it to the latest `1.26.x` patch (and run `go mod tidy` so the toolchain download matches) rather than working around the symptom. A finding in a third-party module (e.g. `golang.org/x/text`, pulled in transitively via `pgx`) is fixed with `go get <module>@<fixed-version>`
+
+## Work state and resolution code on non-case types (migration 0184)
+
+PR #2289 made `UpdateCase` write the right extension table for each case-like
+type, and rejected `severity`/`workState`/`resolutionCode` for every type but
+`case`. ServiceNow disagrees for two of the three: every case-like record lives
+in `sn_customerservice_case`, and on wso2sndev in-progress service requests,
+engagements and security report analyses carry `u_work_state` (1 = Ongoing,
+2 = Paused), and closed ones carry `resolution_code`. Announcements carry
+neither. Severity (`priority` 9–14) is effectively case-only; service requests
+use `priority` 1–4, a different scale, which this does not model.
+
+With `workState` rejected, the portal's Start progress left a service request
+in Work in Progress with an empty work state, shown as "Paused", and public
+replies stayed locked, since both the BFF and the webapp require `ongoing`.
+
+- **Migration 0184** adds `work_state case_work_state_enum` and
+  `resolution_code case_resolution_code_enum` (the "case" enum types) to
+  `service_request`, `engagement` and `security_report_analysis`. Applied by
+  hand like 0179-0181; the sync service does not create or fill them yet.
+- **`validateUpdateCaseFieldsForType`**: `severity` stays case-only;
+  `workState`/`resolutionCode` are rejected only for announcements.
+- **Update queries** for the three types write both columns (`$5`/`$6`) and
+  return `work_state`. `caseLikeExtensionUpdate` builds the statement and
+  arguments for every non-case type, shared by `UpdateCase` and the
+  one-Ongoing path.
+- **One Ongoing per engineer** now spans case, service request, engagement and
+  security report analysis (`workStateWorkItemTypes`), matching the webapp's
+  own conflict lookup, which searches every case-like type.
+- **Reads** (`GetCaseByID`, `SearchCases`, the `workState` filter and
+  aggregate) use `caseLikeWorkStateColumn`/`caseLikeResolutionCodeColumn`.
+- **Dual write** needed no change: the ServiceNow mirror for state, work state
+  and resolution fields already PATCHes the shared case record, whatever its type.
 
 ## Incident report flows (migration 0181)
 

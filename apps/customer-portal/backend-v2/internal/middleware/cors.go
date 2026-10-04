@@ -25,6 +25,17 @@ import "net/http"
 // request bodies.
 const corsAllowedHeaders = "Content-Type, Authorization, x-jwt-assertion, x-user-id-token, X-CSM-Correlation-ID"
 
+// corsExposedHeaders lists response headers the browser's fetch API hides
+// from frontend JS unless explicitly exposed via Access-Control-Expose-Headers
+// (the default CORS-safelisted set doesn't include this one). Without it, the
+// frontend's own support "Tracking ID" copy affordance could never read the
+// correlation ID the CorrelationID middleware stamps on every response — it
+// falls back to the ID it generated and sent itself when this isn't set, so
+// this is a quality improvement (seeing the backend's own authoritative value,
+// including when it generated a fresh one because the caller sent none) not a
+// hard requirement, but costs nothing to expose.
+const corsExposedHeaders = "X-CSM-Correlation-ID"
+
 // CORS returns an HTTP middleware that handles cross-origin requests from the
 // browser-based frontend. It MUST be the outermost middleware in the chain
 // (wrapping Auth, not wrapped by it): a CORS preflight is an OPTIONS request
@@ -60,6 +71,7 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 			if origin != "" && (len(allowed) == 0 || allowed[origin]) {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 				w.Header().Add("Vary", "Origin")
+				w.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
 			}
 
 			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
