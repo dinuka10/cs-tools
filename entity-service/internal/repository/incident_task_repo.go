@@ -29,12 +29,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// IncidentTaskRepository defines the read operations for incident_task
+// IncidentTaskRepository defines the operations for incident_task
 // (migration 0066), a work_item type extension (id IS work_item.id) --
-// same shared-PK pattern as "case"/change_request. There is no Postgres
-// write path at all: no CreateIncidentTask/UpdateIncidentTask exists on
-// IncidentTaskService in the first place (it's read-only on every data
-// source).
+// same shared-PK pattern as "case"/change_request. Tasks are created by the
+// incident flows (IncidentReportTx.CreateIncidentTask); UpdateIncidentTask
+// is the portal's state/close-notes write.
 //
 // incident_task has no assignment-group column anywhere (same gap as
 // change_request's own AssignedTeamID -- see change_request_repo.go's
@@ -63,6 +62,15 @@ type IncidentTaskRepository interface {
 	// GetIncidentTask returns the full detail of a single incident task by
 	// its UUID, or a NotFoundError if no matching row exists.
 	GetIncidentTask(ctx context.Context, id string) (domain.IncidentTaskDetail, error)
+	// UpdateIncidentTask writes req.State and/or req.CloseNotes in one
+	// transaction, with ServiceNow's task-table side effects ("mark closed",
+	// "Set Closure Fields", "task reopener"): entering a closed state
+	// (domain.IncidentTaskClosedStates) from an open one sets is_active
+	// false, and closed_on / closed_by_id (the "user" matching actorEmail)
+	// only where they are still empty; moving back to an open state sets
+	// is_active true and keeps closed_on / closed_by_id, as ServiceNow does.
+	// Returns a NotFoundError if id is not an incident task.
+	UpdateIncidentTask(ctx context.Context, req domain.UpdateIncidentTaskRequest, actorEmail string) error
 }
 
 type incidentTaskRepo struct {
@@ -275,7 +283,7 @@ func (r *incidentTaskRepo) GetIncidentTask(ctx context.Context, id string) (doma
 	query := `
 		SELECT wi.id, wi.number, wi.subject, it.state::TEXT, inc.id, inc_wi.number, ae.id,
 		       COALESCE(ae.name, NULLIF(TRIM(CONCAT_WS(' ', ae.first_name, ae.last_name)), '')),
-		       wi.description, it.priority::TEXT, it.opened_on, it.closed_on
+		       wi.description, it.priority::TEXT, it.opened_on, it.closed_on, it.close_notes
 		` + incidentTaskFromJoins + `
 		WHERE wi.id = $1 AND wi.type = 'INCIDENT_TASK'`
 
@@ -287,10 +295,11 @@ func (r *incidentTaskRepo) GetIncidentTask(ctx context.Context, id string) (doma
 		description          *string
 		priority             *string
 		openedOn, closedOn   *time.Time
+		closeNotes           *string
 	)
 	err := r.db.QueryRow(ctx, query, id).Scan(
 		&id2, &number, &subject, &state, &incID, &incNumber, &aeID, &aeName,
-		&description, &priority, &openedOn, &closedOn,
+		&description, &priority, &openedOn, &closedOn, &closeNotes,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.IncidentTaskDetail{}, &apierror.NotFoundError{Msg: "incident task not found"}
@@ -301,7 +310,7 @@ func (r *incidentTaskRepo) GetIncidentTask(ctx context.Context, id string) (doma
 
 	d := domain.IncidentTaskDetail{
 		ID: &id2, Number: &number, Subject: &subject,
-		Description: description, Priority: priority,
+		Description: description, Priority: priority, CloseNotes: closeNotes,
 	}
 	if openedOn != nil {
 		s := openedOn.UTC().Format(time.RFC3339)
@@ -324,4 +333,56 @@ func (r *incidentTaskRepo) GetIncidentTask(ctx context.Context, id string) (doma
 		d.AssignedTo = &domain.EntityRef{ID: *aeID, Name: stringOrEmpty(aeName)}
 	}
 	return d, nil
+}
+
+// UpdateIncidentTask implements IncidentTaskRepository.
+func (r *incidentTaskRepo) UpdateIncidentTask(ctx context.Context, req domain.UpdateIncidentTaskRequest, actorEmail string) error {
+	return r.db.InTx(ctx, func(tx pgx.Tx) error {
+		var current *string
+		err := tx.QueryRow(ctx, `
+			SELECT it.state::TEXT
+			FROM incident_task it
+			JOIN work_item wi ON wi.id = it.id
+			WHERE it.id = $1 AND wi.type = 'INCIDENT_TASK'
+			FOR UPDATE OF it, wi`, req.ID).Scan(&current)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return &apierror.NotFoundError{Msg: "incident task not found"}
+		}
+		if err != nil {
+			return fmt.Errorf("update incident task: read state: %w", err)
+		}
+
+		var sets []string
+		var args []any
+		add := func(assignment string, val any) {
+			args = append(args, val)
+			sets = append(sets, fmt.Sprintf(assignment, len(args)))
+		}
+		if req.State != nil {
+			add("state = $%d::TEXT::incident_task_state_enum", *req.State)
+			wasClosed := current != nil && domain.IncidentTaskClosedStates[*current]
+			closing := domain.IncidentTaskClosedStates[*req.State]
+			switch {
+			case closing && !wasClosed:
+				sets = append(sets, "is_active = FALSE", "closed_on = COALESCE(closed_on, NOW())")
+				add(`closed_by_id = COALESCE(closed_by_id, (SELECT id FROM "user" WHERE LOWER(email) = LOWER($%d) LIMIT 1))`, actorEmail)
+			case !closing && wasClosed:
+				sets = append(sets, "is_active = TRUE")
+			}
+		}
+		if req.CloseNotes != nil {
+			add("close_notes = $%d", *req.CloseNotes)
+		}
+		args = append(args, req.ID)
+		if _, err := tx.Exec(ctx,
+			fmt.Sprintf(`UPDATE incident_task SET %s WHERE id = $%d`, strings.Join(sets, ", "), len(args)),
+			args...); err != nil {
+			return fmt.Errorf("update incident task: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE work_item SET updated_on = NOW(), updated_by = $2 WHERE id = $1`,
+			req.ID, actorEmail); err != nil {
+			return fmt.Errorf("update incident task: work_item: %w", err)
+		}
+		return nil
+	})
 }

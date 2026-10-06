@@ -445,6 +445,87 @@ func TestParseInternalClientIDs(t *testing.T) {
 	}
 }
 
+// TestConfig_Validate_CSMPortalBackendClientIDAndDomainAllOrNothing pins the pairing
+// requirement: CSM_PORTAL_BACKEND_CLIENT_ID and CSM_PORTAL_USER_DOMAIN are only
+// meaningful together (ResolveScope's domain check needs both), so a
+// deployment setting only one almost certainly meant to set both.
+func TestConfig_Validate_CSMPortalBackendClientIDAndDomainAllOrNothing(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMPortalBackendClientID = "csm-portal"
+	if err := c.Validate(); err == nil {
+		t.Error("CSMPortalBackendClientID with no CSMPortalUserDomain: want an error, got nil")
+	}
+
+	c = baseValidConfig()
+	c.CSMPortalUserDomain = "wso2.com"
+	if err := c.Validate(); err == nil {
+		t.Error("CSMPortalUserDomain with no CSMPortalBackendClientID: want an error, got nil")
+	}
+
+	c = baseValidConfig()
+	c.CSMPortalBackendClientID = "csm-portal"
+	c.CSMPortalUserDomain = "wso2.com"
+	if err := c.Validate(); err != nil {
+		t.Errorf("both set together: unexpected error: %v", err)
+	}
+}
+
+// TestConfig_Validate_RejectsSameClientIDForCSMAndCustomerPortal pins the
+// guard against the one config value that can't be resolved by ResolveScope's
+// own ordering: CSMPortalBackendClientID and CustomerPortalBackendClientID being equal would
+// mean a single client id is both "unrestricted given a matching domain" and
+// "never unrestricted, full stop" at once -- a copy-paste mistake, not a
+// valid deployment.
+func TestConfig_Validate_RejectsSameClientIDForCSMAndCustomerPortal(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMPortalBackendClientID = "shared-id"
+	c.CSMPortalUserDomain = "wso2.com"
+	c.CustomerPortalBackendClientID = "shared-id"
+	if err := c.Validate(); err == nil {
+		t.Error("CSMPortalBackendClientID == CustomerPortalBackendClientID: want an error, got nil")
+	}
+}
+
+// TestConfig_Validate_DistinctCSMAndCustomerPortalBackendClientIDsAreValid guards
+// against the above check being too broad and rejecting the normal case.
+func TestConfig_Validate_DistinctCSMAndCustomerPortalBackendClientIDsAreValid(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMPortalBackendClientID = "csm-portal"
+	c.CSMPortalUserDomain = "wso2.com"
+	c.CustomerPortalBackendClientID = "customer-portal"
+	if err := c.Validate(); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestLoad_CSMPortalUserDomain pins CSM_PORTAL_USER_DOMAIN's one bit of
+// normalization: a value typed with a leading "@" (an easy mistake, since
+// email addresses are usually written that way) is accepted the same as one
+// without, so isCSMPortalUserDomain's own "@"+domain suffix match is never
+// built from a doubled "@@".
+func TestLoad_CSMPortalUserDomain(t *testing.T) {
+	t.Setenv("CSM_PORTAL_USER_DOMAIN", "@wso2.com")
+	if got := Load().CSMPortalUserDomain; got != "wso2.com" {
+		t.Errorf("CSMPortalUserDomain = %q, want %q (leading @ stripped)", got, "wso2.com")
+	}
+
+	t.Setenv("CSM_PORTAL_USER_DOMAIN", "wso2.com")
+	if got := Load().CSMPortalUserDomain; got != "wso2.com" {
+		t.Errorf("CSMPortalUserDomain = %q, want %q (unchanged)", got, "wso2.com")
+	}
+}
+
+// TestLoad_M2MClientIDsFieldName guards against M2M_CLIENT_IDS silently
+// going unread after the AUTH_INTERNAL_CLIENT_IDS rename -- a stale env var
+// name here would leave every M2M caller unexpectedly unauthorized.
+func TestLoad_M2MClientIDsFieldName(t *testing.T) {
+	t.Setenv("M2M_CLIENT_IDS", "svc-a,svc-b")
+	got := Load().M2MClientIDs
+	if !got["svc-a"] || !got["svc-b"] || len(got) != 2 {
+		t.Errorf("M2MClientIDs = %v, want {svc-a, svc-b}", got)
+	}
+}
+
 // TestLoad_CSMMigrationPortalWritesEnabled pins the kill switch's parsing:
 // only the exact string "true" turns the portal membership writes on, so a
 // typo, a "1", or a "TRUE" leaves them off rather than half-enabling a write
@@ -601,6 +682,88 @@ func TestLoad_SalesforceIngestRetryInterval(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_CustomerEngagementFirefightingTypeID(t *testing.T) {
+	c := baseValidConfig()
+	c.CSMMigrationCustomerEngagementIngestEnabled = true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("an unset type id must not fail startup: %v", err)
+	}
+	c.CustomerEngagementFirefightingTypeID = "fc7f2d171b81f910d64e64a2604bcb9b"
+	if err := c.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	c.CustomerEngagementFirefightingTypeID = "not-a-sys-id"
+	if c.Validate() == nil {
+		t.Error("Validate() = nil for a malformed type id")
+	}
+	if !c.HasCustomerEngagementIngest() {
+		t.Error("HasCustomerEngagementIngest() = false on a Postgres config")
+	}
+	c.DataSource = DataSourceServiceNow
+	if c.HasCustomerEngagementIngest() {
+		t.Error("HasCustomerEngagementIngest() = true on a ServiceNow config")
+	}
+}
+
+// TestConfig_Validate_RedisURL: a malformed REDIS_URL fails startup, and the
+// error never echoes the URL, since it carries the Redis password.
+func TestConfig_Validate_RedisURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{name: "unset", url: "", wantErr: false},
+		{name: "tls", url: "rediss://:s3cr3t%3D@cache.example.net:10000", wantErr: false},
+		{name: "plain", url: "redis://localhost:6379/0", wantErr: false},
+		{name: "wrong scheme", url: "https://:s3cr3t@cache.example.net", wantErr: true},
+		{name: "no host", url: "rediss://:s3cr3t@", wantErr: true},
+		{name: "unparseable", url: "rediss://:s3cr3t@[::1", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseValidConfig()
+			c.RedisURL = tt.url
+			err := c.Validate()
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("Validate() = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && strings.Contains(err.Error(), "s3cr3t") {
+				t.Errorf("Validate() error leaks the password: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoad_Redis(t *testing.T) {
+	t.Setenv("REDIS_URL", "")
+	t.Setenv("REDIS_ADDR", "")
+	t.Setenv("USER_CACHE_TTL", "")
+	c := Load()
+	if c.HasRedis() {
+		t.Error("HasRedis() = true with neither REDIS_URL nor REDIS_ADDR set")
+	}
+	if c.UserCacheTTL != 10*time.Minute {
+		t.Errorf("UserCacheTTL = %v, want the 10m default", c.UserCacheTTL)
+	}
+
+	t.Setenv("REDIS_ADDR", " localhost:6379 ")
+	t.Setenv("USER_CACHE_TTL", "90s")
+	c = Load()
+	if !c.HasRedis() || c.RedisAddr != "localhost:6379" {
+		t.Errorf("HasRedis() = %v, RedisAddr = %q; want true, %q", c.HasRedis(), c.RedisAddr, "localhost:6379")
+	}
+	if c.UserCacheTTL != 90*time.Second {
+		t.Errorf("UserCacheTTL = %v, want 90s", c.UserCacheTTL)
+	}
+
+	t.Setenv("REDIS_ADDR", "")
+	t.Setenv("REDIS_URL", "rediss://:pw@cache.example.net:10000")
+	if !Load().HasRedis() {
+		t.Error("HasRedis() = false with REDIS_URL set")
+	}
+}
+
 // dsnSearchPath extracts the search_path value DSN embedded in its "options"
 // query parameter, so a test can assert on the schema alone rather than the
 // whole connection string.
@@ -652,4 +815,23 @@ func TestConfig_DSN_SchemaFallsBackToDBUserPlusPublic(t *testing.T) {
 			t.Errorf("search_path = %q, want %q", got, "public")
 		}
 	})
+}
+
+func TestSREEventHubTopicMovesBothOperationsPublishers(t *testing.T) {
+	t.Setenv("CR_EVENT_HUB_TOPIC", "cr-events")
+	t.Setenv("OUTAGE_EVENT_HUB_TOPIC", "outage-events")
+
+	t.Setenv("SRE_EVENT_HUB_TOPIC", "")
+	if c := Load(); c.CREventHubTopic != "cr-events" || c.OutageEventHubTopic != "outage-events" {
+		t.Errorf("unset SRE topic changed the publishers: cr=%q outage=%q", c.CREventHubTopic, c.OutageEventHubTopic)
+	}
+
+	t.Setenv("SRE_EVENT_HUB_TOPIC", " sre-events ")
+	c := Load()
+	if c.CREventHubTopic != "sre-events" || c.OutageEventHubTopic != "sre-events" {
+		t.Errorf("SRE topic set: cr=%q outage=%q, want both sre-events", c.CREventHubTopic, c.OutageEventHubTopic)
+	}
+	if c.EventHubTopic == "sre-events" {
+		t.Error("the case-events topic must not move")
+	}
 }

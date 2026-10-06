@@ -52,6 +52,14 @@ const userInfoKey contextKey = "user-info"
 type UserInfo struct {
 	Email  string
 	UserID string
+	// FirstName/LastName are the token's "given_name"/"family_name" claims.
+	// Optional -- never required for a token to validate, unlike Email/UserID
+	// below -- and so far only consumed by ensureUserProvisioned (see
+	// handler/ensure_user.go), which needs a display name to provision a
+	// worknote_creator-/escalator-only caller's entity-service "user" row.
+	// Empty when the token doesn't carry either claim.
+	FirstName string
+	LastName  string
 	// Roles is the token's "roles" claim, which portal authorisation checks
 	// (see handler.AccessGuard).
 	Roles []string
@@ -84,6 +92,11 @@ type jwtClaims struct {
 	Roles  stringList `json:"roles"`
 	// Groups — see UserInfo.Groups's doc comment for why this is still read.
 	Groups stringList `json:"groups"`
+	// FirstName/LastName — see UserInfo.FirstName's own doc comment. Neither
+	// is required: a token missing one or both still validates, same as
+	// Groups above.
+	FirstName string `json:"given_name"`
+	LastName  string `json:"family_name"`
 	jwt.RegisteredClaims
 }
 
@@ -260,10 +273,12 @@ func extractUserInfo(tokenStr string, cfg Config, keyFunc jwt.Keyfunc) (*UserInf
 	}
 
 	return &UserInfo{
-		Email:  c.Email,
-		UserID: c.UserID,
-		Roles:  []string(c.Roles),
-		Groups: []string(c.Groups),
+		Email:     c.Email,
+		UserID:    c.UserID,
+		FirstName: c.FirstName,
+		LastName:  c.LastName,
+		Roles:     []string(c.Roles),
+		Groups:    []string(c.Groups),
 	}, nil
 }
 

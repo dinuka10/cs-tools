@@ -30,9 +30,17 @@ import (
 	"github.com/sony/gobreaker/v2"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
-
-	"alert-core-service/internal/apierror"
 )
+
+// Error is returned when csm-integration-service responds with a non-2xx status.
+type Error struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *Error) Error() string {
+	return fmt.Sprintf("csm-integration-service returned %d: %s", e.StatusCode, e.Body)
+}
 
 // tokenFetchTimeout is the HTTP client timeout for token-endpoint requests.
 var tokenFetchTimeout = 10 * time.Second
@@ -63,6 +71,8 @@ type Config struct {
 	ClientID     string
 	ClientSecret string
 	Scopes       []string
+	// HTTPTimeout bounds each CSM call, so one stuck call can't hold a delivery worker and its lock.
+	HTTPTimeout time.Duration
 }
 
 // Client authenticates via OAuth2 client-credentials grant; tokens are acquired and refreshed automatically.
@@ -91,7 +101,7 @@ func NewClient(cfg Config) *Client {
 	}
 	tokenCtx := context.WithValue(context.Background(), oauth2.HTTPClient, tokenHTTPClient)
 	httpClient := cc.Client(tokenCtx)
-	httpClient.Timeout = 25 * time.Second
+	httpClient.Timeout = cfg.HTTPTimeout
 	httpClient.Transport = &httpsOnlyTransport{base: httpClient.Transport}
 	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -116,7 +126,7 @@ func newBreaker() *gobreaker.CircuitBreaker[[]byte] {
 			if errors.Is(err, errCallerDone) {
 				return true
 			}
-			var apiErr *apierror.Error
+			var apiErr *Error
 			if errors.As(err, &apiErr) {
 				return apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 && apiErr.StatusCode != http.StatusTooManyRequests
 			}
@@ -159,7 +169,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]by
 			if err != nil {
 				return nil, wrapCallerDone(ctx, fmt.Errorf("csm: read error response body: %w", err))
 			}
-			return nil, &apierror.Error{StatusCode: resp.StatusCode, Body: string(excerpt)}
+			return nil, &Error{StatusCode: resp.StatusCode, Body: string(excerpt)}
 		}
 
 		respBody, err := io.ReadAll(resp.Body)

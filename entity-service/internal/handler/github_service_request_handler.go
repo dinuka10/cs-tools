@@ -34,13 +34,13 @@ import (
 // want to depend on delivery.
 type GithubServiceRequestHandler struct {
 	svc service.GithubSyncService
-	// internalClientIDs is config.Config.AuthInternalClientIDs. Only these may
+	// internalClientIDs is config.Config.M2MClientIDs. Only these may
 	// call this endpoint -- see Create.
 	internalClientIDs map[string]bool
 }
 
 // NewGithubServiceRequestHandler constructs the endpoint. internalClientIDs is
-// config.Config.AuthInternalClientIDs.
+// config.Config.M2MClientIDs.
 func NewGithubServiceRequestHandler(svc service.GithubSyncService, internalClientIDs map[string]bool) *GithubServiceRequestHandler {
 	return &GithubServiceRequestHandler{svc: svc, internalClientIDs: internalClientIDs}
 }

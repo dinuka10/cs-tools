@@ -255,7 +255,7 @@ type partnerRefreshService struct {
 }
 
 // NewPartnerRefreshService constructs the internal endpoint's service. Every
-// call is restricted to internal callers (AUTH_INTERNAL_CLIENT_IDS), as for
+// call is restricted to internal callers (an Unrestricted AccessScope), as for
 // onboarding steps: it makes this service read Salesforce and write accounts.
 func NewPartnerRefreshService(refresher PartnerRefresher, access AccessService) PartnerRefreshService {
 	return &partnerRefreshService{refresher: refresher, access: access}

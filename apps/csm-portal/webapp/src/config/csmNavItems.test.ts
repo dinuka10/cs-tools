@@ -41,7 +41,7 @@ describe("nav tree invariants", () => {
 
   it("keeps a query-param tab from claiming its section's landing route", () => {
     const incidents = navNodeById("operations.incidents");
-    expect(navNodeRoutes(incidents!)).toEqual(["/operations/incidents"]);
+    expect(navNodeRoutes(incidents!)).toEqual(["/operations/incidents", "/operations/incident-tasks"]);
     expect(navNodePath(incidents!)).toBe("/operations");
   });
 });

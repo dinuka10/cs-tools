@@ -152,6 +152,54 @@ func main() {
 		}
 	}
 
+	// Outage emails: the internal-stakeholder notification and the SRE
+	// outage communication, decided every OUTAGE_NOTICE_POLL_INTERVAL and
+	// published on their own topic for csm-notification-service to send --
+	// seconds after the change, as ServiceNow's record-triggered flows are,
+	// instead of on csm-scheduled-tasks' tick.
+	//
+	// No switch of its own: an email whose recipient list is empty is never
+	// swept (see OutageNoticeDrainer), so OUTAGE_NOTIFICATION_RECIPIENTS and
+	// OUTAGE_COMMUNICATION_RECIPIENTS are what turn each one on.
+	if pool != nil && cfg.DataSource != config.DataSourceServiceNow {
+		switch {
+		case len(cfg.OutageNotificationRecipients) == 0 && len(cfg.OutageCommunicationRecipients) == 0:
+			log.Printf("outage emails off: OUTAGE_NOTIFICATION_RECIPIENTS and OUTAGE_COMMUNICATION_RECIPIENTS are both empty")
+		case cfg.EventHubBroker == "" || !cfg.EventPublishingEnabled:
+			log.Printf("outage emails off: event publishing is not configured (EVENT_HUB_BROKER/EVENT_PUBLISHING_ENABLED)")
+		default:
+			outageNoticeCtx, stopOutageNotices := context.WithCancel(repository.WithSystemIdentity(context.Background()))
+			defer stopOutageNotices()
+			// The context below carries the system identity, which ResolveScope
+			// returns before ever consulting client ids, so none are configured.
+			outageAccess := service.NewAccessService(repository.NewAccessRepository(pool), service.AccessClientConfig{})
+			drainer := &service.OutageNoticeDrainer{
+				Notifications: service.NewOutageNotificationService(
+					repository.NewOutageNotificationRepository(pool), outageAccess),
+				Communications: service.NewOutageCommunicationService(
+					repository.NewOutageCommunicationRepository(pool), outageAccess),
+				Publisher: service.NewEventPublisherService(
+					eventbus.NewProducer(eventbus.Config{
+						Broker:           cfg.EventHubBroker,
+						ConnectionString: cfg.EventHubConnectionString,
+						Topic:            cfg.OutageEventHubTopic,
+					}),
+					service.NewEventPublishFailureService(repository.NewEventPublishFailureRepository(pool)),
+				),
+				NotificationRecipients:  cfg.OutageNotificationRecipients,
+				CommunicationRecipients: cfg.OutageCommunicationRecipients,
+				// Woken by migration 0186's NOTIFY on every outage change;
+				// the interval is only the fallback poll.
+				Listener: repository.NewOutageChangeListener(pool),
+				Interval: cfg.OutageNoticePollInterval,
+			}
+			go drainer.Run(outageNoticeCtx)
+			log.Printf("outage emails enabled: publishing to topic %q on each outage change (fallback poll %s; internal notification: %d recipients, outage communication: %d recipients)",
+				cfg.OutageEventHubTopic, cfg.OutageNoticePollInterval,
+				len(cfg.OutageNotificationRecipients), len(cfg.OutageCommunicationRecipients))
+		}
+	}
+
 	// Cloud status: the record-triggered path. Started whenever the scope is
 	// configured, because it is only useful when there is a scope to decide
 	// against -- and harmless without one, since HandleOutages returns early.

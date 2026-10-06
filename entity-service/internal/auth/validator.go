@@ -168,7 +168,8 @@ func (v *Validator) ValidateUserToken(raw string) (UserClaims, error) {
 // key that JWKS publishes) and did cause real outages: a JWKS refresh
 // rate-limit or transient lookup failure turned into every internal caller
 // being rejected. The client id is only ever used to check membership in
-// AUTH_INTERNAL_CLIENT_IDS -- a deployment-controlled allow-list, not a
+// M2MClientIDs, or equality with CSMPortalBackendClientID/
+// CustomerPortalBackendClientID -- deployment-controlled configs, not a
 // capability grant derived from unproven claims -- so trusting it at face
 // value here carries no more risk than trusting any other value read off this
 // same header elsewhere in the fleet.

@@ -26,6 +26,7 @@ import (
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
 // stubProblemRepo is a minimal repository.ProblemRepository whose
@@ -36,6 +37,14 @@ type stubProblemRepo struct {
 	createProblemFromServiceNow func(ctx context.Context, req domain.CreateProblemRequest, id, number, createdBy string, state *string) (domain.ProblemDetail, error)
 	getProblem                  func(ctx context.Context, id string) (domain.ProblemDetail, error)
 	updateProblemFields         func(ctx context.Context, req domain.UpdateProblemRequest, actorEmail string) (time.Time, error)
+	applyProblemTransition      func(ctx context.Context, req domain.UpdateProblemRequest, t repository.ProblemTransition, enforceFrom bool, actorEmail string) (time.Time, error)
+}
+
+func (s *stubProblemRepo) ApplyProblemTransition(ctx context.Context, req domain.UpdateProblemRequest, t repository.ProblemTransition, enforceFrom bool, actorEmail string) (time.Time, error) {
+	if s.applyProblemTransition != nil {
+		return s.applyProblemTransition(ctx, req, t, enforceFrom, actorEmail)
+	}
+	panic("ApplyProblemTransition called unexpectedly")
 }
 
 func (s *stubProblemRepo) SearchProblems(context.Context, domain.SearchProblemsRequest, []string, []string) ([]domain.SearchProblemView, int, error) {
@@ -249,51 +258,6 @@ func TestProblemService_CreateProblem_MissingUserIDTokenRejected(t *testing.T) {
 	}
 }
 
-// TestProblemService_UpdateProblem_UnsupportedOnPlainDataSource guards the
-// plain-PostgreSQL-only path: with no snWriteback (as NewProblemService
-// constructs), UpdateProblem must still 503, exactly as the original stub
-// always did.
-func TestProblemService_UpdateProblem_UnsupportedOnPlainDataSource(t *testing.T) {
-	svc := NewProblemService(&stubProblemRepo{})
-	causeNotes := "root cause found"
-	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, CauseNotes: &causeNotes})
-	var se *apierror.ServiceUnavailableError
-	if !errors.As(err, &se) {
-		t.Fatalf("expected *apierror.ServiceUnavailableError, got %T: %v", err, err)
-	}
-}
-
-// TestProblemService_UpdateProblem_TransitionRejected and
-// TestProblemService_UpdateProblem_AssignmentGroupIDRejected guard the two
-// fields with nowhere to write them: Transition (ServiceNow's workflow
-// engine owns transition validation, no fixed rule set to reimplement) and
-// AssignmentGroupID (no CMDB/assignment-group table anywhere in this
-// schema). Both must be rejected before ever reaching the repository or the
-// mirror.
-func TestProblemService_UpdateProblem_TransitionRejected(t *testing.T) {
-	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, dispatcher)
-
-	transition := "assess"
-	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, Transition: &transition})
-	var ve *apierror.ValidationError
-	if !asValidationError(err, &ve) {
-		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
-	}
-}
-
-func TestProblemService_UpdateProblem_AssignmentGroupIDRejected(t *testing.T) {
-	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
-	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, dispatcher)
-
-	groupID := testUUID
-	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, AssignmentGroupID: &groupID})
-	var ve *apierror.ValidationError
-	if !asValidationError(err, &ve) {
-		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
-	}
-}
-
 // TestProblemService_UpdateProblem_AtLeastOneFieldRequired guards the
 // "nothing to do" rejection: a request setting none of the 5 supported
 // fields (and neither of the 2 rejected ones) must fail validation rather
@@ -392,23 +356,6 @@ func TestProblemService_UpdateProblem_InvalidTargetResolutionDateRejected(t *tes
 	var ve *apierror.ValidationError
 	if !asValidationError(err, &ve) {
 		t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
-	}
-}
-
-// TestProblemService_UpdateProblem_MirrorNotConfiguredReturnsUnavailable
-// guards the s.snWriteback == nil branch specifically via
-// NewProblemServiceWithSNMirror(nil dispatcher) -- distinct from
-// TestProblemService_UpdateProblem_UnsupportedOnPlainDataSource, which uses
-// NewProblemService (no snMirror at all). Both must produce the same
-// ServiceUnavailableError.
-func TestProblemService_UpdateProblem_MirrorNotConfiguredReturnsUnavailable(t *testing.T) {
-	svc := NewProblemServiceWithSNMirror(&stubProblemRepo{}, &stubMirrorProblemService{}, nil)
-
-	causeNotes := "root cause found"
-	_, err := svc.UpdateProblem(context.Background(), domain.UpdateProblemRequest{ID: testDeploymentUUID, CauseNotes: &causeNotes})
-	var se *apierror.ServiceUnavailableError
-	if !errors.As(err, &se) {
-		t.Fatalf("expected *apierror.ServiceUnavailableError, got %T: %v", err, err)
 	}
 }
 

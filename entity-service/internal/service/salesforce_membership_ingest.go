@@ -60,9 +60,12 @@ func (s *salesforceEventService) handleProjectContactEvent(ctx context.Context, 
 	case domain.SalesforceEventCreated, domain.SalesforceEventUpdated, domain.SalesforceEventRestored:
 		return s.ingestMembership(ctx, req.ReferenceID, req.EventType, nil)
 	case domain.SalesforceEventDeleted:
-		found, err := s.membership.Memberships.DeactivateBySfID(ctx, req.ReferenceID, s.adminRoleBasis)
+		found, affected, err := s.membership.Memberships.DeactivateBySfID(ctx, req.ReferenceID, s.adminRoleBasis)
 		if err != nil {
 			return err
+		}
+		for _, u := range affected {
+			invalidateUser(ctx, s.membership.UserCache, u.ID, u.Email)
 		}
 		if !found {
 			slog.InfoContext(ctx, "salesforce: DELETED project contact was never ingested, nothing to deactivate", "referenceId", req.ReferenceID)
@@ -215,6 +218,7 @@ func (s *salesforceEventService) ingestMembership(ctx context.Context, membershi
 		s.recordDatabaseStepFailed(ctx, step, err)
 		return err
 	}
+	invalidateUser(ctx, s.membership.UserCache, res.UserID, in.Email)
 	slog.InfoContext(ctx, "salesforce: project contact ingested",
 		"membershipSfId", membershipSfID, "state", in.State, "projectId", res.ProjectID, "projectContactId", res.ProjectContactID,
 		"createdUser", res.CreatedUser, "createdAccountContact", res.CreatedAccountContact, "createdProjectContact", res.CreatedProjectContact)

@@ -64,6 +64,18 @@ func (s *outageCommunicationService) Sweep(ctx context.Context, limit int) (doma
 	if err := s.requireInternalCaller(ctx); err != nil {
 		return domain.OutageCommunicationSweepResponse{}, err
 	}
+	release, locked, err := s.repo.TryLockSweep(ctx)
+	if err != nil {
+		return domain.OutageCommunicationSweepResponse{}, err
+	}
+	if !locked {
+		// Another sweep holds the lock and is already sending what is owed.
+		// Reporting nothing is correct: there is nothing for THIS caller to
+		// send, and evaluating again would only race it.
+		return domain.OutageCommunicationSweepResponse{Decisions: []domain.OutageCommunicationDecision{}}, nil
+	}
+	defer release()
+
 	if limit <= 0 || limit > 1000 {
 		limit = defaultOutageCommSweepLimit
 	}

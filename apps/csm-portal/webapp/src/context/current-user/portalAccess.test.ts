@@ -23,6 +23,7 @@ const NONE = {
   canUseOperations: false,
   canUseTimeCardsAndUpdates: false,
   canWrite: false,
+  canAddWorkNotes: false,
   canCreateUser: false,
   canUseSecurityCenter: false,
   canUsePlg: false,
@@ -39,8 +40,40 @@ describe("getPortalAccess", () => {
     expect(getPortalAccess(["internal", "customer", "agent"])).toEqual(NONE);
   });
 
-  it("viewer can use the portal but do nothing else", () => {
+  it("viewer can use the portal and read, but do nothing else (no work notes)", () => {
     expect(getPortalAccess(["viewer"])).toEqual({ ...NONE, hasAnyRole: true });
+  });
+
+  it("worknote_creator adds internal work notes and nothing else", () => {
+    expect(getPortalAccess(["worknote_creator"])).toEqual({
+      ...NONE,
+      hasAnyRole: true,
+      canAddWorkNotes: true,
+    });
+  });
+
+  it("work notes are not a write: only full-write roles can do both", () => {
+    expect(getPortalAccess(["cs_engineer"])).toMatchObject({ canWrite: true, canAddWorkNotes: true });
+    expect(getPortalAccess(["admin"])).toMatchObject({ canWrite: true, canAddWorkNotes: true });
+    for (const role of ["viewer", "escalator", "attachment_downloader", "usage_metrics_viewer", "timecard_approver", "dashboard_designer"]) {
+      expect(getPortalAccess([role]).canAddWorkNotes).toBe(false);
+    }
+  });
+
+  // The role set a viewer holds in practice: viewer reads, worknote_creator
+  // is the only role that adds a comment (an internal work note), and none of
+  // them is a write.
+  it("a viewer's role set can add internal work notes only through worknote_creator", () => {
+    const readers = ["viewer", "escalator", "attachment_downloader", "usage_metrics_viewer", "timecard_approver"];
+    expect(getPortalAccess(readers)).toMatchObject({ canWrite: false, canAddWorkNotes: false });
+    expect(getPortalAccess([...readers, "worknote_creator"])).toMatchObject({
+      canWrite: false,
+      canAddWorkNotes: true,
+      canEscalate: true,
+      canDownloadAttachment: true,
+      canUseOperations: false,
+      canUseSecurityCenter: false,
+    });
   });
 
   it("each specialised role adds only its own ability", () => {
@@ -73,6 +106,7 @@ describe("getPortalAccess", () => {
       canUseOperations: true,
       canUseTimeCardsAndUpdates: true,
       canWrite: true,
+      canAddWorkNotes: true,
       canUseSecurityCenter: true,
       canUsePlg: true,
     };

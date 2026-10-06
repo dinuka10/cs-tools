@@ -157,6 +157,9 @@ const (
 	// permission and the narrower gate is the pre-existing one. A
 	// WorknoteCreator-only caller can therefore only ever post internal
 	// work notes, never a customer-visible comment.
+	//
+	// Viewer deliberately does NOT hold this: it is the read-only role, and
+	// work notes have their own dedicated role (worknote_creator).
 	PermCreateWorkNote
 	// PermManagePlaybooks is authoring a PLG playbook template: creating one,
 	// editing it, replacing its tasks, deleting it. Admin only.

@@ -105,6 +105,9 @@ export interface CallRequestsTableProps {
   /** True when the parent case is closed — existing call requests stay visible
    * but can no longer be updated (scheduled, rejected, etc.). */
   isClosed?: boolean;
+  /** True when the caller can't change call requests (no write access) — the
+   * row actions are shown disabled, since the backend would 403 them. */
+  readOnly?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +118,7 @@ export function CallRequestsTable({
   requests,
   onAction,
   isClosed,
+  readOnly,
 }: CallRequestsTableProps): JSX.Element {
   const [detailTarget, setDetailTarget] = useState<BeCallRequestView | null>(null);
 
@@ -305,7 +309,9 @@ export function CallRequestsTable({
                         title={
                           isClosed
                             ? "This case is closed — it's read-only."
-                            : ACTION_LABEL[action]
+                            : readOnly
+                              ? "You don't have permission to change call requests."
+                              : ACTION_LABEL[action]
                         }
                       >
                         <span>
@@ -316,7 +322,7 @@ export function CallRequestsTable({
                               action === "reject" || action === "cancel" ? "error" : "primary"
                             }
                             onClick={() => onAction(action, cr)}
-                            disabled={isClosed}
+                            disabled={isClosed || readOnly}
                           >
                             <ActionIcon size={16} />
                           </IconButton>

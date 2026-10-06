@@ -23,6 +23,7 @@ import (
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
@@ -140,4 +141,40 @@ func (s *incidentTaskService) GetIncidentTask(ctx context.Context, id string) (d
 		return domain.IncidentTaskDetail{}, err
 	}
 	return s.repo.GetIncidentTask(ctx, id)
+}
+
+// UpdateIncidentTask implements IncidentTaskService for Postgres. State is
+// an incident_task_state_enum label, matched case-insensitively. Tasks are created in
+// Postgres by the incident flows and have no ServiceNow copy, so there is no
+// mirror write.
+func (s *incidentTaskService) UpdateIncidentTask(ctx context.Context, req domain.UpdateIncidentTaskRequest) (domain.IncidentTaskDetail, error) {
+	if err := validateUUIDs("id", []string{req.ID}); err != nil {
+		return domain.IncidentTaskDetail{}, err
+	}
+	if req.State == nil && req.CloseNotes == nil {
+		return domain.IncidentTaskDetail{}, &apierror.ValidationError{Msg: "at least one of state or closeNotes must be provided"}
+	}
+	if req.State != nil {
+		upper := strings.ToUpper(strings.TrimSpace(*req.State))
+		if !incidentTaskStateEnumSet[upper] {
+			return domain.IncidentTaskDetail{}, &apierror.ValidationError{
+				Msg: "state must be one of: PENDING, OPEN, WORK_IN_PROGRESS, CLOSED_COMPLETE, CLOSED_INCOMPLETE, CLOSED_SKIPPED",
+			}
+		}
+		req.State = &upper
+	}
+
+	token := middleware.UserIDTokenFromContext(ctx)
+	if token == "" {
+		return domain.IncidentTaskDetail{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+	actorEmail, err := emailFromJWT(token)
+	if err != nil {
+		return domain.IncidentTaskDetail{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+
+	if err := s.repo.UpdateIncidentTask(ctx, req, actorEmail); err != nil {
+		return domain.IncidentTaskDetail{}, err
+	}
+	return s.repo.GetIncidentTask(ctx, req.ID)
 }

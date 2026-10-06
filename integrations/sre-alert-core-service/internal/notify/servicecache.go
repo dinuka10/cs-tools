@@ -29,7 +29,7 @@ type serviceCache struct {
 }
 
 type serviceCacheEntry struct {
-	id        string
+	svc       resolvedService
 	expiresAt time.Time
 }
 
@@ -37,18 +37,18 @@ func newServiceCache(ttl time.Duration) *serviceCache {
 	return &serviceCache{ttl: ttl, entries: make(map[string]serviceCacheEntry)}
 }
 
-func (c *serviceCache) get(label string, now time.Time) (string, bool) {
+func (c *serviceCache) get(label string, now time.Time) (resolvedService, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[label]
 	if !ok || now.After(e.expiresAt) {
-		return "", false
+		return resolvedService{}, false
 	}
-	return e.id, true
+	return e.svc, true
 }
 
-func (c *serviceCache) set(label, id string, now time.Time) {
+func (c *serviceCache) set(label string, svc resolvedService, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[label] = serviceCacheEntry{id: id, expiresAt: now.Add(c.ttl)}
+	c.entries[label] = serviceCacheEntry{svc: svc, expiresAt: now.Add(c.ttl)}
 }

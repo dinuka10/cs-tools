@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/service"
@@ -68,24 +69,24 @@ var safeAttachmentTypes = map[string]bool{
 // CaseHandler handles HTTP requests for the case resource.
 type CaseHandler struct {
 	svc service.CaseService
-	// m2mTrustedActorEmails is the allowlist AddCaseTag checks a caller-
-	// supplied ActorEmail against (config.Config.M2MTrustedActorEmails).
-	// Lowercased once here so every comparison in AddCaseTag is a cheap
-	// case-insensitive exact match.
-	m2mTrustedActorEmails map[string]bool
+	// m2mClientIDs is config.Config.M2MClientIDs -- the same trusted-internal-
+	// client-id set AccessService.ResolveScope already uses to grant
+	// unconditional, unrestricted access. AddCaseTag/CreateCaseComment reuse
+	// it to decide whether a caller may claim an arbitrary ActorEmail: a
+	// caller whose x-jwt-assertion names a client id in this set is already
+	// trusted to bypass RLS entirely, so it needs no second, narrower
+	// allowlist just to claim a comment/tag author.
+	m2mClientIDs map[string]bool
 }
 
 // NewCaseHandler constructs a CaseHandler with the given service and the
-// allowlist of M2M service-account emails permitted to use
-// AddCaseTagRequest.ActorEmail (see that field's own doc comment). Passing a
-// nil/empty allowlist is safe -- it simply means no ActorEmail is ever
-// trusted, matching the config's default-closed posture.
-func NewCaseHandler(svc service.CaseService, m2mTrustedActorEmails []string) *CaseHandler {
-	allowlist := make(map[string]bool, len(m2mTrustedActorEmails))
-	for _, e := range m2mTrustedActorEmails {
-		allowlist[strings.ToLower(strings.TrimSpace(e))] = true
-	}
-	return &CaseHandler{svc: svc, m2mTrustedActorEmails: allowlist}
+// trusted M2M client id set permitted to use AddCaseTagRequest.ActorEmail/
+// CreateCaseCommentRequest.ActorEmail (see that field's own doc comment and
+// config.Config.M2MClientIDs'). Passing a nil/empty set is safe -- it simply
+// means no ActorEmail is ever trusted, matching the config's default-closed
+// posture.
+func NewCaseHandler(svc service.CaseService, m2mClientIDs map[string]bool) *CaseHandler {
+	return &CaseHandler{svc: svc, m2mClientIDs: m2mClientIDs}
 }
 
 // GetCase handles GET /cases/{id}.
@@ -142,10 +143,11 @@ func (h *CaseHandler) PatchCase(w http.ResponseWriter, r *http.Request) {
 //     existed.
 //   - An M2M caller with no x-user-id-token to resolve an actor from (e.g.
 //     UMT via csm-integration-service): ActorEmail is set instead, and is
-//     honored only when it is on the configured allowlist
-//     (h.m2mTrustedActorEmails) -- otherwise it is rejected here, before
-//     ever reaching the service layer, since an unchecked caller-supplied
-//     actorEmail would let any caller claim to be any user.
+//     honored only when the caller's own x-jwt-assertion names a client id
+//     in the trusted M2M set (h.m2mClientIDs, config.Config.M2MClientIDs) --
+//     otherwise it is rejected here, before ever reaching the service layer,
+//     since an unchecked caller-supplied actorEmail would let any caller
+//     claim to be any user.
 //
 // The two are mutually exclusive: a request carrying both a real
 // x-user-id-token and an ActorEmail is rejected as a bad request rather than
@@ -175,13 +177,13 @@ func (h *CaseHandler) CreateCaseComment(w http.ResponseWriter, r *http.Request) 
 		return
 
 	case req.ActorEmail != nil:
-		actorEmail := strings.ToLower(strings.TrimSpace(*req.ActorEmail))
-		if !h.m2mTrustedActorEmails[actorEmail] {
+		if clientID := auth.IdentityFromContext(r.Context()).ClientID; clientID == "" || !h.m2mClientIDs[clientID] {
 			writeServiceError(w, r, &apierror.ForbiddenError{
-				Msg: "actorEmail is not an authorized M2M service account",
+				Msg: "caller is not an authorized M2M client",
 			})
 			return
 		}
+		actorEmail := strings.ToLower(strings.TrimSpace(*req.ActorEmail))
 		resp, err = h.svc.CreateCaseCommentAs(r.Context(), req, actorEmail)
 
 	default:
@@ -396,10 +398,11 @@ func (h *CaseHandler) SubmitCaseFeedback(w http.ResponseWriter, r *http.Request)
 //     existed.
 //   - An M2M caller with no x-user-id-token to resolve an actor from (e.g.
 //     UMT via csm-integration-service): ActorEmail is set instead, and is
-//     honored only when it is on the configured allowlist
-//     (h.m2mTrustedActorEmails) -- otherwise it is rejected here, before
-//     ever reaching the service layer, since an unchecked caller-supplied
-//     actorEmail would let any caller claim to be any user.
+//     honored only when the caller's own x-jwt-assertion names a client id
+//     in the trusted M2M set (h.m2mClientIDs, config.Config.M2MClientIDs) --
+//     otherwise it is rejected here, before ever reaching the service layer,
+//     since an unchecked caller-supplied actorEmail would let any caller
+//     claim to be any user.
 //
 // The two are mutually exclusive: a request carrying both a real
 // x-user-id-token and an ActorEmail is rejected as a bad request rather than
@@ -429,13 +432,13 @@ func (h *CaseHandler) AddCaseTag(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case req.ActorEmail != nil:
-		actorEmail := strings.ToLower(strings.TrimSpace(*req.ActorEmail))
-		if !h.m2mTrustedActorEmails[actorEmail] {
+		if clientID := auth.IdentityFromContext(r.Context()).ClientID; clientID == "" || !h.m2mClientIDs[clientID] {
 			writeServiceError(w, r, &apierror.ForbiddenError{
-				Msg: "actorEmail is not an authorized M2M service account",
+				Msg: "caller is not an authorized M2M client",
 			})
 			return
 		}
+		actorEmail := strings.ToLower(strings.TrimSpace(*req.ActorEmail))
 		tag, err = h.svc.AddCaseTagAs(r.Context(), caseID, req.Label, actorEmail)
 
 	default:

@@ -105,6 +105,62 @@ describe("useResolvedInlineImageHtml", () => {
     expect(result.current.resolvedHtml).not.toContain("data:");
   });
 
+  describe("bare attachment-id src (migrated content)", () => {
+    const UUID = "0f15cbcc-c36b-8310-af2f-404599013196";
+    const BARE_HTML = `<p><img src="/${UUID}"><br></p>`;
+
+    it("flag off: fetches content by canonical uuid and resolves to a data: URL", async () => {
+      getBlobMock.mockResolvedValue(new Blob(["fake"], { type: "image/png" }));
+      const { result } = renderHook(
+        () => useResolvedInlineImageHtml(BARE_HTML),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      expect(getBlobMock).toHaveBeenCalledTimes(1);
+      expect(getBlobMock.mock.calls[0][0]).toBe(`/attachments/${UUID}/content`);
+      expect(result.current.resolvedHtml).toContain("data:image/png;base64,");
+    });
+
+    it("flag on: creates one share for the canonical uuid and uses its url", async () => {
+      sftpgoFlag.enabled = true;
+      postMock.mockResolvedValue({ shareUrl: "https://sftpgo.example.com/s/abc" });
+      const { result } = renderHook(
+        () => useResolvedInlineImageHtml(BARE_HTML),
+        { wrapper },
+      );
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      expect(postMock).toHaveBeenCalledTimes(1);
+      expect(postMock.mock.calls[0][0]).toBe(`/attachments/${UUID}/share`);
+      expect(result.current.resolvedHtml).toContain(
+        "https://sftpgo.example.com/s/abc",
+      );
+    });
+
+    it("does not double-fetch when the same attachment appears bare and as .iix", async () => {
+      getBlobMock.mockResolvedValue(new Blob(["fake"], { type: "image/png" }));
+      const html = `<img src="/${UUID}"><img src="/${UUID.replace(/-/g, "")}.iix">`;
+      const { result } = renderHook(() => useResolvedInlineImageHtml(html), {
+        wrapper,
+      });
+      await waitFor(() => expect(result.current.isLoading).toBe(false));
+      expect(getBlobMock).toHaveBeenCalledTimes(1);
+      expect(result.current.resolvedHtml).not.toContain("<img src=\"/");
+    });
+
+    it("without the download role, never fetches and shows the permission placeholder", () => {
+      userRoles.value = ["viewer"];
+      const { result } = renderHook(
+        () => useResolvedInlineImageHtml(BARE_HTML),
+        { wrapper },
+      );
+      expect(getBlobMock).not.toHaveBeenCalled();
+      expect(postMock).not.toHaveBeenCalled();
+      expect(result.current.resolvedHtml).toContain(
+        'data-unresolved-reason="permission"',
+      );
+    });
+  });
+
   it("does not resolve anything when the HTML has no .iix references", () => {
     const { result } = renderHook(
       () => useResolvedInlineImageHtml("<p>no images here</p>"),

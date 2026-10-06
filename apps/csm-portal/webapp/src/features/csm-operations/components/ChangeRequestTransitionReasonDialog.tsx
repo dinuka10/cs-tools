@@ -36,7 +36,7 @@ const TRANSITION_COPY: Record<
   rollback: {
     title: "Roll back this change?",
     body:
-      "This moves the change request into Rollback to record that the implemented change is being reversed. It can't be undone from here.",
+      "This moves the change request into Rollback to record that the review failed and the implemented change is being reversed. Rollback is final and can't be undone from here.",
     confirmLabel: "Roll back",
   },
   canceled: {

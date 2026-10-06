@@ -104,6 +104,49 @@ func TestIncidentRepo_CreateIncidentComment_TypeMapping(t *testing.T) {
 	}
 }
 
+// TestIncidentReadMappings_ReturnAPISpellings locks in the read-side enum
+// mappings: an incident read from Postgres carries the same state and
+// resolution code values the API accepts and the ServiceNow data source
+// returns. The webapp keys its state transitions by "CANCELLED", so a
+// 'CANCELED' read back unmapped crashed the incident detail page.
+func TestIncidentReadMappings_ReturnAPISpellings(t *testing.T) {
+	str := func(s string) *string { return &s }
+	deref := func(p *string) string {
+		if p == nil {
+			return "<nil>"
+		}
+		return *p
+	}
+
+	for label, want := range map[string]string{
+		"CANCELED":    "CANCELLED",
+		"NEW":         "NEW",
+		"IN_PROGRESS": "IN_PROGRESS",
+		"CLOSED":      "CLOSED",
+	} {
+		if got := deref(incidentStateFromEnum(str(label))); got != want {
+			t.Errorf("incidentStateFromEnum(%q) = %q, want %q", label, got, want)
+		}
+	}
+	if got := incidentStateFromEnum(nil); got != nil {
+		t.Errorf("incidentStateFromEnum(nil) = %q, want nil", *got)
+	}
+
+	for label, want := range map[string]string{
+		"SOLVED_WORK_AROUND":   "SOLVED_WORKAROUND",
+		"NOT_ACTIONABLE_ALERT": "NOT_ACTIONABLE",
+		"SOLVED_PERMANENTLY":   "SOLVED_PERMANENTLY",
+		"DUPLICATE":            "DUPLICATE",
+	} {
+		if got := deref(incidentResolutionCodeFromEnum(str(label))); got != want {
+			t.Errorf("incidentResolutionCodeFromEnum(%q) = %q, want %q", label, got, want)
+		}
+	}
+	if got := incidentResolutionCodeFromEnum(nil); got != nil {
+		t.Errorf("incidentResolutionCodeFromEnum(nil) = %q, want nil", *got)
+	}
+}
+
 // errorsAsValidationError is a tiny local helper -- this package has no
 // shared asValidationError helper the way internal/service does.
 func errorsAsValidationError(err error, target **apierror.ValidationError) bool {

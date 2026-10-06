@@ -31,11 +31,21 @@ const DefaultPath = "config.toml"
 // Config groups every deployment tunable, previously hardcoded constants, by the subsystem it configures. Security-sensitive constants (e.g. auth.Iterations, the PBKDF2 round count) intentionally stay as Go constants rather than config.toml fields, since they're not meant to vary per deployment.
 type Config struct {
 	Poll      PollConfig      `toml:"poll"`
-	Cassandra CassandraConfig `toml:"cassandra"`
+	Postgres  PostgresConfig  `toml:"postgres"`
 	Notify    NotifyConfig    `toml:"notify"`
 	Server    ServerConfig    `toml:"server"`
-	Lease     LeaseConfig     `toml:"lease"`
 	Engine    EngineConfig    `toml:"engine"`
+	Retention RetentionConfig `toml:"retention"`
+}
+
+// RetentionConfig bounds how long processed alerts and settled incidents are kept.
+type RetentionConfig struct {
+	// Interval is how often one replica purges expired rows.
+	Interval Duration `toml:"interval"`
+	// Alerts is how long a processed alert row, and a raw_alerts webhook body, is kept.
+	Alerts Duration `toml:"alerts"`
+	// Incidents is how long an incident with nothing left to deliver is kept after its last alert.
+	Incidents Duration `toml:"incidents"`
 }
 
 // EngineConfig tunes the dedup engine's fixed duplicate-folding window.
@@ -44,30 +54,20 @@ type EngineConfig struct {
 	DedupWindow Duration `toml:"dedup_window"`
 }
 
-// PollConfig tunes the alert poller's cadence, concurrency, and per-cycle alert id limits.
+// PollConfig tunes the poller's cadence, concurrency, and batch size; applies per replica, no leader election.
 type PollConfig struct {
 	// Interval is the backstop cadence; POST /alertz drives real-time pickup, so this only bounds how long a dropped ping goes unnoticed.
 	Interval Duration `toml:"interval"`
-	// Concurrency is fingerprint-sharded worker count; same-fingerprint alerts stay serialized on one worker.
+	// Concurrency is fingerprint-sharded worker count per replica; same-fingerprint alerts stay serialized on one worker.
 	Concurrency int `toml:"concurrency"`
-	// ReadConcurrency bounds parallel alert-row reads at cycle start, independent of the handling worker count.
-	ReadConcurrency int `toml:"read_concurrency"`
-	// MaxWindow caps how many alert ids a single poll cycle processes at once, bounding memory usage under large alert bursts.
-	MaxWindow int `toml:"max_window"`
-	// GapTimeout is how long an alert id may stay missing before it's skipped and logged loudly; a whole gap is skipped together after one GapTimeout.
-	GapTimeout Duration `toml:"gap_timeout"`
+	// MaxBatch caps the seed rows of one claim; siblings sharing a seed's fingerprint can add as many again, and 2 x MaxBatch alerts can be in flight.
+	MaxBatch int `toml:"max_batch"`
+	// ClaimTTL bounds how long a claimed-but-unfinished alert is held before any replica may reclaim it, recovering work stranded by a crashed replica.
+	ClaimTTL Duration `toml:"claim_ttl"`
 }
 
-// LeaseConfig tunes the lease electing one active poller across replicas, so standbys never double-process alerts.
-type LeaseConfig struct {
-	// TTL bounds how long a dead leader's work can go unresumed by a standby.
-	TTL Duration `toml:"ttl"`
-	// RenewInterval must stay well under TTL so one missed renewal never drops leadership.
-	RenewInterval Duration `toml:"renew_interval"`
-}
-
-// CassandraConfig tunes startup connection retry attempts, backoff delay, connect timeout, and the per-query timeout used for every Cassandra call.
-type CassandraConfig struct {
+// PostgresConfig tunes startup connection retry attempts, backoff delay, connect timeout, and the per-query timeout used for every Postgres call.
+type PostgresConfig struct {
 	ConnectMaxAttempts int      `toml:"connect_max_attempts"`
 	ConnectBaseDelay   Duration `toml:"connect_base_delay"`
 	ConnectTimeout     Duration `toml:"connect_timeout"`
@@ -79,7 +79,7 @@ type NotifyConfig struct {
 	MaxAttempts    int      `toml:"max_attempts"`
 	RetryBaseDelay Duration `toml:"retry_base_delay"`
 	HTTPTimeout    Duration `toml:"http_timeout"`
-	// RetrySweepInterval retries outstanding CSM/Chat notifications; outage recovery, independent of poll.interval.
+	// RetrySweepInterval is the longest delivery waits when no fold triggers it; it bounds retry latency.
 	RetrySweepInterval Duration `toml:"retry_sweep_interval"`
 	// MaxCSMAttempts caps failed attempts before marking permanently failed, so bad payloads don't grow RetrySweep's scan cost forever.
 	MaxCSMAttempts int `toml:"max_csm_attempts"`
@@ -93,8 +93,12 @@ type NotifyConfig struct {
 	CSMRetryMultiplier float64 `toml:"csm_retry_multiplier"`
 	// CSMRetryMaxDelay caps how long the exponential CSM retry wait can grow to.
 	CSMRetryMaxDelay Duration `toml:"csm_retry_max_delay"`
-	// ChatThreadingEnabled threads every Chat fallback message for the same alert fingerprint into one Google Chat thread, instead of posting a new top-level message each time the incident recurs.
+	// ChatFallbackDelay is how long CSM gets to confirm a new incident before it is posted to the Chat fallback; zero posts on the first CSM failure.
+	ChatFallbackDelay Duration `toml:"chat_fallback_delay"`
+	// ChatThreadingEnabled threads each incident's Chat fallback card and its Duplicate/OK replies into one Google Chat thread; a new incident after the dedup window gets its own thread.
 	ChatThreadingEnabled bool `toml:"chat_threading_enabled"`
+	// DeliveryConcurrency is how many incidents each replica delivers to CSM/Chat in parallel, independent of alert processing.
+	DeliveryConcurrency int `toml:"delivery_concurrency"`
 }
 
 // ServerConfig tunes how long the HTTP server waits for in-flight requests to drain during a graceful shutdown before forcing the process to exit.
@@ -124,40 +128,42 @@ func (d Duration) Duration() time.Duration {
 func defaults() Config {
 	return Config{
 		Poll: PollConfig{
-			Interval:        Duration(60 * time.Second),
-			Concurrency:     128,
-			ReadConcurrency: 64,
-			MaxWindow:       2000,
-			GapTimeout:      Duration(10 * time.Minute),
+			Interval:    Duration(10 * time.Second),
+			Concurrency: 128,
+			MaxBatch:    500,
+			ClaimTTL:    Duration(2 * time.Minute),
 		},
-		Lease: LeaseConfig{
-			TTL:           Duration(15 * time.Second),
-			RenewInterval: Duration(5 * time.Second),
-		},
-		Cassandra: CassandraConfig{
+		Postgres: PostgresConfig{
 			ConnectMaxAttempts: 5,
 			ConnectBaseDelay:   Duration(2 * time.Second),
 			ConnectTimeout:     Duration(10 * time.Second),
-			QueryTimeout:       Duration(10 * time.Second),
+			QueryTimeout:       Duration(5 * time.Second),
 		},
 		Notify: NotifyConfig{
 			MaxAttempts:          3,
 			RetryBaseDelay:       Duration(200 * time.Millisecond),
 			HTTPTimeout:          Duration(10 * time.Second),
-			RetrySweepInterval:   Duration(30 * time.Second),
+			RetrySweepInterval:   Duration(15 * time.Second),
 			MaxCSMAttempts:       20,
-			ServiceCacheTTL:      Duration(15 * time.Minute),
-			StateCheckInterval:   Duration(1 * time.Minute),
+			ServiceCacheTTL:      Duration(time.Hour),
+			StateCheckInterval:   Duration(2 * time.Minute),
 			CSMRetryBaseDelay:    Duration(30 * time.Second),
-			CSMRetryMultiplier:   3,
-			CSMRetryMaxDelay:     Duration(time.Hour),
+			CSMRetryMultiplier:   2,
+			CSMRetryMaxDelay:     Duration(15 * time.Minute),
 			ChatThreadingEnabled: true,
+			ChatFallbackDelay:    Duration(25 * time.Second),
+			DeliveryConcurrency:  64,
 		},
 		Server: ServerConfig{
 			ShutdownGrace: Duration(15 * time.Second),
 		},
 		Engine: EngineConfig{
 			DedupWindow: Duration(5 * time.Minute),
+		},
+		Retention: RetentionConfig{
+			Interval:  Duration(time.Hour),
+			Alerts:    Duration(7 * 24 * time.Hour),
+			Incidents: Duration(30 * 24 * time.Hour),
 		},
 	}
 }
@@ -190,26 +196,18 @@ func (c Config) validate() error {
 		return fmt.Errorf("poll.interval must be positive")
 	case c.Poll.Concurrency <= 0:
 		return fmt.Errorf("poll.concurrency must be positive")
-	case c.Poll.ReadConcurrency <= 0:
-		return fmt.Errorf("poll.read_concurrency must be positive")
-	case c.Poll.MaxWindow <= 0:
-		return fmt.Errorf("poll.max_window must be positive")
-	case c.Poll.GapTimeout <= 0:
-		return fmt.Errorf("poll.gap_timeout must be positive")
-	case c.Lease.TTL <= 0:
-		return fmt.Errorf("lease.ttl must be positive")
-	case c.Lease.RenewInterval <= 0:
-		return fmt.Errorf("lease.renew_interval must be positive")
-	case c.Lease.RenewInterval >= c.Lease.TTL:
-		return fmt.Errorf("lease.renew_interval must be less than lease.ttl")
-	case c.Cassandra.ConnectMaxAttempts <= 0:
-		return fmt.Errorf("cassandra.connect_max_attempts must be positive")
-	case c.Cassandra.ConnectBaseDelay <= 0:
-		return fmt.Errorf("cassandra.connect_base_delay must be positive")
-	case c.Cassandra.ConnectTimeout <= 0:
-		return fmt.Errorf("cassandra.connect_timeout must be positive")
-	case c.Cassandra.QueryTimeout <= 0:
-		return fmt.Errorf("cassandra.query_timeout must be positive")
+	case c.Poll.MaxBatch <= 0:
+		return fmt.Errorf("poll.max_batch must be positive")
+	case c.Poll.ClaimTTL <= 0:
+		return fmt.Errorf("poll.claim_ttl must be positive")
+	case c.Postgres.ConnectMaxAttempts <= 0:
+		return fmt.Errorf("postgres.connect_max_attempts must be positive")
+	case c.Postgres.ConnectBaseDelay <= 0:
+		return fmt.Errorf("postgres.connect_base_delay must be positive")
+	case c.Postgres.ConnectTimeout <= 0:
+		return fmt.Errorf("postgres.connect_timeout must be positive")
+	case c.Postgres.QueryTimeout <= 0:
+		return fmt.Errorf("postgres.query_timeout must be positive")
 	case c.Notify.MaxAttempts <= 0:
 		return fmt.Errorf("notify.max_attempts must be positive")
 	case c.Notify.RetryBaseDelay <= 0:
@@ -230,10 +228,20 @@ func (c Config) validate() error {
 		return fmt.Errorf("notify.csm_retry_multiplier must be greater than 1")
 	case c.Notify.CSMRetryMaxDelay.Duration() < c.Notify.CSMRetryBaseDelay.Duration():
 		return fmt.Errorf("notify.csm_retry_max_delay must be at least csm_retry_base_delay")
+	case c.Notify.ChatFallbackDelay < 0:
+		return fmt.Errorf("notify.chat_fallback_delay must not be negative")
+	case c.Notify.DeliveryConcurrency <= 0:
+		return fmt.Errorf("notify.delivery_concurrency must be positive")
 	case c.Server.ShutdownGrace <= 0:
 		return fmt.Errorf("server.shutdown_grace must be positive")
 	case c.Engine.DedupWindow <= 0:
 		return fmt.Errorf("engine.dedup_window must be positive")
+	case c.Retention.Interval <= 0:
+		return fmt.Errorf("retention.interval must be positive")
+	case c.Retention.Alerts < c.Engine.DedupWindow:
+		return fmt.Errorf("retention.alerts must be at least engine.dedup_window")
+	case c.Retention.Incidents < c.Engine.DedupWindow:
+		return fmt.Errorf("retention.incidents must be at least engine.dedup_window")
 	}
 	return nil
 }

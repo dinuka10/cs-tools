@@ -63,6 +63,9 @@ docs/*
 # patterns above miss it. It is full of real names and leave.
 out.sql
 scripts/csm-compose/out.sql
+# Per-run copies of escalation.yaml written by trigger-escalation.sh -c / -m.
+# They can carry your own phone number, so they are never committed.
+scripts/csm-compose/.run/
 # The SRE team's rotation workbook, and SQL generated from it.
 *ABT-Rotation*
 *sre-rotation*.sql

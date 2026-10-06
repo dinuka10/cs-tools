@@ -34,8 +34,8 @@ The sections below appear in the left sidebar in this order:
   My Work, Organisations, New Registrations, and Manage Playbooks.
 
 Accounts set up for the Sales and Solutions Architecture view see a different sidebar in place
-of the one above: **Sales / Solutions Architecture**, with six tabs: Accounts, Projects, Team
-schedule, User scan, Usage metrics, and Customer health.
+of the one above: **Sales / Solutions Architecture**, with seven tabs: Cases, Accounts, Projects,
+Team schedule, User scan, Usage metrics, and Customer health.
 
 Most of these sections have their own topic further down this page with the specifics.
 

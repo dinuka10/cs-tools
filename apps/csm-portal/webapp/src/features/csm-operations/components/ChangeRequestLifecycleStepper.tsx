@@ -102,17 +102,31 @@ function StepNode({ done, current }: { done: boolean; current: boolean }): JSX.E
  * renders dimmed with nothing marked current or complete — the record
  * carries no history of which forward state it was in before the off-ramp —
  * and a distinct tag below names the actual state.
+ *
+ * `customer_approval` and `customer_review` are optional steps, present only
+ * when the CR's "Customer Approval" / "Customer Review" checkbox is on. When
+ * the matching flag is explicitly `false` (and the CR isn't sitting in that
+ * very state) the step is left off the line, so a CR that skips it doesn't
+ * show a step it will never pass through. A flag that is `undefined` (unknown)
+ * keeps the step, i.e. the full 9-state path.
  */
 export default function ChangeRequestLifecycleStepper({
   state,
+  customerApprovalRequired,
+  customerReviewRequired,
 }: {
   state?: string | null;
+  customerApprovalRequired?: boolean;
+  customerReviewRequired?: boolean;
 }): JSX.Element {
   const offRamp = isChangeRequestOffRampState(state);
-  const currentIndex = offRamp
-    ? -1
-    : CHANGE_REQUEST_FORWARD_STATES.indexOf(state as (typeof CHANGE_REQUEST_FORWARD_STATES)[number]);
-  const lastIndex = CHANGE_REQUEST_FORWARD_STATES.length - 1;
+  const steps = CHANGE_REQUEST_FORWARD_STATES.filter((s) => {
+    if (s === "customer_approval") return customerApprovalRequired !== false || state === s;
+    if (s === "customer_review") return customerReviewRequired !== false || state === s;
+    return true;
+  });
+  const currentIndex = offRamp ? -1 : steps.indexOf(state as (typeof steps)[number]);
+  const lastIndex = steps.length - 1;
   // A state the backend could start sending that isn't yet one of the 9
   // forward states or a recognized off-ramp — distinct from "no state at
   // all" (`!state`), which is just a CR still being created and gets no
@@ -128,7 +142,7 @@ export default function ChangeRequestLifecycleStepper({
         aria-label="Change request lifecycle"
         sx={{ display: "flex", alignItems: "flex-start", opacity: offRamp || unrecognizedState ? 0.45 : 1 }}
       >
-        {CHANGE_REQUEST_FORWARD_STATES.map((s, index) => {
+        {steps.map((s, index) => {
           const isCurrent = index === currentIndex;
           const isDone = currentIndex > index;
           // The connector to the LEFT of this node is "filled" once this node

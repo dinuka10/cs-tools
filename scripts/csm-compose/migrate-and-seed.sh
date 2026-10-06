@@ -65,22 +65,6 @@ ensure_migrations_table() {
     "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
 }
 
-# entity-service/migrations currently carries TWO Team Schedule chains side by
-# side (a merge collision upstream). The consolidated chain -- 0153_team_schedule_tables,
-# 0154_team_schedule_catalogue, 0155_team_schedule_audit -- creates the
-# team_schedule_* tables and, on a fresh database, first DROPs the un-prefixed
-# schedule_* tables the older chain built. The older chain's remaining files
-# (0152_team_schedule_tables .. 0168_team_schedule_audit, listed below) then
-# ALTER those dropped tables and fail, so a fresh database can never finish
-# migrating. They are superseded by the consolidated chain, so skip them here.
-# Remove this list once the stale files are deleted from entity-service/migrations.
-is_superseded() {
-  case "$1" in
-    0152_team_schedule_tables|0153_team_schedule_catalogue|0154_team_schedule_vocabulary|    0155_schedule_customer_allocation_split|0156_schedule_shift_is_rotation|    0157_schedule_shift_required_headcount|0158_schedule_assignment_activity|    0159_schedule_absence_activity|0160_schedule_absence_kind_consolidation|    0161_schedule_americas_weekend_names|0162_schedule_remove_invented_windows|    0163_schedule_rotation_short_codes|0164_schedule_integrity_constraints|    0165_schedule_team_key_catalogue|0166_schedule_absence_bucket_enum|    0167_team_schedule_table_prefix|0168_team_schedule_audit) return 0 ;;
-  esac
-  return 1
-}
-
 apply_pending_migrations() {
   db="$1"; dir="$2"
   ensure_migrations_table "$db"
@@ -94,10 +78,6 @@ apply_pending_migrations() {
               ls "${dir}"/[0-9][0-9][0-9][0-9][0-9][0-9]_*.up.sql 2>/dev/null | sort -t_ -k1 -V; } )"
   for f in $files; do
     version="$(basename "$f" .sql)"
-    if is_superseded "$version"; then
-      echo "[migrate]   skipping superseded $version"
-      continue
-    fi
     already="$($PSQL -d "$db" -tAc "SELECT 1 FROM schema_migrations WHERE version = '${version}'")"
     if [ "$already" != "1" ]; then
       echo "[migrate]   applying $f"

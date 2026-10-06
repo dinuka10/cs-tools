@@ -14,6 +14,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import type { TopBannerItem } from "@config/topBannersConfig";
+
 // Extend window interface to include our config
 declare global {
   interface Window {
@@ -84,8 +86,17 @@ declare global {
       CSM_PORTAL_MAINTENANCE_BANNER_ACTION_URL?: string;
       CSM_PORTAL_CHATBOT_WEBSOCKET_URL?: string;
       CSM_PORTAL_FLOATING_NOVERA_ENABLED?: boolean;
+      /** Legacy single banner: gates CSM_PORTAL_TOP_BANNER_HTML when it is a string. */
       CSM_PORTAL_TOP_BANNER_ENABLED?: boolean;
-      CSM_PORTAL_TOP_BANNER_HTML?: string;
+      /**
+       * Legacy single banner. A raw HTML string (shown only when
+       * CSM_PORTAL_TOP_BANNER_ENABLED is true; has no start or expiry) or a banner
+       * object (honours its own startsAt and expiresAt).
+       * Prefer CSM_PORTAL_TOP_BANNERS.
+       */
+      CSM_PORTAL_TOP_BANNER_HTML?: string | TopBannerItem;
+      /** Ordered banners rendered above the header. Default: []. */
+      CSM_PORTAL_TOP_BANNERS?: TopBannerItem[];
       CSM_PORTAL_ANNOUNCEMENT_BANNER_VISIBLE?: boolean;
       CSM_PORTAL_ANNOUNCEMENT_BANNER_STORAGE_KEY?: string;
       CSM_PORTAL_ANNOUNCEMENT_BANNER_HTML?: string;

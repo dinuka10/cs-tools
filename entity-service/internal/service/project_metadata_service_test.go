@@ -41,6 +41,9 @@ func (f *fakeReferenceDataRepo) EnumLabels(context.Context, []string) (map[strin
 func (f *fakeReferenceDataRepo) ListTimeZones(context.Context) ([]repository.TimeZoneRow, error) {
 	return nil, nil
 }
+func (f *fakeReferenceDataRepo) ListSLADurationPolicy(context.Context) ([]repository.SLADurationPolicyRow, error) {
+	return nil, nil
+}
 
 // The call-request endpoints reject upper-case state values ("invalid state"),
 // so the ids the metadata offers must be the lowercase domain ids -- each one

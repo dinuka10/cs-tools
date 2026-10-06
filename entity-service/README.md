@@ -192,8 +192,31 @@ rather than async.
 | `AUTH_ISSUER` / `AUTH_JWKS_URL` | Asgardeo issuer and JWKS URL for validating the `x-user-id-token` user ID token -- always on, there is no flag to disable it. Required; the JWKS must load at startup or the process exits. A present-but-invalid `x-user-id-token` is a 401 on every route. `x-jwt-assertion` (the client-credentials assertion) is decoded only, never verified against these -- see entity-service's `CLAUDE.md` ("Token validation and caller-scoped access") for why |
 | `AUTH_USER_TOKEN_AUDIENCES` | Comma-separated client ids an ID token's `aud` must contain to count as a user token; required |
 | `AUTH_CLOCK_SKEW` | Leeway for `exp` (default `30s`) |
-| `AUTH_INTERNAL_CLIENT_IDS` | Comma-separated Asgardeo application client ids trusted with unconditional full access to every project and case (checked against a client-credentials `x-jwt-assertion` token), regardless of any `x-user-id-token` the same request also carries. A caller not in this list is resolved purely from its `x-user-id-token` instead. Which real client ids go here is a deployment decision, but a service that calls the scoped endpoints directly with only a client-credentials token gets a 401 unless it is listed (optional) |
+| `M2M_CLIENT_IDS` | Comma-separated Asgardeo application client ids for pure machine-to-machine callers (no human in the loop), trusted with unconditional full access to every project and case (checked against a client-credentials `x-jwt-assertion` token), regardless of any `x-user-id-token` the same request also carries. A service that calls the scoped endpoints directly with only a client-credentials token gets a 401 unless it is listed (optional) |
+| `CSM_PORTAL_BACKEND_CLIENT_ID` / `CSM_PORTAL_USER_DOMAIN` | The CSM portal backend's client id, unrestricted only if the forwarded `x-user-id-token`'s email also ends in this domain (e.g. `wso2.com`); otherwise refused (403). Must be set together or not at all (optional) |
+| `CUSTOMER_PORTAL_BACKEND_CLIENT_ID` | The customer portal backend's client id. Checked first and always resolved purely from the forwarded `x-user-id-token` -- never unconditionally trusted, structurally preventing this id from ever gaining unrestricted access even if misconfigured elsewhere (optional) |
 | `CUSTOMER_ROLES` | Comma-separated ServiceNow role names whose presence on a case comment's author marks it a customer reply — see "Customer reply state transition" below. No default; unset means that path never fires (optional) |
+
+### User cache (Redis)
+
+`GET /users/{id}` and `GET /users/me` can be served from Redis (`internal/cache`), cache-aside:
+a miss reads Postgres and stores the result for `USER_CACHE_TTL`. Every writer of user, contact
+and membership data (`POST /users`, `PATCH /users/me`, the Salesforce Contact and membership
+ingest, and the portal `/projects/{id}/contacts` writes) deletes the affected user's entries after
+its transaction commits, so the TTL is only a backstop. Errors and not-found results are never
+cached.
+
+The cache is optional and fails open: with no Redis configured, or Redis unreachable, every read
+goes to Postgres as before (a Redis outage is logged, never returned to the caller). It is wired
+only when there is a database.
+
+| Variable | Description |
+|---|---|
+| `REDIS_URL` | `rediss://:<access-key>@<host>:<port>` for a managed, TLS-only Redis (Azure Managed Redis); takes priority over `REDIS_ADDR`. Holds the access key — a secret in Choreo. Must be non-clustered or the "Enterprise" clustering policy, not "OSS Cluster" (optional) |
+| `REDIS_ADDR` / `REDIS_PASSWORD` | Plain, non-TLS `host:port` and password for a local Redis (optional) |
+| `USER_CACHE_TTL` | How long a cached user lives without an invalidation, as a Go duration (default `10m`) |
+
+Keys are namespaced `entity:v1:user:*`; emails appear in keys only as a SHA-256 hash.
 
 ### SLA status
 

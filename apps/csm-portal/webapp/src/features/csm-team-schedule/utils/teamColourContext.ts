@@ -38,3 +38,24 @@ export const TeamColourContext = createContext<(teamKey: string) => string>(() =
 export function useTeamColour(): (teamKey: string) => string {
   return useContext(TeamColourContext);
 }
+
+/**
+ * A team's display name, by its key.
+ *
+ * The rota stores team_key, which is a slug -- since the catalogue moved to
+ * the long convention it reads "castor_abt_cre_team", which is a database
+ * identifier and not a thing to show a reader. The catalogue serves the name
+ * beside the key, so the lookup rides along with the colour rather than being
+ * threaded separately through every card.
+ *
+ * Falls back to the key itself, so a team the catalogue has not got still
+ * renders something recognisable instead of an empty label.
+ */
+export const TeamNameContext = createContext<(teamKey: string) => string>(
+  (teamKey) => teamKey,
+);
+
+/** The display name for a team, from whatever list the page was given. */
+export function useTeamName(): (teamKey: string) => string {
+  return useContext(TeamNameContext);
+}

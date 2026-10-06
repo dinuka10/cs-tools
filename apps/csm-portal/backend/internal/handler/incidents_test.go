@@ -871,3 +871,65 @@ func TestHandOffIncidentToSpecialist(t *testing.T) {
 		}
 	})
 }
+
+// TestIncidentLifecycle_WithoutSubcategory drives the portal's own
+// incident endpoints the way the webapp does for a full lifecycle: create
+// with no subcategory (CreateIncidentPage no longer requires one), then the
+// EditIncidentDialog PATCH bodies for New -> In Progress -> Resolved ->
+// Closed. Every request must pass this layer's validation and reach the
+// entity service byte-for-byte, and no transition may carry a subcategory.
+func TestIncidentLifecycle_WithoutSubcategory(t *testing.T) {
+	const incidentID = "33333333-3333-3333-3333-333333333333"
+	const createPayload = `{"subject":"Gateway returning 502s","category":"SERVICE_INTERRUPTION","serviceId":"22222222-2222-2222-2222-222222222222","contactType":"EMAIL","impact":"HIGH","urgency":"LOW","callerId":"11111111-1111-1111-1111-111111111111"}`
+
+	var forwarded []string
+	client := &mockEntityIncidentClient{
+		createIncidentFn: func(_ context.Context, body []byte) ([]byte, error) {
+			forwarded = append(forwarded, string(body))
+			return []byte(`{"message":"Incident created successfully.","incident":{"id":"` + incidentID + `","number":"INC0090001"}}`), nil
+		},
+		patchIncidentFn: func(_ context.Context, id string, body []byte) ([]byte, error) {
+			if id != incidentID {
+				t.Errorf("PATCH forwarded for id %q, want %q", id, incidentID)
+			}
+			forwarded = append(forwarded, string(body))
+			return []byte(`{"message":"Incident updated successfully.","incident":{"id":"` + incidentID + `"}}`), nil
+		},
+	}
+	h := NewIncidentHandler(client)
+
+	w := httptest.NewRecorder()
+	h.CreateIncident(w, withUser(httptest.NewRequest(http.MethodPost, "/incidents", strings.NewReader(createPayload))))
+	assertStatus(t, w, http.StatusCreated)
+
+	transitions := []struct{ name, body string }{
+		{"start work", `{"state":"IN_PROGRESS"}`},
+		{"resolve", `{"state":"RESOLVED","resolutionCode":"SOLVED_PERMANENTLY","resolutionNotes":"Rolled back the bad gateway config."}`},
+		{"close", `{"state":"CLOSED","resolutionCode":"SOLVED_PERMANENTLY","resolutionNotes":"Rolled back the bad gateway config."}`},
+	}
+	for _, tr := range transitions {
+		r := withUser(httptest.NewRequest(http.MethodPatch, "/incidents/"+incidentID, strings.NewReader(tr.body)))
+		r.SetPathValue("id", incidentID)
+		w := httptest.NewRecorder()
+		h.PatchIncident(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: PATCH %s: status %d, body %s", tr.name, tr.body, w.Code, w.Body.String())
+		}
+	}
+
+	want := []string{createPayload}
+	for _, tr := range transitions {
+		want = append(want, tr.body)
+	}
+	if len(forwarded) != len(want) {
+		t.Fatalf("forwarded %d requests to the entity service, want %d: %v", len(forwarded), len(want), forwarded)
+	}
+	for i := range want {
+		if forwarded[i] != want[i] {
+			t.Errorf("request %d forwarded as %s, want %s", i, forwarded[i], want[i])
+		}
+		if strings.Contains(forwarded[i], "subcategory") {
+			t.Errorf("request %d carries a subcategory: %s", i, forwarded[i])
+		}
+	}
+}

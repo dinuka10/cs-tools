@@ -17,9 +17,12 @@
 package repository
 
 import (
+	"context"
+	"errors"
 	"sort"
 	"testing"
 
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 )
 
@@ -65,6 +68,20 @@ func TestReferenceTypeToWorkItemType_OthersStaySingleType(t *testing.T) {
 		got := ReferenceTypeToWorkItemType[tt.refType]
 		if len(got) != 1 || got[0] != tt.want {
 			t.Errorf("ReferenceTypeToWorkItemType[%q] = %v, want [%q]", tt.refType, got, tt.want)
+		}
+	}
+}
+
+// TestSearchWorkItemAttachments_RejectsUnsupportedTypes: validation runs
+// before any query, so a repo with no database is enough. "deployment" is not
+// a work_item subtype; "case" has its own method.
+func TestSearchWorkItemAttachments_RejectsUnsupportedTypes(t *testing.T) {
+	r := &caseRepo{}
+	for _, rt := range []domain.ReferenceType{domain.ReferenceTypeDeployment, domain.ReferenceTypeCase, "bogus"} {
+		_, _, err := r.SearchWorkItemAttachments(context.Background(), "00000000-0000-0000-0000-0000000000d1", rt, domain.Pagination{Limit: 10})
+		var ve *apierror.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("type %q: want ValidationError, got %v", rt, err)
 		}
 	}
 }

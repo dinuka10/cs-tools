@@ -37,6 +37,7 @@ import (
 
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/chataudience"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/entity"
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/escalation"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/events"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/notifications"
@@ -69,11 +70,38 @@ type googleChatSender interface {
 	SendSecurityReportAnalysisAlert(ctx context.Context, audience, caseNumber, wso2CaseID, productName, title, team, caseLink string) error
 	SendCaseAcknowledgedAlert(ctx context.Context, audience, severityLabel, severityColor, caseNumber, wso2CaseID, caseLink, acknowledgerName string) error
 	SendSeverityChangedAlert(ctx context.Context, audience, oldSeverityLabel, oldSeverityColor, newSeverityLabel, newSeverityColor, caseNumber, wso2CaseID, title, team, caseLink string) error
+	SendFrustrationAlert(ctx context.Context, audience, caseNumber, wso2CaseID, productName, reason string, frustrationLevel float64, caseLink string) error
+	// HasAudienceSpace answers "does this team have a configured Chat
+	// space" — checkFrustration's own chataudience.Resolve call needs it,
+	// same as internal/slaengine's identical use for SLA breach alerts.
+	HasAudienceSpace(audience string) bool
+}
+
+// escalationDetector abstracts escalation.Client for testability — the one
+// call handleCommentAdded's frustration-detection step makes, to the
+// existing ai-escalate-comment-detector service.
+type escalationDetector interface {
+	DetectEscalation(ctx context.Context, caseID, caseNumber, product, comment string) (escalation.Result, error)
+}
+
+// slaEngineService abstracts internal/slaengine.Engine for testability — the
+// three triggers that keep SLA tracking current: a new case registers its
+// clocks, a status change pauses/resumes/completes them, and a qualifying
+// support-engineer reply completes the response clock early. Each call is
+// best-effort from this dispatcher's own point of view, same posture as
+// every other independent reaction in this file (a Chat/email failure never
+// fails the whole Handle call) — slaengine.Engine itself already logs its
+// own failures and never returns an error to call sites, so there is
+// nothing for this dispatcher to join/propagate here at all.
+type slaEngineService interface {
+	RegisterClocks(ctx context.Context, caseID, priority string, createdAt time.Time, caseNumber, wso2CaseID, caseTitle, caseType, product, team string)
+	ApplyStateEffects(ctx context.Context, caseID, newStatus string)
+	CompleteResponseClock(ctx context.Context, caseID string)
 }
 
 // callSender abstracts notifications.TwilioClient's MakeCall for testability.
 type callSender interface {
-	MakeCall(ctx context.Context, to, message string) error
+	MakeCall(ctx context.Context, to, message string) (notifications.Call, error)
 }
 
 // linkResolver abstracts recipientlinks.Resolver for testability.
@@ -81,6 +109,10 @@ type linkResolver interface {
 	ResolveLinks(ctx context.Context, emails []string, projectID, caseID string) ([]recipientlinks.RecipientLink, error)
 	CSMLink(caseID string) string
 	ChangeRequestLink(audience, changeRequestID, projectID string) string
+	OutageLink(outageID string) string
+	// IsCustomer classifies a single email as external (customer) vs
+	// internal — handleCommentAdded's frustration-detection gate.
+	IsCustomer(ctx context.Context, email string) (bool, error)
 }
 
 // identityProvisioner abstracts scim.Client for testability — the one
@@ -152,6 +184,18 @@ type Dispatcher struct {
 	googleChat googleChatSender
 	call       callSender
 	links      linkResolver
+
+	// frustrationDetector is set via WithFrustrationDetection — nil (every
+	// deployment that hasn't configured it) means handleCommentAdded skips
+	// the frustration-detection step entirely, the same optional-feature
+	// posture WithOnboarding's own cfg has.
+	frustrationDetector escalationDetector
+
+	// slaEngine is set via WithSLAEngine — nil (REDIS_ADDR/REDIS_URL unset)
+	// means handleCaseCreated/handleStatusChanged/handleCommentAdded skip
+	// their own SLA-tracking call entirely, same optional-feature posture as
+	// frustrationDetector above.
+	slaEngine slaEngineService
 
 	// emailSendingEnabled (EMAIL_SENDING_ENABLED, the disable-entirely
 	// `!= "false"` convention CALL_SENDING_ENABLED below also uses) is
@@ -269,6 +313,29 @@ func NewDispatcher(email emailSender, googleChat googleChatSender, call callSend
 		records:              make(map[string]*recordState),
 		identityExisted:      make(map[string]bool),
 	}
+}
+
+// WithFrustrationDetection configures handleCommentAdded's
+// frustration-detection step (see escalationDetector) and returns d for
+// chaining. Not part of NewDispatcher's parameter list deliberately — same
+// "optional per deployment" reasoning as WithOnboarding immediately below: a
+// deployment with no detector configured gets a nil frustrationDetector, and
+// handleCommentAdded skips the step entirely rather than erroring.
+func (d *Dispatcher) WithFrustrationDetection(detector escalationDetector) *Dispatcher {
+	d.frustrationDetector = detector
+	return d
+}
+
+// WithSLAEngine configures handleCaseCreated/handleStatusChanged/
+// handleCommentAdded's SLA-tracking calls (see slaEngineService) and
+// returns d for chaining. Not part of NewDispatcher's parameter list
+// deliberately — same "optional per deployment" reasoning as
+// WithFrustrationDetection above: a deployment with no Redis configured
+// gets a nil slaEngine, and all three handlers skip their own call
+// entirely rather than erroring.
+func (d *Dispatcher) WithSLAEngine(engine slaEngineService) *Dispatcher {
+	d.slaEngine = engine
+	return d
 }
 
 // WithOnboarding configures handleProjectContactInvited (see
@@ -389,6 +456,26 @@ func recordBaseKey(record eventbus.Record) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// HandleShared is Handle for a topic other producers share -- sre-events,
+// which carries the change-request notices and the outage emails today and is
+// meant to carry more operations events later.
+//
+// *** AN UNKNOWN TYPE IS SKIPPED, NOT AN ERROR. *** On a topic this service
+// owns, an unknown type means a broken producer, and failing it into the DLQ
+// is the right signal. On a shared topic it usually means an event some other
+// consumer is for; erroring would burn this consumer's retries on it and then
+// dead-letter a record that was never broken. Known types are handled exactly
+// as Handle handles them.
+func (d *Dispatcher) HandleShared(ctx context.Context, record eventbus.Record) error {
+	var env events.Envelope
+	if err := json.Unmarshal(record.Value, &env); err == nil && env.Type != "" && !env.Type.IsKnown() {
+		slog.InfoContext(ctx, "dispatch: event type not handled by this service on a shared topic, skipping",
+			"type", string(env.Type), "topic", record.Topic)
+		return nil
+	}
+	return d.Handle(ctx, record)
+}
+
 // Handle implements eventbus.Handle. A non-nil return causes the caller
 // (eventbus.Consumer) to retry — see its package doc for the retry policy.
 func (d *Dispatcher) Handle(ctx context.Context, record eventbus.Record) error {
@@ -422,10 +509,20 @@ func (d *Dispatcher) Handle(ctx context.Context, record eventbus.Record) error {
 		return d.handleSeverityChanged(ctx, record, env.Payload)
 	case events.TypeIncidentCreated:
 		return d.handleIncidentCreated(ctx, record, env.Payload)
+	case events.TypeIncidentAcknowledged, events.TypeIncidentPriorityElevated, events.TypeIncidentCommentAdded,
+		events.TypeIncidentAssigned:
+		// The incident call-escalation ladder (internal/paging) owns
+		// these four; the notification dispatcher reacts to none of them. Same
+		// reasoning as the sla.* case below — erroring here would burn this
+		// consumer's retries and dead-letter a perfectly valid event that
+		// simply is not this consumer's concern.
+		return nil
 	case events.TypeCRApprovalRequested:
 		return d.handleCRApprovalRequested(ctx, record, env.Payload)
 	case events.TypeCRPlanDateNotice:
 		return d.handleCRPlanDateNotice(ctx, record, env.Payload)
+	case events.TypeOutageNotificationDue, events.TypeOutageCommunicationDue:
+		return d.handleOutageNotice(ctx, env.Type, env.Payload)
 	case events.TypeProjectContactInvited:
 		return d.handleProjectContactInvited(ctx, record, env.Payload)
 	case events.TypeProjectContactRegistered:
@@ -476,6 +573,20 @@ func (d *Dispatcher) handleCaseCreated(ctx context.Context, record eventbus.Reco
 	var p events.CaseCreatedPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fmt.Errorf("dispatch: decode case.created payload: %w", err)
+	}
+
+	// Independent of, and does not block, every reaction below — see
+	// slaEngineService's own doc comment. CreatedAt is RFC3339 on every
+	// real publisher (see events.CaseCreatedPayload.CreatedAt); a value
+	// that fails to parse skips registration rather than guessing a
+	// fallback "now" that would start every clock from the wrong instant.
+	if d.slaEngine != nil {
+		createdAt, err := time.Parse(time.RFC3339, p.CreatedAt)
+		if err != nil {
+			slog.WarnContext(ctx, "dispatch: case.created createdAt not RFC3339, sla clocks not registered", "caseId", p.CaseID, "createdAt", p.CreatedAt, "err", err)
+		} else {
+			d.slaEngine.RegisterClocks(ctx, p.CaseID, p.Priority, createdAt, p.CaseNumber, p.WSO2CaseID, p.CaseTitle, p.CaseType, p.Product, p.Team)
+		}
 	}
 
 	baseKey := recordBaseKey(record)
@@ -599,6 +710,17 @@ func (d *Dispatcher) handleCommentAdded(ctx context.Context, record eventbus.Rec
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fmt.Errorf("dispatch: decode case.comment_added payload: %w", err)
 	}
+
+	d.checkFrustration(ctx, record, p)
+
+	// Independent of, and does not block, every reaction above/below — see
+	// slaEngineService's own doc comment. Entity-service has already
+	// confirmed IsSupportEngineerResponse (it owns the role data); this
+	// dispatcher does no role/identity resolution of its own.
+	if d.slaEngine != nil && p.IsSupportEngineerResponse {
+		d.slaEngine.CompleteResponseClock(ctx, p.CaseID)
+	}
+
 	groups, groupUserIDs, err := d.groupByLink(ctx, p.Recipients, p.ProjectID, p.CaseID)
 	if err != nil {
 		return err
@@ -624,6 +746,90 @@ func (d *Dispatcher) handleCommentAdded(ctx context.Context, record eventbus.Rec
 	return sendErr
 }
 
+// checkFrustration runs ai-escalate-comment-detector's own OpenAI-backed
+// analysis on a customer-authored comment and, when it crosses that
+// service's own configured threshold, sends a Chat alert — routed through
+// chataudience.Resolve exactly like an SLA breach alert (sendBreachAlert in
+// internal/slaengine): the case's own team when it has a configured space,
+// falling back to Incident Monitor, plus the Evaluation/Onboarding/Americas/
+// weekend overlays. A failure on one resolved audience doesn't stop the
+// others (errors.Join, same as sendBreachAlert), each logged individually.
+//
+// Deliberately best-effort and entirely independent of handleCommentAdded's
+// own email-sending return value: a failure here (entity-service's role
+// lookup, the detector call itself, or the Chat post) is logged and
+// swallowed, never propagated as this record's own error — the email
+// reaction to a new comment is the primary thing this handler exists for,
+// and a problem with a newer, secondary feature must not cause Kafka to
+// retry a comment whose email side has already succeeded.
+//
+// Claimed via recordBaseKey(record)+"/frustration" (the same per-record,
+// content-keyed idempotency tracking as every other channel in this file —
+// see claim's own doc comment), and deliberately NOT released on success the
+// way handleCaseAcknowledged's/handleIncidentCreated's own single-channel
+// shape does: those two are safe to forget-on-success because their own
+// success/failure IS the whole function's return value, so a successful run
+// is never retried at all. This call site is different — it runs
+// unconditionally at the top of handleCommentAdded, whose return value is
+// driven entirely by the EMAIL path below; a record retried solely because
+// the email side failed would otherwise redo this step (a second OpenAI
+// call, and a second Chat post) even though frustration detection itself
+// already fully completed on the first attempt. Released only on
+// record.NoMoreRetries (no further attempt coming, ever, on any topic — see
+// recordBaseKey's own doc comment for why a DLQ redelivery shares the same
+// key) — matching the exact repeated-Chat-alert-on-retry-and-DLQ-hand-off
+// incident this file's own history already documents for the email/other
+// Chat channels.
+func (d *Dispatcher) checkFrustration(ctx context.Context, record eventbus.Record, p events.CommentAddedPayload) {
+	if d.frustrationDetector == nil || p.IsInternalNote || p.AuthorEmail == "" || p.CaseComment == "" {
+		return
+	}
+
+	frustrationKey := recordBaseKey(record) + "/frustration"
+	if record.NoMoreRetries {
+		// No further attempt will ever come for this record's content again
+		// (main topic or DLQ) -- release unconditionally, the same
+		// "regardless of who currently holds it" reasoning
+		// forgetEmailGroups' own NoMoreRetries branch uses. Registered
+		// before the claim attempt below (not after): on the actually-final
+		// retry, claim() returning false (an earlier attempt still holds the
+		// key, since nothing has forgotten it yet) would otherwise return
+		// before ever reaching a forget placed after it, leaking the key
+		// forever -- confirmed by a failing regression test before this
+		// ordering was fixed.
+		defer d.forget(frustrationKey)
+	}
+	if !d.claim(frustrationKey) {
+		return
+	}
+
+	isCustomer, err := d.links.IsCustomer(ctx, p.AuthorEmail)
+	if err != nil {
+		slog.ErrorContext(ctx, "dispatch: frustration detection, classify comment author failed", "caseID", p.CaseID, "err", err)
+		return
+	}
+	if !isCustomer {
+		return
+	}
+
+	result, err := d.frustrationDetector.DetectEscalation(ctx, p.CaseID, p.CaseNumber, p.Product, p.CaseComment)
+	if err != nil {
+		slog.ErrorContext(ctx, "dispatch: frustration detection, detector call failed", "caseID", p.CaseID, "err", err)
+		return
+	}
+	if !result.ShouldAlert {
+		return
+	}
+
+	caseLink := d.links.CSMLink(p.CaseID)
+	audiences := chataudience.Resolve(p.Team, p.IsEvaluationAccount, p.ProjectOnboardingStatus, time.Now(), d.googleChat.HasAudienceSpace)
+	for _, audience := range audiences {
+		if err := d.googleChat.SendFrustrationAlert(ctx, audience, p.CaseNumber, p.WSO2CaseID, p.Product, result.Reason, result.FrustratedLevel, caseLink); err != nil {
+			slog.ErrorContext(ctx, "dispatch: frustration detection, send chat alert failed", "caseID", p.CaseID, "audience", audience, "err", err)
+		}
+	}
+}
+
 // handleStatusChanged's email step is tracked the same way — see
 // handleCommentAdded's doc comment.
 func (d *Dispatcher) handleStatusChanged(ctx context.Context, record eventbus.Record, raw json.RawMessage) error {
@@ -631,6 +837,13 @@ func (d *Dispatcher) handleStatusChanged(ctx context.Context, record eventbus.Re
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return fmt.Errorf("dispatch: decode case.status_changed payload: %w", err)
 	}
+
+	// Independent of, and does not block, the email reaction below — see
+	// slaEngineService's own doc comment.
+	if d.slaEngine != nil {
+		d.slaEngine.ApplyStateEffects(ctx, p.CaseID, p.NewStatus)
+	}
+
 	groups, groupUserIDs, err := d.groupByLink(ctx, p.Recipients, p.ProjectID, p.CaseID)
 	if err != nil {
 		return err
@@ -1361,7 +1574,13 @@ func (d *Dispatcher) handleIncidentCreated(ctx context.Context, record eventbus.
 			slog.WarnContext(ctx, "dispatch: no callTo for incident.created (payload and INCIDENT_DEFAULT_CALL_TO both empty); skipping call")
 		default:
 			message := fmt.Sprintf("New incident: %s. %s", p.Title, p.ShortDescription)
-			callErr = d.call.MakeCall(ctx, callTo, message)
+			var placed notifications.Call
+			placed, callErr = d.call.MakeCall(ctx, callTo, message)
+			if callErr == nil {
+				slog.InfoContext(ctx, "dispatch: incident call placed",
+					"incident", p.Number, "to", maskPhone(callTo),
+					"callSid", placed.SID, "callStatus", placed.Status)
+			}
 			if callErr != nil {
 				d.forget(callKey)
 				callOwned = false
@@ -1996,4 +2215,57 @@ func displayProjectName(projectName, projectKey string) string {
 		return projectKey
 	}
 	return "your project"
+}
+
+// handleOutageNotice sends one of the two outage emails. entity-service has
+// already decided it is owed, worded it and named its recipients; this wraps
+// it, adds the portal link and sends -- with the same sending switch and debug
+// redirect as every other email here.
+//
+// A send failure is returned, not swallowed, so the consumer retries it and
+// then dead-letters it to the outage DLQ: entity-service has already recorded
+// this email as sent, so this is the last place it can be recovered.
+func (d *Dispatcher) handleOutageNotice(ctx context.Context, t events.Type, raw json.RawMessage) error {
+	var p events.OutageNoticePayload
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return fmt.Errorf("dispatch: decode %s payload: %w", t, err)
+	}
+	recipients := p.Recipients
+	if !d.emailSendingEnabled {
+		slog.InfoContext(ctx, "dispatch: email sending disabled, skipping outage email",
+			"type", string(t), "outageId", p.OutageID, "number", p.Number, "kind", p.Kind)
+		return nil
+	}
+	if d.emailDebugMode {
+		if len(d.emailDebugRecipients) == 0 {
+			slog.WarnContext(ctx, "dispatch: email debug mode on with no debug recipients, skipping outage email",
+				"type", string(t), "outageId", p.OutageID)
+			return nil
+		}
+		recipients = d.emailDebugRecipients
+	}
+
+	link := d.links.OutageLink(p.OutageID)
+	var body string
+	if t == events.TypeOutageNotificationDue {
+		body = notifications.RenderOutageNotificationEmail(notifications.OutageNotificationEmailData{
+			PhaseWord: notifications.OutagePhaseWord(p.Kind),
+			Number:    p.Number,
+			Message:   p.Body,
+			Link:      link,
+		})
+	} else {
+		body = notifications.RenderOutageCommunicationEmail(notifications.OutageCommunicationEmailData{
+			PhaseWord: notifications.OutagePhaseWord(p.Kind),
+			Message:   p.Body,
+			Link:      link,
+		})
+	}
+
+	if err := d.email.SendEmail(ctx, recipients, nil, nil, nil, p.Subject, body, nil); err != nil {
+		return fmt.Errorf("dispatch: send %s for outage %s (%s): %w", t, p.Number, p.Kind, err)
+	}
+	slog.InfoContext(ctx, "dispatch: outage email sent", "type", string(t),
+		"outageId", p.OutageID, "number", p.Number, "kind", p.Kind, "recipients", len(recipients))
+	return nil
 }

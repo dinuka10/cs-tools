@@ -58,7 +58,7 @@ type onboardingStepService struct {
 }
 
 // NewOnboardingStepService constructs an OnboardingStepService. access gates
-// every method to internal callers (AUTH_INTERNAL_CLIENT_IDS): onboarding
+// every method to internal callers (an Unrestricted AccessScope): onboarding
 // steps carry other people's e-mail addresses and Salesforce Ids, and an
 // external portal user has no business reading or writing them.
 func NewOnboardingStepService(repo repository.OnboardingStepRepository, access AccessService) OnboardingStepService {

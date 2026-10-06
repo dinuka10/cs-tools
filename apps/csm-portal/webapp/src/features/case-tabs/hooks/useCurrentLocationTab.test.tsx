@@ -15,11 +15,22 @@
 // under the License.
 
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { JSX } from "react";
 import "@testing-library/jest-dom/vitest";
 import { MemoryRouter, Route, Routes } from "react-router";
+// The viewer view pins the cases list, not the CS dashboard, when a case is
+// the first page a user lands on.
+let mockView: "cs-abt" | "sales-sa" = "cs-abt";
+vi.mock("@context/current-user/usePortalView", () => ({
+  usePortalView: () => mockView,
+}));
+
 import { useCurrentLocationTab } from "@features/case-tabs/hooks/useCurrentLocationTab";
+
+beforeEach(() => {
+  mockView = "cs-abt";
+});
 
 function Probe(): JSX.Element {
   const tab = useCurrentLocationTab();
@@ -37,6 +48,19 @@ function renderAt(path: string) {
 }
 
 describe("useCurrentLocationTab", () => {
+  it("falls back to the cases list, not the CS dashboard, in the viewer view", () => {
+    mockView = "sales-sa";
+    render(
+      <MemoryRouter initialEntries={["/cases/CS0001"]}>
+        <Routes>
+          <Route path="*" element={<Probe />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("path")).toHaveTextContent("/cases");
+    expect(screen.getByTestId("path")).not.toHaveTextContent("/dashboard");
+  });
+
   // Regression test: the stored "last non-case location" only captured
   // pathname + search, dropping the `#hash` — a user who opened a case tab
   // from an anchor-linked page (e.g. `/help#topic`) lost the anchor when

@@ -14,8 +14,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// "Home" navigates to /spl/cases, not this app's own /cases — that route is
-// CSM Portal's own, unrelated case-management feature.
+// "Home" navigates to /cases -- the CSM cases list, which is also what the
+// viewer's "Cases" nav item opens.
 import { Box, Button, Tooltip } from "@wso2/oxygen-ui";
 import { ChevronRightIcon, HomeIcon } from "@wso2/oxygen-ui-icons-react";
 import { useNavigate } from "react-router";
@@ -36,7 +36,7 @@ export default function PathView({ accountName, accountNumber }: { accountName?:
   return (
     <Box sx={{ display: "flex", alignItems: "center", gap: 0.5, mb: 1.5 }}>
       <Tooltip title="Home">
-        <Button size="small" onClick={() => navigate("/spl/cases")} startIcon={<HomeIcon size={16} />} />
+        <Button size="small" onClick={() => navigate("/cases")} startIcon={<HomeIcon size={16} />} />
       </Tooltip>
       <ChevronRightIcon size={16} style={{ opacity: 0.5 }} />
       <Tooltip title="Account">

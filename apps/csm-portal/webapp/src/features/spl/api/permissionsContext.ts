@@ -19,9 +19,7 @@ import { createContext, useContext } from "react";
 // Split out of PermissionProvider.tsx: react-refresh/only-export-components
 // requires a file exporting a component to export only components.
 export interface Permissions {
-  canAddWorkNotes: boolean;
   canAddEscalations: boolean;
-  canDownloadAttachments: boolean;
   canViewUsageMetrics: boolean;
 }
 

@@ -18,6 +18,7 @@ package service
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
@@ -27,11 +28,30 @@ import (
 
 type conversationService struct {
 	repo repository.ConversationRepository
+	// snWriteback/snMirror are set only under
+	// DATA_SOURCE=postgres-servicenow-dual-write (via
+	// NewConversationServiceWithSNWriteback) and are nil in every other mode.
+	// CreateConversation calls snMirror synchronously, ServiceNow-first, so
+	// the Postgres row carries ServiceNow's own id and every later mirror
+	// write (UpdateConversation here, the conversation's comments in
+	// commentService) targets a record ServiceNow knows. UpdateConversation
+	// mirrors asynchronously through snWriteback.
+	snWriteback *SNWritebackDispatcher
+	snMirror    ConversationService
 }
 
 // NewConversationService constructs a ConversationService backed by Postgres.
 func NewConversationService(repo repository.ConversationRepository) ConversationService {
 	return &conversationService{repo: repo}
+}
+
+// NewConversationServiceWithSNWriteback is NewConversationService plus the
+// wiring DATA_SOURCE=postgres-servicenow-dual-write needs: UpdateConversation
+// dispatches a best-effort, asynchronous ServiceNow mirror write onto mirror
+// after the Postgres write commits -- see conversationService's own
+// snWriteback/snMirror doc comment.
+func NewConversationServiceWithSNWriteback(repo repository.ConversationRepository, dispatcher *SNWritebackDispatcher, mirror ConversationService) ConversationService {
+	return &conversationService{repo: repo, snWriteback: dispatcher, snMirror: mirror}
 }
 
 // SearchConversations implements ConversationService.
@@ -78,13 +98,60 @@ func (s *conversationService) GetConversation(ctx context.Context, id string) (d
 	return s.repo.GetConversation(ctx, id)
 }
 
-// CreateConversation is not supported for the PostgreSQL data source: like
-// CaseRepository.CreateCase, work_item.number has no DB default and no
-// backing sequence anywhere in migrations/.
-func (s *conversationService) CreateConversation(_ context.Context, _ domain.CreateConversationRequest) (domain.CreateConversationResponse, error) {
-	return domain.CreateConversationResponse{}, &apierror.ServiceUnavailableError{
-		Msg: "creating a conversation is not available on this data source: work_item.number has no generation strategy defined here",
+// conversationSubjectLength is how much of the first message becomes
+// work_item.subject -- the same 100-character truncation csm-sync-service's
+// u_chat_conversation mapping applies to u_initial_message.
+const conversationSubjectLength = 100
+
+// CreateConversation implements ConversationService. The conversation starts
+// ACTIVE: a chat is live from its first message. Under dual-write ServiceNow
+// creates it first (see conversationService's snMirror doc comment); a
+// ServiceNow failure then writes nothing to Postgres.
+func (s *conversationService) CreateConversation(ctx context.Context, req domain.CreateConversationRequest) (domain.CreateConversationResponse, error) {
+	if err := validateUUIDs("projectId", []string{req.ProjectID}); err != nil {
+		return domain.CreateConversationResponse{}, err
 	}
+	if req.InitialMessage == "" {
+		return domain.CreateConversationResponse{}, &apierror.ValidationError{Msg: "initialMessage is required"}
+	}
+
+	token := middleware.UserIDTokenFromContext(ctx)
+	callerEmail, err := emailFromJWT(token)
+	if err != nil {
+		return domain.CreateConversationResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+	}
+
+	in := repository.CreateConversationInput{
+		ProjectID:      req.ProjectID,
+		Subject:        truncateRunes(req.InitialMessage, conversationSubjectLength),
+		InitialMessage: req.InitialMessage,
+		CreatedBy:      callerEmail,
+		State:          domain.ConversationStateActive,
+	}
+
+	if s.snMirror != nil {
+		snResp, err := s.snMirror.CreateConversation(ctx, req)
+		if err != nil {
+			return domain.CreateConversationResponse{}, err
+		}
+		in.ID = snResp.Conversation.ID
+		in.Number = snResp.Conversation.Number
+		if snResp.Conversation.State != nil {
+			in.State = domain.ConversationState(*snResp.Conversation.State)
+		}
+	}
+
+	created, err := s.repo.CreateConversation(ctx, in)
+	if err != nil {
+		if s.snMirror != nil {
+			// ServiceNow already has the conversation: this is drift needing
+			// operator attention, same as createProblemSNFirst's equivalent.
+			slog.ErrorContext(ctx, "sn create conversation: ServiceNow conversation created but the Postgres insert failed",
+				"conversationID", in.ID, "number", in.Number, "err", err)
+		}
+		return domain.CreateConversationResponse{}, err
+	}
+	return domain.CreateConversationResponse{Message: "Conversation created successfully", Conversation: created}, nil
 }
 
 // UpdateConversation implements ConversationService.
@@ -107,8 +174,31 @@ func (s *conversationService) UpdateConversation(ctx context.Context, id string,
 		return domain.UpdateConversationResponse{}, err
 	}
 
+	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
+	// only (snWriteback/snMirror are both nil otherwise -- see
+	// conversationService's own doc comment). Postgres has already committed
+	// by this point.
+	if s.snWriteback != nil {
+		s.snWriteback.Dispatch(ctx, "conversation", id, "update", req,
+			func(writeCtx context.Context) error {
+				_, err := s.snMirror.UpdateConversation(writeCtx, id, req)
+				return err
+			},
+		)
+	}
+
 	return domain.UpdateConversationResponse{
 		Message:      "Conversation updated successfully",
 		Conversation: updated,
 	}, nil
+}
+
+// truncateRunes returns at most n runes of v, never splitting a multi-byte
+// character.
+func truncateRunes(v string, n int) string {
+	r := []rune(v)
+	if len(r) <= n {
+		return v
+	}
+	return string(r[:n])
 }

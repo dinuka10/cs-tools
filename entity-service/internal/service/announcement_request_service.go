@@ -133,8 +133,21 @@ func (s *announcementRequestService) Search(ctx context.Context, req domain.Sear
 	if req.State != nil && !isValidAnnouncementRequestState(*req.State) {
 		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "state must be one of: draft, pending_approval, approved, published"}
 	}
-	if req.ReadyForScheduledPublish && req.State != nil {
-		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "readyForScheduledPublish cannot be combined with state"}
+	for _, st := range req.States {
+		if !isValidAnnouncementRequestState(st) {
+			return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "states must each be one of: draft, pending_approval, approved, published"}
+		}
+	}
+	// "Combined" means the field was sent at all, so these compare against nil
+	// rather than len(): an explicit `"states": []` decodes to a non-nil empty
+	// slice, and a request that names both fields is contradictory even when
+	// one of them is empty. States on its own, empty or omitted, still just
+	// means "no state filter."
+	if req.State != nil && req.States != nil {
+		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "state cannot be combined with states"}
+	}
+	if req.ReadyForScheduledPublish && (req.State != nil || req.States != nil) {
+		return domain.SearchAnnouncementRequestsResponse{}, &apierror.ValidationError{Msg: "readyForScheduledPublish cannot be combined with state or states"}
 	}
 
 	requests, total, err := s.repo.Search(ctx, req)

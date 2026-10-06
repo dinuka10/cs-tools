@@ -190,6 +190,37 @@ func (r *Resolver) linkFor(ctx context.Context, user entity.UserRoleInfo, found 
 	return fmt.Sprintf("%s/cases/%s", r.csmBase, url.PathEscape(caseID))
 }
 
+// IsCustomer classifies a single email the same way linkFor classifies a
+// recipient -- role first (CustomerRoles/CSMRoles), falling back to the
+// email's own domain when entity-service has no record for it or its roles
+// match neither list. Unlike ResolveLinks, this doesn't build a case link at
+// all: it exists for a caller (dispatch's frustration-detection check) that
+// only needs the yes/no classification itself, not a portal link.
+func (r *Resolver) IsCustomer(ctx context.Context, email string) (bool, error) {
+	users, err := r.entity.SearchUsersByEmail(ctx, []string{email})
+	if err != nil {
+		return false, fmt.Errorf("recipientlinks: search users: %w", err)
+	}
+
+	var user entity.UserRoleInfo
+	found := false
+	for _, u := range users {
+		if strings.EqualFold(u.Email, email) {
+			user, found = u, true
+			break
+		}
+	}
+
+	switch {
+	case found && r.matchesAny(user.Roles, r.customerRoles):
+		return true, nil
+	case found && r.matchesAny(user.Roles, r.csmRoles):
+		return false, nil
+	default:
+		return !strings.EqualFold(emailDomain(email), wso2EmailDomain), nil
+	}
+}
+
 // CSMLink builds the CSM portal's case link directly, without any recipient
 // or role lookup — for a notification with no per-recipient audience to
 // resolve against (e.g. dispatch's case.created Google Chat alert, which
@@ -219,6 +250,12 @@ func (r *Resolver) ChangeRequestLink(audience, changeRequestID, projectID string
 			r.customerBase, url.PathEscape(projectID), url.PathEscape(changeRequestID))
 	}
 	return fmt.Sprintf("%s/operations/change-requests/%s", r.csmBase, url.PathEscape(changeRequestID))
+}
+
+// OutageLink is an outage's page in the CSM portal, the route the portal's own
+// outage list navigates to.
+func (r *Resolver) OutageLink(outageID string) string {
+	return fmt.Sprintf("%s/operations/outages/%s", r.csmBase, url.PathEscape(outageID))
 }
 
 // emailDomain returns the part of email after its last "@", lowercased —

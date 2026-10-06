@@ -38,6 +38,37 @@ type fakeIncidentReportTx struct {
 
 	created []repository.NewIncidentReportTask
 	reports map[string]string
+
+	tasks    []repository.NewIncidentTask
+	problems []repository.NewIncidentProblem
+	links    map[string]string // incident id -> problem id
+}
+
+func (f *fakeIncidentReportTx) CreateIncidentTask(_ context.Context, t repository.NewIncidentTask) (string, string, error) {
+	if f.createErr != nil {
+		return "", "", f.createErr
+	}
+	f.tasks = append(f.tasks, t)
+	return "alert-task-id", "CS-PORTAL-000002", nil
+}
+
+func (f *fakeIncidentReportTx) CreateProblem(_ context.Context, p repository.NewIncidentProblem) (string, string, error) {
+	if f.createErr != nil {
+		return "", "", f.createErr
+	}
+	f.problems = append(f.problems, p)
+	return "problem-id", "CS-PORTAL-000003", nil
+}
+
+func (f *fakeIncidentReportTx) LinkProblem(_ context.Context, incidentID, problemID, _ string) error {
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	if f.links == nil {
+		f.links = map[string]string{}
+	}
+	f.links[incidentID] = problemID
+	return nil
 }
 
 func (f *fakeIncidentReportTx) IncidentSource(context.Context, string) (repository.IncidentReportSource, error) {

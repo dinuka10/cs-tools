@@ -141,6 +141,7 @@ func (s *salesforceEventService) writeContact(ctx context.Context, contactSfID, 
 		s.recordContactIngestFailed(ctx, state, err)
 		return err
 	}
+	invalidateUser(ctx, s.membership.UserCache, res.UserID, in.Email)
 	slog.InfoContext(ctx, "salesforce: contact ingested",
 		"contactSfId", contactSfID, "accountSfId", accountSfID, "userId", res.UserID, "accountContactId", res.AccountContactID,
 		"createdUser", res.CreatedUser, "createdAccountContact", res.CreatedAccountContact,
@@ -155,7 +156,7 @@ func (s *salesforceEventService) deactivateContact(ctx context.Context, contactS
 	if s.membership.Contacts == nil || s.support.States == nil {
 		return errContactWriterNotConfigured
 	}
-	found, err := s.membership.Contacts.DeactivateBySfID(ctx, contactSfID, domain.UpsertSalesforceIngestStateRequest{
+	found, affected, err := s.membership.Contacts.DeactivateBySfID(ctx, contactSfID, domain.UpsertSalesforceIngestStateRequest{
 		Entity:          domain.SalesforceIngestEntityContact,
 		SfID:            contactSfID,
 		EventModifiedOn: time.Now().UTC(),
@@ -164,6 +165,9 @@ func (s *salesforceEventService) deactivateContact(ctx context.Context, contactS
 	})
 	if err != nil {
 		return err
+	}
+	for _, u := range affected {
+		invalidateUser(ctx, s.membership.UserCache, u.ID, u.Email)
 	}
 	if !found {
 		slog.InfoContext(ctx, "salesforce: DELETED contact was never ingested, nothing to deactivate", "contactSfId", contactSfID)

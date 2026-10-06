@@ -107,6 +107,9 @@ func (s *incidentReportService) HandleChange(ctx context.Context, tx repository.
 			return err
 		}
 		slog.InfoContext(ctx, "incidentreport: wrote incident report", "incidentId", c.IncidentID)
+		if err := postResolutionTasks(ctx, tx, src); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -361,4 +364,134 @@ func (d *IncidentReportDrainer) drainOnce(ctx context.Context) (int, error) {
 		}
 	}
 	return applied, nil
+}
+
+// ---------------------------------------------------------------------------
+// "[WSO2 Cloud Ops] Post resolution tasks"
+//
+// ServiceNow: record_update incident, run as system, condition
+// business_service=Choreo ^OR business_service=Asgardeo ^ stateCHANGESTO6
+// (Resolved). Its blocks, in order, each If independent of the others
+// (discovery script 55, 2026-10-05):
+//
+//	 1 Log "Incident # - <number> - is resolved"
+//	 2 If close_code = False Alarm          -> 3 alert task, P1, WSO2 SRE Team
+//	 4 If close_code = Duplicate            -> 5 alert task, P1, WSO2 SRE Team
+//	 6 If close_code = Not Actionable Alert -> 7 alert task, P2, WSO2 SRE Team
+//	 8 If close_code = Solved (Work Around) and problem_id is empty
+//	      9 create problem; 10 incident.problem_id = it
+//	     11 If Choreo       -> 12 problem group Choreo Special Ops
+//	     13 Else If Asgardeo -> 14 problem group Asgardeo Operations Team
+//	15 If u_runbook_solve_the_issue = 2 and close_code != Solved (Work Around)
+//	     -> 16 runbook task
+//
+// Blocks 15-16 are NOT ported: incident.u_runbook_solve_the_issue has no
+// Postgres column and the portal has no field for it, so the condition can
+// never be true here. See the PR for what porting it needs.
+//
+// Blocks 9 and 12/14 are one insert here (the problem is created with its
+// group) rather than a create and an update; the stored result is the same.
+// ---------------------------------------------------------------------------
+
+// The two services the flow's trigger names, and the groups it sets, as
+// Postgres ids (sysidToUUID of the ServiceNow sys_ids in the flow).
+const (
+	postResolutionServiceChoreo   = "b9c999f8-1b86-a010-00ae-86acdd4bcb61"
+	postResolutionServiceAsgardeo = "97ed1b8b-1ba2-6c10-00ae-86acdd4bcbd3"
+
+	groupWSO2SRETeam            = "f991f369-1b88-b410-cb68-98aebd4bcb13"
+	groupChoreoSpecialOps       = "fe0d8868-1b0b-3010-d64e-64a2604bcb3c"
+	groupAsgardeoOperationsTeam = "e66e38f7-870b-b110-c049-76e4dabb35aa"
+)
+
+// postResolutionTasks runs the flow's blocks 1-14 for an incident that has
+// just changed to Resolved. src is the incident as it is now, which is what
+// the flow's {{Updated_1.current}} pills read.
+func postResolutionTasks(ctx context.Context, tx repository.IncidentReportTx, src repository.IncidentReportSource) error {
+	service := strOrEmpty(src.ServiceID)
+	if service != postResolutionServiceChoreo && service != postResolutionServiceAsgardeo {
+		return nil
+	}
+	slog.InfoContext(ctx, "Incident # - "+src.Number+" - is resolved", "incidentId", src.IncidentID)
+
+	code := strOrEmpty(src.ResolutionCode)
+	for _, t := range alertTasksFor(src, code) {
+		id, number, err := tx.CreateIncidentTask(ctx, t)
+		if err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "postresolution: created alert task",
+			"incidentId", src.IncidentID, "taskId", id, "taskNumber", number)
+	}
+
+	if code == "SOLVED_WORK_AROUND" && strOrEmpty(src.ProblemID) == "" {
+		id, number, err := tx.CreateProblem(ctx, problemFor(src))
+		if err != nil {
+			return err
+		}
+		if err := tx.LinkProblem(ctx, src.IncidentID, id, incidentReportActor); err != nil {
+			return err
+		}
+		slog.InfoContext(ctx, "postresolution: created problem",
+			"incidentId", src.IncidentID, "problemId", id, "problemNumber", number)
+	}
+	return nil
+}
+
+// alertTasksFor is blocks 2-7. close_code is a single value, so at most one
+// matches. ServiceNow's "Duplicate" (label "Duplicate Alert") arrives in
+// Postgres as DUPLICATE_ALERT from the sync and as DUPLICATE from the
+// portal's resolve; both are that one choice. Subjects are ServiceNow's,
+// including its "Falser Alarm".
+func alertTasksFor(src repository.IncidentReportSource, code string) []repository.NewIncidentTask {
+	var subject, priority string
+	switch code {
+	case "FALSE_ALARM":
+		subject, priority = "[Alert Task][Falser Alarm] "+src.Number+" alert is a false alarm", "CRITICAL"
+	case "DUPLICATE", "DUPLICATE_ALERT":
+		subject, priority = "[Alert Task][Duplicate Alert] "+src.Number+" alert is a duplicate", "CRITICAL"
+	case "NOT_ACTIONABLE_ALERT":
+		subject, priority = "[Alert Task][Not Actionable Alert] "+src.Number+" is not an actionable alert", "HIGH"
+	default:
+		return nil
+	}
+	group := groupWSO2SRETeam
+	return []repository.NewIncidentTask{{
+		IncidentID:        src.IncidentID,
+		Subject:           subject,
+		Priority:          priority,
+		ServiceID:         src.ServiceID,
+		AssignmentGroupID: &group,
+		CreatedBy:         incidentReportActor,
+	}}
+}
+
+// problemFor is blocks 9 and 11-14: service, impact, urgency and priority
+// copied from the incident, the incident linked, and the group chosen by
+// which of the two services the incident is on. The flow's If compares a
+// transform of the incident to CHOREO / ASGARDEO; the trigger admits only
+// those two services, so the service decides it.
+func problemFor(src repository.IncidentReportSource) repository.NewIncidentProblem {
+	group := groupAsgardeoOperationsTeam
+	if strOrEmpty(src.ServiceID) == postResolutionServiceChoreo {
+		group = groupChoreoSpecialOps
+	}
+	return repository.NewIncidentProblem{
+		IncidentID:        src.IncidentID,
+		Subject:           "Fix the root cause of " + src.Number,
+		ServiceID:         src.ServiceID,
+		Priority:          src.Priority,
+		Impact:            src.Impact,
+		Urgency:           src.Urgency,
+		AssignmentGroupID: &group,
+		CreatedBy:         incidentReportActor,
+	}
+}
+
+// strOrEmpty is *s, or "" for nil.
+func strOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

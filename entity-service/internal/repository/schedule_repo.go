@@ -133,7 +133,7 @@ const assignmentColumns = `
     -- silently returned FALSE for a real lead -- no error, just a missing badge.
     -- With no team on the row, any lead membership the engineer holds counts;
     -- with one, only that team's. bool_or keeps it a single row either way.
-    COALESCE((SELECT bool_or(tm2.role = 'lead') FROM team_member tm2
+    COALESCE((SELECT bool_or(tm2.role IN ('lead', 'americas_team_lead')) FROM team_member tm2
                WHERE tm2.user_id = a.user_id
                  AND (a.team_id IS NULL OR tm2.team_id = a.team_id)), FALSE),
     a.team_key, s.code, z.code, a.tier::text, a.rota_date,
@@ -477,7 +477,7 @@ func (r *scheduleRepository) LeadsTeam(ctx context.Context, userEmail, teamKey s
 		    JOIN "user" u ON u.id = tm.user_id
 		    JOIN team t    ON t.id = tm.team_id
 		   WHERE lower(u.email) = lower($1)
-		     AND tm.role = 'lead'
+		     AND tm.role IN ('lead', 'americas_team_lead')
 		     AND t.key = lower($2)
 		)`, userEmail, teamKey).Scan(&ok)
 	if err != nil {
@@ -773,7 +773,7 @@ func (r *scheduleRepository) LeadTeamsFor(ctx context.Context, userEmail string)
 		  JOIN "user" u ON u.id = tm.user_id
 		  JOIN team t    ON t.id = tm.team_id
 		 WHERE lower(u.email) = lower($1)
-		   AND tm.role = 'lead'
+		   AND tm.role IN ('lead', 'americas_team_lead')
 		 ORDER BY 1`, userEmail)
 	if err != nil {
 		return nil, fmt.Errorf("query lead teams: %w", err)

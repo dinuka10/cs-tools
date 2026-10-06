@@ -300,3 +300,28 @@ func TestCommentRowToDomain_NoMatchingUserLeavesNameEmpty(t *testing.T) {
 		t.Errorf("CreatedBy.Email = %q, want %q", got.CreatedBy.Email, "github_pipeline")
 	}
 }
+
+// TestCommentRowToDomain_AgentReadsBackAsNovera covers Novera chat history on
+// Postgres: the assistant's replies are stored with created_by "agent", which
+// has no "user" row, and the customer portal only treats a message as the
+// assistant's when its author name is "Novera" -- the name ServiceNow gave it.
+func TestCommentRowToDomain_AgentReadsBackAsNovera(t *testing.T) {
+	row := repository.CommentRow{
+		ID:         "c-3",
+		WorkItemID: "wi-1",
+		Content:    "Try restarting the gateway.",
+		CreatedBy:  "agent",
+	}
+
+	got := commentRowToDomain(row)
+
+	if got.CreatedBy == nil {
+		t.Fatal("CreatedBy is nil, want a reference")
+	}
+	if got.CreatedBy.Name != "Novera" {
+		t.Errorf("CreatedBy.Name = %q, want %q", got.CreatedBy.Name, "Novera")
+	}
+	if got.CreatedBy.Email != "agent" {
+		t.Errorf("CreatedBy.Email = %q, want %q", got.CreatedBy.Email, "agent")
+	}
+}

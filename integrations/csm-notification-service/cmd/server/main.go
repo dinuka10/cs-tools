@@ -36,9 +36,11 @@ import (
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/dispatch"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/entity"
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/escalation"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/eventbus"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/notifications"
+	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/paging"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/recipientlinks"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/scim"
 	"github.com/wso2-open-operations/cs-tools/integrations/csm-notification-service/internal/slaengine"
@@ -93,7 +95,36 @@ func main() {
 		Voice:               os.Getenv("TWILIO_VOICE"),
 		Language:            os.Getenv("TWILIO_LANGUAGE"),
 		APIBaseURL:          os.Getenv("TWILIO_API_BASE_URL"),
+		// Without this the field was documented, settable, and read by
+		// nothing: every production ladder call rang for Twilio's 60s default
+		// whatever an operator configured. It matters for a ladder because a
+		// rung's next attempt can come due while the previous call is still
+		// ringing.
+		RingTimeoutSeconds: envInt("TWILIO_RING_TIMEOUT_SECONDS", 0),
 	})
+
+	// The frustration-detection escalation client (dispatch.checkFrustration,
+	// case.comment_added only) is likewise optional per deployment: an unset
+	// ESCALATION_DETECTOR_BASE_URL means WithFrustrationDetection below is
+	// simply never called, and checkFrustration's own nil-frustrationDetector
+	// check skips the step entirely rather than erroring on every comment.
+	//
+	// Shares the same OAuth2 client credentials app as emailClient/
+	// customerEntityClient above (OAUTH2_CLIENT_ID/OAUTH2_CLIENT_SECRET/
+	// OAUTH2_TOKEN_URL) rather than getting its own -- only BaseURL/Scopes
+	// are specific to this client.
+	var escalationClient *escalation.Client
+	if baseURL := os.Getenv("ESCALATION_DETECTOR_BASE_URL"); baseURL != "" {
+		escalationClient = escalation.New(escalation.Config{
+			BaseURL:      baseURL,
+			TokenURL:     os.Getenv("OAUTH2_TOKEN_URL"),
+			ClientID:     os.Getenv("OAUTH2_CLIENT_ID"),
+			ClientSecret: os.Getenv("OAUTH2_CLIENT_SECRET"),
+			Scopes:       splitComma(os.Getenv("ESCALATION_DETECTOR_SCOPES")),
+		})
+	} else {
+		slog.Warn("ESCALATION_DETECTOR_BASE_URL not set; frustration detection on case.comment_added is disabled")
+	}
 
 	// The customer entity service backs per-recipient portal-link resolution
 	// (internal/recipientlinks) — optional per deployment like the channel
@@ -186,6 +217,41 @@ func main() {
 	crDLQProducer := eventbus.NewProducer(crDLQCfg)
 	defer crDLQProducer.Close()
 
+	// The escalation ladder needs a dead-letter topic of its own, and for a
+	// sharper reason than isolation.
+	//
+	// It shares the case topic with the dispatcher but runs a different
+	// handler. Dead-lettering a ladder record onto the shared DLQ hands it to
+	// the DLQ consumer, which runs dispatcher.Handle -- so an incident.created
+	// whose LADDER exhausted its retries would be dispatched a second time,
+	// placing another immediate call for an incident the dispatcher had
+	// already handled, while the ladder itself was never retried at all. One
+	// duplicate call, and still no escalation.
+	escalationDLQCfg := eventbus.Config{
+		Broker:           eventBusCfg.Broker,
+		ConnectionString: eventBusCfg.ConnectionString,
+		Topic:            envOrDefault("INCIDENT_ESCALATION_DLQ_TOPIC", "escalation-events-dlq"),
+	}
+	escalationDLQProducer := eventbus.NewProducer(escalationDLQCfg)
+	defer escalationDLQProducer.Close()
+
+	// The two outage emails ride their own topic as well, for the same
+	// reason: entity-service's outage notice drainer publishes them there
+	// (OUTAGE_EVENT_HUB_TOPIC there), and its own DLQ keeps a stuck outage
+	// email out of the case and change-request dead-letter topics.
+	outageCfg := eventbus.Config{
+		Broker:           eventBusCfg.Broker,
+		ConnectionString: eventBusCfg.ConnectionString,
+		Topic:            envOrDefault("OUTAGE_EVENT_HUB_TOPIC", "outage-events"),
+	}
+	outageDLQCfg := eventbus.Config{
+		Broker:           eventBusCfg.Broker,
+		ConnectionString: eventBusCfg.ConnectionString,
+		Topic:            envOrDefault("OUTAGE_EVENT_HUB_DLQ_TOPIC", "outage-events-dlq"),
+	}
+	outageDLQProducer := eventbus.NewProducer(outageDLQCfg)
+	defer outageDLQProducer.Close()
+
 	// The onboarding events ride their own topic too, for the same reason
 	// the change-request notices do: a separate consumer group isolates
 	// processing, only a separate topic isolates volume. An invitation
@@ -216,6 +282,10 @@ func main() {
 	crDLQConsumerGroup := envOrDefault("CR_DLQ_CONSUMER_GROUP", "csm-notification-service-cr-dlq")
 	crConsumerCount := envInt("CR_CONSUMER_COUNT", 1)
 	crDLQConsumerCount := envInt("CR_DLQ_CONSUMER_COUNT", 1)
+	outageConsumerGroup := envOrDefault("OUTAGE_CONSUMER_GROUP", "csm-notification-service-outage")
+	outageDLQConsumerGroup := envOrDefault("OUTAGE_DLQ_CONSUMER_GROUP", "csm-notification-service-outage-dlq")
+	outageConsumerCount := envInt("OUTAGE_CONSUMER_COUNT", 1)
+	outageDLQConsumerCount := envInt("OUTAGE_DLQ_CONSUMER_COUNT", 1)
 	projectConsumerGroup := envOrDefault("PROJECT_CONSUMER_GROUP", "csm-notification-service-project")
 	projectDLQConsumerGroup := envOrDefault("PROJECT_DLQ_CONSUMER_GROUP", "csm-notification-service-project-dlq")
 	projectConsumerCount := envInt("PROJECT_CONSUMER_COUNT", 1)
@@ -278,6 +348,17 @@ func main() {
 
 	dispatcher := dispatch.NewDispatcher(emailClient, googleChatClient, twilioClient, linkResolver, emailSendingEnabled, emailDebugMode, emailDebugRecipients, callSendingEnabled, defaultOnCallNumber, defaultCSMEmailCC).
 		WithOnboarding(loadOnboardingConfig(customerEntityClient, emailClient))
+	// escalationClient is a *escalation.Client, not the escalationDetector
+	// interface itself -- passing it through WithFrustrationDetection
+	// unconditionally when nil would store a non-nil interface wrapping a
+	// nil pointer (the same "nil pointer in an interface is non-nil" trap
+	// entity-service's own health handler guards against), making
+	// checkFrustration's own frustrationDetector != nil check always true
+	// and then panicking on DetectEscalation. Only chain it in when a real
+	// client was constructed.
+	if escalationClient != nil {
+		dispatcher = dispatcher.WithFrustrationDetection(escalationClient)
+	}
 
 	// The main consumer's OnExhausted: publish the exhausted record to the
 	// dead-letter topic instead of just logging and dropping it. The DLQ's
@@ -300,6 +381,25 @@ func main() {
 		slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
 			append(attrs, deadLetterErrAttrs(handleErr)...)...)
 		return crDLQProducer.Publish(ctx, record.Key, record.Value)
+	}
+
+	// The escalation ladder's own, for the reason escalationDLQCfg gives: a
+	// record retried by the wrong handler is a duplicate call.
+	escalationToDeadLetter := func(ctx context.Context, record eventbus.Record, handleErr error) error {
+		attrs := []any{"topic", record.Topic, "partition", record.Partition,
+			"offset", record.Offset, "dlqTopic", escalationDLQCfg.Topic}
+		slog.WarnContext(ctx, "eventbus: escalation handler exhausted retries, publishing to its own dead-letter topic",
+			append(attrs, deadLetterErrAttrs(handleErr)...)...)
+		return escalationDLQProducer.Publish(ctx, record.Key, record.Value)
+	}
+
+	// And for the outage consumer.
+	outageToDeadLetter := func(ctx context.Context, record eventbus.Record, handleErr error) error {
+		attrs := []any{"topic", record.Topic, "partition", record.Partition,
+			"offset", record.Offset, "dlqTopic", outageDLQCfg.Topic}
+		slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
+			append(attrs, deadLetterErrAttrs(handleErr)...)...)
+		return outageDLQProducer.Publish(ctx, record.Key, record.Value)
 	}
 
 	// Same again for the onboarding consumer: a stuck invitation cannot
@@ -352,29 +452,27 @@ func main() {
 		}
 	}()
 
-	mainConsumers := startConsumers(ctx, "main", eventBusCfg, consumerGroup, mainConsumerCount, dispatcher.Handle, toDeadLetter)
-	dlqConsumers := startConsumers(ctx, "dlq", dlqCfg, dlqConsumerGroup, dlqConsumerCount, dispatcher.Handle, nil)
-	// Same dispatcher as the case consumers: it already routes on the
-	// envelope's Type, and these two only ever receive change_request.* since
-	// that is all their topic carries.
-	crConsumers := startConsumers(ctx, "cr", crCfg, crConsumerGroup, crConsumerCount, dispatcher.Handle, crToDeadLetter)
-	crDLQConsumers := startConsumers(ctx, "cr-dlq", crDLQCfg, crDLQConsumerGroup, crDLQConsumerCount, dispatcher.Handle, nil)
-	// And the same for project_contact.invited: the one dispatcher routes
-	// on the envelope's Type already, and these two only ever receive the
-	// onboarding events since that is all their topic carries.
-	projectConsumers := startConsumers(ctx, "project", projectCfg, projectConsumerGroup, projectConsumerCount, dispatcher.Handle, projectToDeadLetter)
-	projectDLQConsumers := startConsumers(ctx, "project-dlq", projectDLQCfg, projectDLQConsumerGroup, projectDLQConsumerCount, dispatcher.Handle, nil)
-
 	// The SLA breach-alerting engine is optional per deployment, gated on
 	// REDIS_ADDR or REDIS_URL being set — unset means this engine never
-	// polls, matching the "unset means don't run" convention used elsewhere
-	// in this repo's own services for an optional capability (e.g.
-	// apps/csm-portal/backend's EVENT_HUB_BROKER gate). Unlike the design
-	// this replaced, it is no longer a Kafka consumer at all — see
-	// internal/slaengine's own CLAUDE.md section ("SLA breach alerting")
-	// for the full redesign: it polls entity-service's GET /sla-status
-	// (backed by the real, ServiceNow-synced "sla" table, not a value this
-	// service used to compute itself) on a plain ticker instead.
+	// starts, matching the "unset means don't run" convention used
+	// elsewhere in this repo's own services for an optional capability
+	// (e.g. apps/csm-portal/backend's EVENT_HUB_BROKER gate). It is not a
+	// Kafka consumer of its own either — see internal/slaengine's own
+	// CLAUDE.md section ("SLA breach alerting") for the full design:
+	// RegisterClocks/ApplyStateEffects/CompleteResponseClock are called
+	// directly from three of dispatcher's own handlers, on the existing
+	// main consumer; only the tick itself runs on its own ticker, scanning
+	// a Redis wake-index this engine computes and schedules entirely on
+	// its own, not a poll of entity-service.
+	//
+	// This whole block — Redis connection included — runs here, BEFORE any
+	// consumer starts below, specifically so dispatcher.WithSLAEngine has
+	// already set Dispatcher.slaEngine before the first case.created can
+	// ever reach handleCaseCreated. A consumer started first and wired
+	// second would let an early, unlucky delivery see a nil slaEngine,
+	// skip RegisterClocks, and still have its offset committed — silently
+	// losing that one case's SLA tracking forever, since there is no
+	// backfill (see RegisterClocks' own doc comment).
 	//
 	// REDIS_URL (a rediss://:<password>@<host>:<port> connection string,
 	// parsed via redis.ParseURL) is how a managed Redis with TLS — Azure
@@ -393,10 +491,11 @@ func main() {
 	// to follow MOVED/ASK redirects, which nothing here constructs. Confirm
 	// the target Redis resource's clustering policy is Enterprise/
 	// non-clustered before pointing REDIS_URL at it; OSS Cluster policy will
-	// fail unpredictably (TierStore's key operations landing on the wrong
-	// shard) rather than at this construction site.
+	// fail unpredictably (slaengine.Store's key operations landing on the
+	// wrong shard) rather than at this construction site.
 	var redisClient *redis.Client
 	var slaProducer *eventbus.Producer
+	var escalationConsumers []*eventbus.Consumer
 	redisURL := os.Getenv("REDIS_URL")
 	redisAddr := os.Getenv("REDIS_ADDR")
 	if redisURL != "" || redisAddr != "" {
@@ -432,7 +531,8 @@ func main() {
 		// warns-and-degrades on a missing config), mustEnv is used for all
 		// four values here: once REDIS_ADDR opts into this engine, every one
 		// of them is required for it to do anything at all — a missing
-		// credential would otherwise silently fail every poll.
+		// credential would otherwise silently fail the one startup call this
+		// client makes.
 		slaEntityClient := slaengine.NewEntityClient(slaengine.EntityConfig{
 			BaseURL:      mustEnv("CUSTOMER_ENTITY_BASE_URL"),
 			TokenURL:     mustEnv("OAUTH2_TOKEN_URL"),
@@ -448,19 +548,363 @@ func main() {
 		// exists.
 		slaProducer = eventbus.NewProducer(eventBusCfg)
 
-		slaEngine := slaengine.NewEngine(slaEntityClient, slaengine.NewTierStore(redisClient), slaProducer, googleChatClient, linkResolver, emailClient, emailSendingEnabled, emailDebugMode, emailDebugRecipients)
+		// GET /sla-duration-policy is fetched exactly once, here, at
+		// startup — not refreshed again for the life of this process (see
+		// slaengine.Engine's own doc comment on why). A failure here is
+		// loud but not fatal: this is a nice-to-have engine layered on top
+		// of the notification channels this service exists for, not core
+		// delivery, so SLA tracking is simply disabled for this run rather
+		// than crash-looping the whole service over one failed startup
+		// call — restarting (or redeploying) picks it up once
+		// entity-service is reachable again. The 30s timeout bounds how
+		// long this can delay event consumption below by at most that much
+		// — acceptable once, at startup, for a feature that's otherwise
+		// entirely event-driven with no further entity-service calls.
+		slaStartupCtx, slaStartupCancel := context.WithTimeout(ctx, 30*time.Second)
+		durations, err := slaEntityClient.GetDurationPolicy(slaStartupCtx)
+		slaStartupCancel()
+		if err != nil {
+			slog.Error("slaengine: failed to fetch sla duration policy at startup, sla tracking is disabled for this run", "err", err)
+		} else {
+			slaEngine := slaengine.NewEngine(slaengine.NewStore(redisClient), slaProducer, googleChatClient, linkResolver, durations)
+			dispatcher = dispatcher.WithSLAEngine(slaEngine)
 
-		// SLA_TICK_INTERVAL defaults far above the old wake-index engine's
-		// 15s: that interval made sense for firing a precomputed due date
-		// close to when it actually elapsed, but this engine now polls
-		// entity-service directly every tick (paginating through every
-		// active clock, ~5,500 as of this redesign) and only needs to
-		// notice a newly-crossed 50/75/100% checkpoint, not a specific
-		// instant — most active "sla" rows don't change more than a few
-		// times a day. 5 minutes balances alert latency against load on
-		// entity-service and Redis.
-		tickInterval := envDuration("SLA_TICK_INTERVAL", 5*time.Minute)
-		go slaEngine.RunTicker(ctx, tickInterval)
+			// SLA_TICK_INTERVAL defaults far above the old wake-index
+			// design's original 15s: this engine now schedules a wake entry
+			// per tier at registration time (RegisterClocks), so a tick only
+			// needs to notice whichever ones have since become due, not
+			// recompute anything — 5 minutes balances alert latency against
+			// a near-zero load on Redis either way.
+			tickInterval := envDuration("SLA_TICK_INTERVAL", 5*time.Minute)
+			go slaEngine.RunTicker(ctx, tickInterval)
+		}
+	}
+
+	mainConsumers := startConsumers(ctx, "main", eventBusCfg, consumerGroup, mainConsumerCount, dispatcher.Handle, toDeadLetter)
+	dlqConsumers := startConsumers(ctx, "dlq", dlqCfg, dlqConsumerGroup, dlqConsumerCount, dispatcher.Handle, nil)
+	// Same dispatcher as the case consumers: it already routes on the
+	// envelope's Type, and these two only ever receive change_request.* since
+	// that is all their topic carries.
+	//
+	// sre-events: ONE topic for the operations notifications (change-request
+	// notices and outage emails today), routed by event type like every
+	// topic here. Off unless SRE_EVENT_HUB_TOPIC is set, so a deployment
+	// that does not set it runs exactly the consumers it did before. When set,
+	// see planSREConsumers for which consumers it replaces and which group it
+	// reads with.
+	plan := planSREConsumers(os.Getenv("SRE_EVENT_HUB_TOPIC"), os.Getenv("SRE_CONSUMER_GROUP"),
+		os.Getenv("SRE_EVENT_HUB_DLQ_TOPIC"), os.Getenv("SRE_DLQ_CONSUMER_GROUP"),
+		consumerTarget{crCfg.Topic, crConsumerGroup}, consumerTarget{crDLQCfg.Topic, crDLQConsumerGroup},
+		consumerTarget{outageCfg.Topic, outageConsumerGroup}, consumerTarget{outageDLQCfg.Topic, outageDLQConsumerGroup})
+	if err := validateSREPlan(plan, eventBusCfg.Topic, projectCfg.Topic); err != nil {
+		slog.Error("invalid sre-events configuration", "err", err)
+		os.Exit(1)
+	}
+	var crConsumers, crDLQConsumers, outageConsumers, outageDLQConsumers, sreConsumers, sreDLQConsumers []*eventbus.Consumer
+	if plan.StartCR {
+		crConsumers = startConsumers(ctx, "cr", crCfg, crConsumerGroup, crConsumerCount, dispatcher.Handle, crToDeadLetter)
+	}
+	if plan.StartCRDLQ {
+		crDLQConsumers = startConsumers(ctx, "cr-dlq", crDLQCfg, crDLQConsumerGroup, crDLQConsumerCount, dispatcher.Handle, nil)
+	}
+	if plan.StartOutage {
+		outageConsumers = startConsumers(ctx, "outage", outageCfg, outageConsumerGroup, outageConsumerCount, dispatcher.Handle, outageToDeadLetter)
+	}
+	if plan.StartOutageDLQ {
+		outageDLQConsumers = startConsumers(ctx, "outage-dlq", outageDLQCfg, outageDLQConsumerGroup, outageDLQConsumerCount, dispatcher.Handle, nil)
+	}
+	if plan.Enabled {
+		sreCfg := eventbus.Config{Broker: eventBusCfg.Broker, ConnectionString: eventBusCfg.ConnectionString, Topic: plan.SRE.Topic}
+		sreDLQCfg := eventbus.Config{Broker: eventBusCfg.Broker, ConnectionString: eventBusCfg.ConnectionString, Topic: plan.SREDLQ.Topic}
+		sreDLQProducer := eventbus.NewProducer(sreDLQCfg)
+		defer sreDLQProducer.Close()
+		sreToDeadLetter := func(ctx context.Context, record eventbus.Record, handleErr error) error {
+			attrs := []any{"topic", record.Topic, "partition", record.Partition,
+				"offset", record.Offset, "dlqTopic", sreDLQCfg.Topic}
+			slog.WarnContext(ctx, "eventbus: handler exhausted retries, publishing to dead-letter topic",
+				append(attrs, deadLetterErrAttrs(handleErr)...)...)
+			return sreDLQProducer.Publish(ctx, record.Key, record.Value)
+		}
+		// HandleShared, not Handle: an event type this service does not
+		// handle is someone else's on a shared topic, not a broken record.
+		sreConsumers = startConsumers(ctx, "sre", sreCfg, plan.SRE.Group,
+			envInt("SRE_CONSUMER_COUNT", 1), dispatcher.HandleShared, sreToDeadLetter)
+		sreDLQConsumers = startConsumers(ctx, "sre-dlq", sreDLQCfg, plan.SREDLQ.Group,
+			envInt("SRE_DLQ_CONSUMER_COUNT", 1), dispatcher.HandleShared, nil)
+		slog.Info("sre-events consumer enabled", "topic", plan.SRE.Topic, "group", plan.SRE.Group,
+			"dlqTopic", plan.SREDLQ.Topic, "dlqGroup", plan.SREDLQ.Group,
+			"replacesCRConsumer", !plan.StartCR, "replacesOutageConsumer", !plan.StartOutage)
+	}
+	// And the same for project_contact.invited: the one dispatcher routes
+	// on the envelope's Type already, and these two only ever receive the
+	// onboarding events since that is all their topic carries.
+	projectConsumers := startConsumers(ctx, "project", projectCfg, projectConsumerGroup, projectConsumerCount, dispatcher.Handle, projectToDeadLetter)
+	projectDLQConsumers := startConsumers(ctx, "project-dlq", projectDLQCfg, projectDLQConsumerGroup, projectDLQConsumerCount, dispatcher.Handle, nil)
+
+	// The incident call-escalation ladder (internal/paging) shares the Redis
+	// connected further up (for the SLA engine, started before any consumer
+	// — see that block's own doc comment) — its own keys, its own ZSET, and
+	// its own consumer group on the same topic. Unlike the SLA engine, it
+	// has no race with dispatcher.Handle to avoid: it uses its own
+	// escalationEngine.Handle, never routed through Dispatcher, so there is
+	// no reason to also pull this forward ahead of the main consumers.
+	if redisClient != nil {
+		// It needs one more thing than Redis, though: a roster to resolve
+		// levels to people (see paging.RosterResolver for why that is
+		// configuration rather than a ServiceNow lookup today). With none
+		// configured, the engine is deliberately NOT started — a running
+		// ladder that can never call anyone is worse than an absent one,
+		// because it looks like coverage.
+		roster, err := paging.ParseRoster(os.Getenv("INCIDENT_ESCALATION_ROSTER"))
+		escalationChannel, channelErr := paging.ParseChannel(os.Getenv("INCIDENT_ESCALATION_CHANNEL"))
+
+		// The configuration file governs behaviour; the environment still
+		// holds the secrets. With no file, every knob keeps its previous
+		// env-derived value, so an existing deployment behaves exactly as it
+		// did -- see loadEscalationConfig.
+		escalationCfg, cfgErr := loadEscalationConfig(escalationChannel)
+		creCfg, creRunning := escalationCfg.For(paging.LadderKeyCRE)
+		sreCfg, sreRunning := escalationCfg.For(paging.LadderKeySRE)
+		escalationRunning := creRunning || sreRunning
+		if cfgErr == nil {
+			// The file wins over INCIDENT_ESCALATION_CHANNEL when there is
+			// one, so there is a single answer to "what will this dial".
+			escalationChannel = creCfg.Channel
+		}
+
+		usingTeamSchedule := os.Getenv("INCIDENT_ESCALATION_RESOLVER") == "team-schedule"
+		startProblem := escalationStartProblem(err != nil, roster.IsEmpty(),
+			usingTeamSchedule, os.Getenv("CUSTOMER_ENTITY_BASE_URL") != "")
+		// A Team Schedule resolver with no teams configured can resolve almost
+		// nothing: no ABT keys and no ABT type means isABT is always false,
+		// the team-lead and nominee rungs return nobody, and only the two
+		// heads are reachable. The ladder would start, climb, and page almost
+		// no one -- which is the "worse than an absent one, because it looks
+		// like coverage" case escalationStartProblem exists to prevent, just
+		// arriving through configuration rather than through a missing roster.
+		if startProblem == "" && usingTeamSchedule &&
+			len(creCfg.Teams.ABTs) == 0 && creCfg.Teams.ABTType == "" {
+			startProblem = "INCIDENT_ESCALATION_RESOLVER=team-schedule needs teams.abtType or teams.abts " +
+				"in the escalation configuration; without them almost every rung resolves to nobody"
+		}
+		switch {
+		case cfgErr != nil:
+			// Never a fall back to defaults: this file decides what gets
+			// dialled, so a broken one means nothing runs until it is fixed.
+			slog.Error("invalid escalation configuration; both ladders are disabled", "err", cfgErr)
+		case !escalationRunning:
+			slog.Warn("incident call escalation is disabled by configuration",
+				"configPath", os.Getenv("INCIDENT_ESCALATION_CONFIG"))
+		case startProblem != "":
+			// Not logging a roster decode error itself: it can quote the
+			// surrounding JSON, which carries real phone numbers.
+			slog.Error(startProblem + "; incident call escalation is disabled")
+		case channelErr != nil:
+			slog.Error("invalid INCIDENT_ESCALATION_CHANNEL; incident call escalation is disabled", "err", channelErr)
+		default:
+			// Same entity-service and same shared OAuth2 app as the SLA
+			// engine's client above — a separate client only because this one
+			// speaks to /incidents rather than the sla_clocks endpoints.
+			//
+			// Unlike that one, this is os.Getenv and genuinely optional. The
+			// SLA engine can do nothing at all without entity-service — its
+			// clocks live there. This engine's job is notifying people; the
+			// execution summary is a record of what it did. A deployment (or
+			// a laptop) without entity-service access should still be able to
+			// run a real ladder, with the summary logged instead of written
+			// back — see Engine.writeNote's nil handling.
+			var escalationNotes *paging.EntityClient
+			if base := os.Getenv("CUSTOMER_ENTITY_BASE_URL"); base != "" {
+				escalationNotes = paging.NewEntityClient(paging.EntityConfig{
+					BaseURL:      base,
+					TokenURL:     os.Getenv("OAUTH2_TOKEN_URL"),
+					ClientID:     os.Getenv("OAUTH2_CLIENT_ID"),
+					ClientSecret: os.Getenv("OAUTH2_CLIENT_SECRET"),
+					Scopes:       splitComma(os.Getenv("CUSTOMER_ENTITY_SCOPES")),
+				})
+			} else {
+				slog.Warn("CUSTOMER_ENTITY_BASE_URL is not set; incident escalation will log its " +
+					"execution summary instead of writing it back to the incident")
+			}
+
+			// Who each rung reaches. The Team Schedule is the real answer -
+			// rota and rank, kept current by the people who own them - and the
+			// hand-maintained roster is the stopgap it replaces. Reading the
+			// schedule needs entity-service, so a deployment without it falls
+			// back rather than starting with a resolver that cannot answer.
+			//
+			// Off by default: the rung model the schedule resolver implements
+			// is still an assumption awaiting confirmation, and a deployment
+			// should opt into it knowingly rather than inherit it on upgrade.
+			var escalationResolver paging.Resolver = paging.NewRosterResolver(roster)
+			if os.Getenv("INCIDENT_ESCALATION_RESOLVER") == "team-schedule" {
+				if escalationNotes == nil {
+					slog.Error("INCIDENT_ESCALATION_RESOLVER=team-schedule needs CUSTOMER_ENTITY_BASE_URL; " +
+						"falling back to the configured roster")
+				} else {
+					// The rota holds no phone numbers: they come from
+					// INCIDENT_ESCALATION_PHONES (e-mail -> E.164), or every
+					// call goes to INCIDENT_ESCALATION_TEST_CALL_TO. A chat-only
+					// ladder needs neither.
+					phones, perr := paging.ParsePhoneBook(os.Getenv("INCIDENT_ESCALATION_PHONES"), os.Getenv("INCIDENT_ESCALATION_TEST_CALL_TO"))
+					if perr != nil {
+						// Not logging perr: the decode error can quote numbers.
+						slog.Error("invalid INCIDENT_ESCALATION_PHONES; escalation calls will have no numbers")
+					}
+					escalationResolver = paging.NewTeamScheduleResolver(
+						escalationNotes, resolverTeams(creCfg, sreCfg), creCfg.Rules).
+						// The heads are two named people, not a team lookup.
+						WithHeads(creCfg.Heads).
+						// How the nominated rungs are read: which tiers exist,
+						// and how many nominees a rung takes per team.
+						WithAlertDuty(creCfg.AlertTiers(), creCfg.AlertDuty.PerTeam).
+						// Who has gone longest without a call, for the evening
+						// pairing's second call.
+						WithCallHistory(paging.NewStore(redisClient)).
+						// The rota holds no numbers; see ParsePhoneBook above.
+						WithPhoneBook(phones)
+					slog.Info("incident escalation resolves rungs from the Team Schedule (CRE and SRE ladders)")
+				}
+			}
+
+			// Phone numbers. The Team Schedule says who, never how to reach
+			// them, and a call plan drops anyone without a number. Each
+			// person keeps their mobile on their own CSM Portal profile,
+			// which the portal stores on their Asgardeo user; read it from
+			// there through the same SCIM operations service and OAuth2 app
+			// the onboarding flow uses. A number named in escalation.yaml
+			// (the heads) still wins.
+			if creCfg.PhoneSource() == paging.PhoneSourceProfile {
+				if scimURL := strings.TrimSpace(os.Getenv("SCIM_BASE_URL")); scimURL == "" {
+					slog.Warn("incident escalation: phones.source is profile but SCIM_BASE_URL is not set; " +
+						"recipients without a number in escalation.yaml cannot be called")
+				} else {
+					escalationResolver = paging.NewProfilePhoneResolver(escalationResolver, scim.NewClient(scim.Config{
+						BaseURL:      scimURL,
+						TokenURL:     os.Getenv("OAUTH2_TOKEN_URL"),
+						ClientID:     os.Getenv("OAUTH2_CLIENT_ID"),
+						ClientSecret: os.Getenv("OAUTH2_CLIENT_SECRET"),
+						Scopes:       splitComma(os.Getenv("SCIM_SCOPES")),
+					}))
+					slog.Info("incident escalation reads recipients' phone numbers from their CSM Portal profiles")
+				}
+			}
+
+			// One engine per ladder. They share the resolver, the Redis and
+			// the Twilio account, and nothing else: each has its own channel,
+			// its own consumer group and its own store namespace, because a
+			// P0 CRE incident climbs both ladders at the same time and the
+			// two must not mistake each other for a redelivery.
+			ladders := []struct {
+				kind    paging.Ladder
+				name    string
+				cfg     paging.LadderConfig
+				running bool
+				group   string
+			}{
+				{paging.LadderCRE, "escalation", creCfg, creRunning,
+					envOrDefault("INCIDENT_ESCALATION_CONSUMER_GROUP", "csm-notification-service-escalation")},
+				{paging.LadderSRE, "escalation-sre", sreCfg, sreRunning,
+					envOrDefault("INCIDENT_ESCALATION_SRE_CONSUMER_GROUP", "csm-notification-service-escalation-sre")},
+			}
+			for _, l := range ladders {
+				if !l.running {
+					slog.Warn("incident call escalation ladder is disabled by configuration", "ladder", l.name)
+					continue
+				}
+				// With no file, both ladders take INCIDENT_ESCALATION_CHANNEL;
+				// with one, each ladder's own channel wins.
+				channel := l.cfg.Channel
+				if channel == "" {
+					channel = escalationChannel
+				}
+				escalationEngine := paging.NewEngine(
+					paging.DefaultPolicy,
+					escalationResolver,
+					twilioClient,
+					googleChatClient,
+					// The ladder builds its own incident link. recipientlinks
+					// lost IncidentLink when incident.created stopped posting
+					// a Chat alert and nothing else needed one; a rung's card
+					// still has to say where to go and look.
+					paging.PortalLinks{CSMBaseURL: csmPortalBaseURL},
+					paging.NewStore(redisClient),
+					escalationNotes,
+					// The audience a rung's card posts to when the incident
+					// names no product of its own. Its own variable rather
+					// than the dispatcher's old DEFAULT_CHAT_PRODUCT, which
+					// went away with the incident Chat alert -- the ladder's
+					// room is its own decision now.
+					os.Getenv("INCIDENT_ESCALATION_CHAT_AUDIENCE"),
+					paging.EngineConfig{
+						// Shares CALL_SENDING_ENABLED with
+						// dispatch.handleIncidentCreated's single call: both
+						// are the same outbound channel to the same people,
+						// and splitting them would let a deployment silence
+						// one and not the other.
+						CallSendingEnabled: callSendingEnabled,
+						// SSML is opt-in rather than the default: it changes
+						// how every escalation call sounds, so a deployment
+						// should hear a sample call first before switching.
+						UseSSML: os.Getenv("INCIDENT_ESCALATION_SSML") == "true",
+						Channel: channel,
+						// Which incidents get a ladder, and what one may spend.
+						Ladder: l.cfg,
+						Kind:   l.kind,
+						// Which ladders an incident climbs: the file's
+						// routing section, shared by both engines.
+						Routing: escalationCfg.Routing,
+					},
+				)
+
+				escalationCount := envInt("INCIDENT_ESCALATION_CONSUMER_COUNT", 1)
+				escalationConsumers = append(escalationConsumers,
+					startConsumers(ctx, l.name, eventBusCfg, l.group, escalationCount, escalationEngine.Handle, escalationToDeadLetter)...)
+
+				// And a consumer for that DLQ running THIS ladder's handler, so
+				// a dead-lettered record gets a retry pass from the ladder that
+				// failed it. Both ladders dead-letter onto the one topic, each
+				// in its own consumer group; a record the other ladder failed
+				// is a redelivery here, which the create-if-absent claim and
+				// the stale-trigger guard already make harmless. onExhausted
+				// is nil: a record that fails here too is logged and dropped.
+				dlqGroup := l.group + "-dlq"
+				if l.kind == paging.LadderCRE {
+					dlqGroup = envOrDefault("INCIDENT_ESCALATION_DLQ_CONSUMER_GROUP", dlqGroup)
+				}
+				escalationDLQCount := envInt("INCIDENT_ESCALATION_DLQ_CONSUMER_COUNT", 1)
+				escalationConsumers = append(escalationConsumers,
+					startConsumers(ctx, l.name+"-dlq", escalationDLQCfg, dlqGroup,
+						escalationDLQCount, escalationEngine.Handle, nil)...)
+
+				// Ticks faster than the SLA engine's 15s: the shortest gap
+				// between two calls in section 7.0's table is one minute
+				// (P0), so a coarse tick would visibly smear a P0 ladder.
+				escalationTick := envDuration("INCIDENT_ESCALATION_TICK_INTERVAL", 5*time.Second)
+				go escalationEngine.RunTicker(ctx, escalationTick)
+
+				slog.Info("incident call escalation is enabled",
+					"ladder", l.name,
+					"channel", string(channel),
+					"ssml", os.Getenv("INCIDENT_ESCALATION_SSML") == "true",
+					"sending", callSendingEnabled)
+			}
+
+			// dispatch.handleIncidentCreated's own single, immediate call to
+			// INCIDENT_DEFAULT_CALL_TO predates the ladder and is NOT part of
+			// the escalation specification — section 3.0's initial reaction
+			// to a new incident is the Chat alert and an email, with calls
+			// starting only after the priority's initial wait. Left in place
+			// rather than removed, because a deployment with no roster still
+			// relies on it as its only page; unset INCIDENT_DEFAULT_CALL_TO
+			// to retire it once the ladder covers an environment. Logged so
+			// the overlap is visible at startup rather than discovered by
+			// being called twice.
+			if defaultOnCallNumber != "" {
+				slog.Warn("incident call escalation is enabled while INCIDENT_DEFAULT_CALL_TO is also set; " +
+					"a new incident will get both the single immediate call and the escalation ladder")
+			}
+		}
 	}
 
 	<-ctx.Done()
@@ -478,10 +922,25 @@ func main() {
 	for _, c := range crDLQConsumers {
 		c.Close()
 	}
+	for _, c := range outageConsumers {
+		c.Close()
+	}
+	for _, c := range outageDLQConsumers {
+		c.Close()
+	}
+	for _, c := range sreConsumers {
+		c.Close()
+	}
+	for _, c := range sreDLQConsumers {
+		c.Close()
+	}
 	for _, c := range projectConsumers {
 		c.Close()
 	}
 	for _, c := range projectDLQConsumers {
+		c.Close()
+	}
+	for _, c := range escalationConsumers {
 		c.Close()
 	}
 	if slaProducer != nil {
@@ -785,4 +1244,95 @@ func deadLetterErrAttrs(err error) []any {
 		return []any{"errKind", "upstream", "status", apiErr.StatusCode}
 	}
 	return []any{"errKind", fmt.Sprintf("%T", err)}
+}
+
+// escalationStartProblem says why the escalation engine must not start, or ""
+// when it can: it needs somebody to resolve rungs from. That is the Team
+// Schedule when INCIDENT_ESCALATION_RESOLVER=team-schedule and entity-service
+// is configured, and the INCIDENT_ESCALATION_ROSTER otherwise -- the roster is
+// only required when it is what the ladder would actually read. A ladder that
+// can never call anyone is worse than none, because it looks like coverage.
+//
+// A roster that is set but does not parse always stops the engine, in either
+// mode: it is a configuration mistake, and starting anyway would hide it.
+func escalationStartProblem(rosterInvalid, rosterEmpty, teamSchedule, entityConfigured bool) string {
+	switch {
+	case rosterInvalid:
+		return "invalid INCIDENT_ESCALATION_ROSTER: failed to parse"
+	case teamSchedule && entityConfigured:
+		return ""
+	case teamSchedule && rosterEmpty:
+		return "INCIDENT_ESCALATION_RESOLVER=team-schedule needs CUSTOMER_ENTITY_BASE_URL, and there is no INCIDENT_ESCALATION_ROSTER to fall back to"
+	case rosterEmpty:
+		return "INCIDENT_ESCALATION_ROSTER is not set"
+	}
+	return ""
+}
+
+// loadEscalationConfig reads the escalation configuration file, or synthesises
+// the pre-file behaviour when no path is set.
+//
+// The fallback is what keeps this change safe to deploy: a service with no
+// INCIDENT_ESCALATION_CONFIG behaves exactly as it did before the file
+// existed -- enabled, on whatever INCIDENT_ESCALATION_CHANNEL said, with no
+// trigger conditions and no spending caps. A deployment adopts the file when
+// it wants to narrow any of that, not because it was forced to all at once.
+//
+// INCIDENT_ESCALATION_ENABLED overrides the file's own master switch in both
+// directions, so an operator can stop every ladder by setting one variable,
+// without editing and shipping a file in the middle of an incident.
+func loadEscalationConfig(envChannel paging.Channel) (paging.Config, error) {
+	path := os.Getenv("INCIDENT_ESCALATION_CONFIG")
+
+	cfg := paging.Config{
+		Enabled: true,
+		CRE:     paging.LadderConfig{Enabled: true, Channel: envChannel},
+		// Only the Team Schedule knows SRE tiers. The roster resolver ignores
+		// which ladder asks, so an SRE engine on it would call the same roster
+		// people a second time; without a file, a roster deployment keeps the
+		// CRE ladder alone, as it had before the SRE one existed.
+		SRE: paging.LadderConfig{Enabled: os.Getenv("INCIDENT_ESCALATION_RESOLVER") == "team-schedule", Channel: envChannel,
+			// The file's sre.timing.includeL4, for a deployment without one.
+			Timing: paging.SRETiming{IncludeL4: os.Getenv("INCIDENT_ESCALATION_SRE_L4") == "true"}},
+	}
+	if path != "" {
+		loaded, err := paging.LoadConfig(path)
+		if err != nil {
+			return loaded, err
+		}
+		cfg = loaded
+		slog.Info("escalation configuration loaded",
+			"configPath", path, "enabled", cfg.Enabled,
+			"creChannel", string(cfg.CRE.Channel), "sreChannel", string(cfg.SRE.Channel))
+	}
+
+	if raw := os.Getenv("INCIDENT_ESCALATION_ENABLED"); raw != "" {
+		on := raw == "true"
+		if on != cfg.Enabled {
+			slog.Warn("INCIDENT_ESCALATION_ENABLED overrides the configuration file's master switch",
+				"enabled", on, "fileSaid", cfg.Enabled)
+		}
+		cfg.Enabled = on
+	}
+	return cfg, nil
+}
+
+// resolverTeams merges the two ladders' team keys into the one resolver both
+// ladders share: the CRE section names the ABTs, the Americas team and the
+// heads; the SRE section names the SRE teams. Aliases from either apply to
+// both, since an assignment group means the same team whichever ladder asks.
+func resolverTeams(cre, sre paging.LadderConfig) paging.TeamKeys {
+	teams := cre.Teams
+	teams.SRE = sre.Teams.ABTs
+	if len(sre.Teams.Aliases) > 0 {
+		merged := make(map[string]string, len(cre.Teams.Aliases)+len(sre.Teams.Aliases))
+		for k, v := range cre.Teams.Aliases {
+			merged[k] = v
+		}
+		for k, v := range sre.Teams.Aliases {
+			merged[k] = v
+		}
+		teams.Aliases = merged
+	}
+	return teams
 }

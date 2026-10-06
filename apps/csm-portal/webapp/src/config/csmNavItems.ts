@@ -19,6 +19,7 @@ import {
   AlertTriangle,
   BarChart3,
   Briefcase,
+  BookOpen,
   Bug,
   Building2,
   CalendarClock,
@@ -153,7 +154,7 @@ export const CSM_NAV_ITEMS: CsmNavSection[] = [
         label: "Incidents",
         href: "/operations?tab=incidents",
         tab: "incidents",
-        routes: ["/operations/incidents"],
+        routes: ["/operations/incidents", "/operations/incident-tasks"],
         icon: AlertTriangle,
       },
       {
@@ -226,6 +227,34 @@ export const CSM_NAV_ITEMS: CsmNavSection[] = [
         id: "customers.projects",
         label: "Projects",
         href: "/customers/projects",
+      },
+    ],
+  },
+  {
+    id: "kb-articles",
+    label: "Knowledge",
+    href: "/knowledge",
+    icon: BookOpen,
+    children: [
+      {
+        id: "kb-articles.all",
+        label: "All",
+        href: "/knowledge/all",
+      },
+      {
+        id: "kb-articles.to-review",
+        label: "To Review",
+        href: "/knowledge/to-review",
+      },
+      {
+        id: "kb-articles.my",
+        label: "My",
+        href: "/knowledge/my-articles",
+      },
+      {
+        id: "kb-articles.admin",
+        label: "Admin",
+        href: "/knowledge/admin",
       },
     ],
   },

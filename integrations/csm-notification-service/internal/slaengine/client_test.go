@@ -20,8 +20,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
+	"time"
 )
 
 func newTestEntityClient(t *testing.T, apiSrv *httptest.Server) *EntityClient {
@@ -34,56 +34,68 @@ func newTestEntityClient(t *testing.T, apiSrv *httptest.Server) *EntityClient {
 	return NewEntityClient(EntityConfig{BaseURL: apiSrv.URL, TokenURL: tokenSrv.URL, ClientID: "id", ClientSecret: "secret"})
 }
 
-// TestFetchAllActiveSLAStatuses_PagesUntilExhausted verifies the client
-// keeps requesting pages until it has seen every row the server reports as
-// total, matching entity-service's listPageSize-per-request contract.
-func TestFetchAllActiveSLAStatuses_PagesUntilExhausted(t *testing.T) {
-	const total = listPageSize + 5
-	var gotOffsets []int
+// TestGetDurationPolicy_BuildsSeverityClockTypeMap verifies the response is
+// grouped by severity then clockType, and durationSeconds is converted to a
+// real time.Duration.
+func TestGetDurationPolicy_BuildsSeverityClockTypeMap(t *testing.T) {
 	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
-		gotOffsets = append(gotOffsets, offset)
-
-		remaining := total - offset
-		pageSize := remaining
-		if pageSize > listPageSize {
-			pageSize = listPageSize
-		}
-		statuses := make([]SLAStatus, pageSize)
-		for i := range statuses {
-			statuses[i] = SLAStatus{CaseID: strconv.Itoa(offset + i), ClockType: "response"}
+		if r.URL.Path != "/sla-duration-policy" {
+			t.Errorf("path = %q, want /sla-duration-policy", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(searchSLAStatusResponse{Statuses: statuses, Total: total, Limit: listPageSize, Offset: offset})
+		_ = json.NewEncoder(w).Encode(slaDurationPolicyResponse{Policies: []slaDurationPolicyItem{
+			{Severity: "CATASTROPHIC", ClockType: "response", DurationSeconds: 900},
+			{Severity: "CATASTROPHIC", ClockType: "workaround", DurationSeconds: 14400},
+			{Severity: "LOW", ClockType: "response", DurationSeconds: 86400},
+		}})
 	}))
 	defer apiSrv.Close()
 
 	c := newTestEntityClient(t, apiSrv)
-	got, err := c.FetchAllActiveSLAStatuses(t.Context())
+	got, err := c.GetDurationPolicy(t.Context())
 	if err != nil {
-		t.Fatalf("FetchAllActiveSLAStatuses() error = %v, want nil", err)
+		t.Fatalf("GetDurationPolicy() error = %v, want nil", err)
 	}
-	if len(got) != total {
-		t.Fatalf("len(got) = %d, want %d", len(got), total)
+
+	if got["CATASTROPHIC"][ClockResponse] != 15*time.Minute {
+		t.Errorf("CATASTROPHIC/response = %v, want 15m", got["CATASTROPHIC"][ClockResponse])
 	}
-	if want := []int{0, listPageSize}; len(gotOffsets) != len(want) || gotOffsets[0] != want[0] || gotOffsets[1] != want[1] {
-		t.Errorf("requested offsets = %v, want %v", gotOffsets, want)
+	if got["CATASTROPHIC"][ClockWorkaround] != 4*time.Hour {
+		t.Errorf("CATASTROPHIC/workaround = %v, want 4h", got["CATASTROPHIC"][ClockWorkaround])
+	}
+	if _, ok := got["CATASTROPHIC"][ClockResolution]; ok {
+		t.Error("CATASTROPHIC/resolution present, want absent (no row in the response)")
+	}
+	if got["LOW"][ClockResponse] != 24*time.Hour {
+		t.Errorf("LOW/response = %v, want 24h", got["LOW"][ClockResponse])
 	}
 }
 
-func TestFetchAllActiveSLAStatuses_EmptyResult(t *testing.T) {
+func TestGetDurationPolicy_EmptyResult(t *testing.T) {
 	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(searchSLAStatusResponse{Statuses: nil, Total: 0})
+		_ = json.NewEncoder(w).Encode(slaDurationPolicyResponse{})
 	}))
 	defer apiSrv.Close()
 
 	c := newTestEntityClient(t, apiSrv)
-	got, err := c.FetchAllActiveSLAStatuses(t.Context())
+	got, err := c.GetDurationPolicy(t.Context())
 	if err != nil {
-		t.Fatalf("FetchAllActiveSLAStatuses() error = %v, want nil", err)
+		t.Fatalf("GetDurationPolicy() error = %v, want nil", err)
 	}
 	if len(got) != 0 {
 		t.Errorf("len(got) = %d, want 0", len(got))
+	}
+}
+
+func TestGetDurationPolicy_UpstreamError(t *testing.T) {
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer apiSrv.Close()
+
+	c := newTestEntityClient(t, apiSrv)
+	if _, err := c.GetDurationPolicy(t.Context()); err == nil {
+		t.Fatal("expected an error for a non-2xx response")
 	}
 }

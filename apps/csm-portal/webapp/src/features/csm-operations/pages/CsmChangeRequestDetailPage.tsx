@@ -15,6 +15,7 @@
 // under the License.
 
 import {
+  Alert,
   Box,
   Button,
   Card,
@@ -51,6 +52,7 @@ import { formatBackendTimestampForDisplay } from "@utils/dateTime";
 import { isBlankHtml, sanitizeRichTextHtml } from "@utils/sanitizeHtml";
 import { BackendApiError } from "@api/backend/client";
 import ExportPdfButton from "@components/ExportPdfButton";
+import { useCurrentUser } from "@context/current-user/CurrentUserContext";
 import { useErrorBanner } from "@context/error-banner/ErrorBannerContext";
 import { usePortalAccess } from "@context/current-user/usePortalAccess";
 import { useEngineerDisplayName } from "@hooks/useEngineerDisplayName";
@@ -69,12 +71,16 @@ import {
 import ChangeRequestActionBar from "@features/csm-operations/components/ChangeRequestActionBar";
 import ChangeRequestApprovals from "@features/csm-operations/components/ChangeRequestApprovals";
 import ChangeRequestLifecycleStepper from "@features/csm-operations/components/ChangeRequestLifecycleStepper";
+import ChangeRequestRescheduleDialog from "@features/csm-operations/components/ChangeRequestRescheduleDialog";
 import ChangeRequestTransitionReasonDialog from "@features/csm-operations/components/ChangeRequestTransitionReasonDialog";
 import EditChangeRequestDialog from "@features/csm-operations/components/EditChangeRequestDialog";
 import EntityRefLink from "@features/csm-operations/components/EntityRefLink";
 import {
   buildCloneChangeRequestNavState,
   changeRequestBlockingReason,
+  changeRequestCategoryLabel,
+  noCustomerContactsHelper,
+  isChangeRequestCreator,
   changeRequestCommentGateReason,
   changeRequestTransitionRequiresReason,
   changeRequestImpactColor,
@@ -120,7 +126,7 @@ function backendErrorMessage(err: unknown, fallback: string): string {
  * (`{requestApproval: true}`), but that was backwards relative to the real
  * ServiceNow process (confirmed against the live instance): it's a direct,
  * ungated state change, exactly like every other forward transition in this
- * bar ("Schedule", "Mark implemented", …) — there is no approval gate on this
+ * bar ("Mark implemented", …) — there is no approval gate on this
  * move at all. `requestApproval` is a separate, unrelated bookkeeping flag on
  * the same PATCH endpoint that this action bar no longer has any reason to
  * set.
@@ -163,6 +169,18 @@ function MetaCell({ label, children }: { label: string; children: ReactNode }): 
 
 function RefText({ value }: { value?: BeEntityRef | null }): JSX.Element {
   return <Typography variant="body2">{value?.name || "—"}</Typography>;
+}
+
+/** A multi-valued reference (Deployments / Deployment products / Customer Group) as chips, "—" when empty. */
+function RefChips({ values }: { values?: BeEntityRef[] | null }): JSX.Element {
+  if (!values?.length) return <Typography variant="body2">—</Typography>;
+  return (
+    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
+      {values.map((v) => (
+        <Chip key={v.id} size="small" variant="outlined" label={v.name} />
+      ))}
+    </Box>
+  );
 }
 
 function YesNo({ value }: { value?: boolean }): JSX.Element {
@@ -273,6 +291,7 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
   // fetching twice.
   const { data: approvalsData } = useGetChangeRequestApprovals(id);
   const { showError } = useErrorBanner();
+  const { user } = useCurrentUser();
   const patchCr = usePatchChangeRequest();
   const [editOpen, setEditOpen] = useState(false);
   // Kept in the URL (`?tab=`), not local state, so a shared/bookmarked link
@@ -326,6 +345,11 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
   const [reasonTarget, setReasonTarget] = useState<string | null>(null);
   const [reasonError, setReasonError] = useState<string | null>(null);
   const [reasonRecorded, setReasonRecorded] = useState(false);
+  // Re-schedule (Customer Approval -> Authorize) collects the new planned
+  // window first; same shape as the reason dialog above.
+  const [rescheduleOpen, setRescheduleOpen] = useState(false);
+  const [rescheduleError, setRescheduleError] = useState<string | null>(null);
+  const [rescheduleReasonRecorded, setRescheduleReasonRecorded] = useState(false);
 
   const attachmentList = useMemo(() => attachments ?? [], [attachments]);
 
@@ -415,6 +439,9 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
   }
 
   const cr = data;
+  // The creator can't approve/reject any stage (backend-enforced); they can
+  // still cancel, which the action bar offers via `legalNextStates` as usual.
+  const isCreator = isChangeRequestCreator(cr, user);
 
   const handleExportChangeRequestPdf = async (): Promise<void> => {
     try {
@@ -432,7 +459,12 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
   const blockingReason =
     cr.state === "closed" || cr.state === "canceled" || cr.state === "rollback"
       ? null
-      : changeRequestBlockingReason(approvalsData?.approvals);
+      : changeRequestBlockingReason(approvalsData?.approvals, cr.state);
+  // At a customer gate whose project has no registered contacts the backend
+  // had no one to assign the Customer Approval / Customer Review stage to.
+  // `customerContacts` absent from the payload (another data source) yields
+  // null, so nothing is claimed.
+  const noCustomerGroupNote = noCustomerContactsHelper(cr.state, cr.customerContacts);
   // A transition is in flight whenever either half of a destructive
   // transition (the reason comment, then the patch) or a plain patch is
   // running, so the bar stays disabled across both and a double-click can't
@@ -445,6 +477,13 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
    * the comment-then-patch ordering they then follow.
    */
   const onTransition = (target: string): void => {
+    // `authorize` is only offered as Re-schedule, which needs the new window.
+    if (target === "authorize") {
+      setRescheduleError(null);
+      setRescheduleReasonRecorded(false);
+      setRescheduleOpen(true);
+      return;
+    }
     if (changeRequestTransitionRequiresReason(target)) {
       setReasonError(null);
       setReasonRecorded(false);
@@ -521,6 +560,37 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
           transitionFallbackMessage(target),
         )} You don't need to retype it.`,
       );
+    }
+  };
+
+  /**
+   * Confirmed Re-schedule: the optional reason is recorded as an internal
+   * comment first (once, even across retries), then the state + new planned
+   * window are patched. The backend's refusal (e.g. "re-scheduling requires a
+   * changed planned start or end") is shown in the dialog as returned.
+   */
+  const confirmReschedule = async (
+    patch: BePatchChangeRequestPayload,
+    reason: string,
+  ): Promise<void> => {
+    setRescheduleError(null);
+    if (reason && !rescheduleReasonRecorded) {
+      try {
+        await postComment.mutateAsync({ changeRequestId: cr.id, bodyHtml: reason, internal: true });
+        setRescheduleReasonRecorded(true);
+      } catch (err) {
+        setRescheduleError(
+          backendErrorMessage(err, "Could not record the reason, so the change was not re-scheduled. Try again."),
+        );
+        return;
+      }
+    }
+    try {
+      await patchCr.mutateAsync({ id: cr.id, patch });
+      setRescheduleOpen(false);
+      setRescheduleReasonRecorded(false);
+    } catch (err) {
+      setRescheduleError(backendErrorMessage(err, "Could not re-schedule this change request."));
     }
   };
 
@@ -608,7 +678,11 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
             )}
           </Box>
           <Typography variant="h5">{cr.subject || "Change request"}</Typography>
-          <ChangeRequestLifecycleStepper state={cr.state} />
+          <ChangeRequestLifecycleStepper
+            state={cr.state}
+            customerApprovalRequired={cr.customerApprovalRequired}
+            customerReviewRequired={cr.customerReviewRequired}
+          />
         </Box>
         <Box sx={{ flexShrink: 0, alignSelf: { xs: "stretch", md: "flex-start" } }}>
           <Box className="csm-print-hide" sx={{ display: "flex", alignItems: "center", gap: 1 }}>
@@ -658,7 +732,7 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
             },
           }}
         >
-          <MetaCell label="Project"><RefText value={cr.project} /></MetaCell>
+          <MetaCell label="Customer Project"><RefText value={cr.project} /></MetaCell>
           <MetaCell label="Type">
             <Typography variant="body2">{cr.type || "—"}</Typography>
           </MetaCell>
@@ -678,6 +752,12 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
           <MetaCell label="Deployment"><RefText value={cr.deployment} /></MetaCell>
           <MetaCell label="Deployed product"><RefText value={cr.deployedProduct} /></MetaCell>
           <MetaCell label="Product"><RefText value={cr.product} /></MetaCell>
+          <MetaCell label="Deployments"><RefChips values={cr.deployments} /></MetaCell>
+          <MetaCell label="Deployment products"><RefChips values={cr.deploymentProducts} /></MetaCell>
+          <MetaCell label="Customer group"><RefChips values={cr.customerContacts} /></MetaCell>
+          <MetaCell label="Category">
+            <Typography variant="body2">{changeRequestCategoryLabel(cr.category)}</Typography>
+          </MetaCell>
           <MetaCell label="Assigned engineer"><RefText value={cr.assignedEngineer} /></MetaCell>
           <MetaCell label="Assigned team"><RefText value={cr.assignedTeam} /></MetaCell>
           <MetaCell label="Duration">
@@ -752,7 +832,8 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
               }}
             >
               <Typography variant="body2" color="text.secondary">
-                What the customer has confirmed on this change.
+                Whether this change requires customer approval and review, and what the
+                customer has confirmed on it.
               </Typography>
               <Box
                 sx={{
@@ -765,6 +846,12 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
                   },
                 }}
               >
+                <MetaCell label="Customer approval required">
+                  <YesNo value={cr.customerApprovalRequired} />
+                </MetaCell>
+                <MetaCell label="Customer review required">
+                  <YesNo value={cr.customerReviewRequired} />
+                </MetaCell>
                 <MetaCell label="Customer approved"><YesNo value={cr.hasCustomerApproved} /></MetaCell>
                 <MetaCell label="Customer reviewed"><YesNo value={cr.hasCustomerReviewed} /></MetaCell>
                 <MetaCell label="Approved by"><RefText value={cr.approvedBy} /></MetaCell>
@@ -781,9 +868,14 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
               color="text.secondary"
               sx={{ letterSpacing: 0.6 }}
             >
-              Internal approval workflow
+              Approval workflow
             </Typography>
-            <ChangeRequestApprovals id={cr.id} />
+            {noCustomerGroupNote && (
+              <Alert severity="info" sx={{ mb: 0.5 }}>
+                {noCustomerGroupNote}
+              </Alert>
+            )}
+            <ChangeRequestApprovals id={cr.id} isCreator={isCreator} customerContacts={cr.customerContacts} />
           </Box>
         </Box>
       )}
@@ -843,11 +935,10 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
 
           {/*
             Read-only SRE metadata (`CHANGES-cr-field-parity.md`'s "group
-            C2"/"group D" plus the extra read-only refs from "group C1").
-            None of these get an editable control here — `category` never
-            gets one at all (see `BeChangeRequestDetail.category`'s doc
-            comment), and the rest have no write path anywhere in the stack
-            yet (`EditChangeRequestDialog`'s doc comment on
+            C2"/"group D"). Project / deployments / deployment
+            products / customer group (the project's registered contacts) / category are shown (and editable) in
+            the Overview above; the rest here have no write path anywhere in
+            the stack yet (`EditChangeRequestDialog`'s doc comment on
             `BePatchChangeRequestPayload` explains why each is missing).
           */}
           <Card sx={{ p: 2.5, display: "flex", flexDirection: "column", gap: 2 }}>
@@ -862,11 +953,7 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
               <MetaCell label="Priority">
                 <Typography variant="body2">{cr.priority?.label || "—"}</Typography>
               </MetaCell>
-              <MetaCell label="Category">
-                <Typography variant="body2">{cr.category?.label || "—"}</Typography>
-              </MetaCell>
               <MetaCell label="Requested by"><RefText value={cr.requestedBy} /></MetaCell>
-              <MetaCell label="Customer group"><RefText value={cr.customerGroup} /></MetaCell>
               <MetaCell label="Change request type">
                 <Typography variant="body2">{cr.changeRequestType?.label || "—"}</Typography>
               </MetaCell>
@@ -899,33 +986,6 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
                 )}
               </MetaCell>
             </Box>
-            {!!cr.environments?.length && (
-              <MetaCell label="Environments">
-                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
-                  {cr.environments.map((e) => (
-                    <Chip key={e.id} size="small" variant="outlined" label={e.name} />
-                  ))}
-                </Box>
-              </MetaCell>
-            )}
-            {!!cr.deploymentProducts?.length && (
-              <MetaCell label="Deployment products">
-                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
-                  {cr.deploymentProducts.map((p) => (
-                    <Chip key={p.id} size="small" variant="outlined" label={p.name} />
-                  ))}
-                </Box>
-              </MetaCell>
-            )}
-            {!!cr.deployments?.length && (
-              <MetaCell label="Deployments">
-                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
-                  {cr.deployments.map((d) => (
-                    <Chip key={d.id} size="small" variant="outlined" label={d.name} />
-                  ))}
-                </Box>
-              </MetaCell>
-            )}
             {!!cr.labels?.length && (
               <MetaCell label="Labels">
                 <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75 }}>
@@ -1034,6 +1094,22 @@ export default function CsmChangeRequestDetailPage(): JSX.Element {
             setReasonRecorded(false);
           }}
           onConfirm={(reason) => void confirmReasonTransition(reason)}
+        />
+      )}
+
+      {rescheduleOpen && (
+        <ChangeRequestRescheduleDialog
+          cr={cr}
+          isSubmitting={transitionPending}
+          error={rescheduleError}
+          reasonRecorded={rescheduleReasonRecorded}
+          onClose={() => {
+            if (transitionPending) return;
+            setRescheduleOpen(false);
+            setRescheduleError(null);
+            setRescheduleReasonRecorded(false);
+          }}
+          onSubmit={(patch, reason) => void confirmReschedule(patch, reason)}
         />
       )}
 

@@ -53,15 +53,30 @@ func TestCaseAttachmentRoutes_UsePostgresUnderPlainPostgres(t *testing.T) {
 	}
 }
 
-// TestCaseAttachmentRoutes_UseServiceNowUnderPostgresServiceNowDualWrite is the
-// regression guard for the routing fix: under
-// DataSource=postgres-servicenow-dual-write, case attachment routes must reach
-// ServiceNow (via the same snCaseService already used for case CREATE/
-// UPDATE's mirror), never the Postgres-backed case_attachment path -- the
-// sftpgo-backed Postgres attachment implementation is not production-ready,
-// so this mode must never route a request to it, regardless of how case
-// metadata itself is wired in this mode.
-func TestCaseAttachmentRoutes_UseServiceNowUnderPostgresServiceNowDualWrite(t *testing.T) {
+// TestCaseAttachmentRoutes_DualWriteCreateRequiresAuthBeforeReachingServiceNow
+// is the routing-level regression guard for
+// DATA_SOURCE=postgres-servicenow-dual-write's attachment hybrid
+// (service.caseAttachmentDualWriteService): POST /attachments must route
+// through that hybrid, not bypass it, and the hybrid's CreateCaseAttachment
+// resolves the caller's Postgres actor BEFORE ever calling ServiceNow (see
+// that method's own doc comment -- case_attachment.uploaded_by is a real FK
+// to "user"(id), so there's no point uploading to ServiceNow before a
+// Postgres user is known). An unauthenticated request therefore must get a
+// 401 without the fake ServiceNow server ever seeing a call -- proving
+// routing reaches the new hybrid (which performs this check) rather than,
+// say, the plain Postgres path (which would 400 on a missing storageKey
+// instead, per TestCaseAttachmentRoutes_UsePostgresUnderPlainPostgres above)
+// or an unconditional ServiceNow passthrough (which would reach the fake
+// server even unauthenticated).
+//
+// This intentionally does NOT exercise the full SN-success-then-Postgres-insert
+// round trip: that requires a live Postgres pool (CreateCaseAttachmentFromServiceNow
+// writes a real row), which this package's nil-pool router tests don't carry
+// (see optional_database_test.go) -- that path is covered at the service
+// layer instead, by case_attachment_dual_write_service_test.go's
+// TestCaseAttachmentDualWriteService_CreateCaseAttachment_Succeeds using a
+// fake repo + fake SN mirror.
+func TestCaseAttachmentRoutes_DualWriteCreateRequiresAuthBeforeReachingServiceNow(t *testing.T) {
 	var snAttachmentCallReceived bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oauth2/token", func(w http.ResponseWriter, r *http.Request) {
@@ -92,19 +107,18 @@ func TestCaseAttachmentRoutes_UseServiceNowUnderPostgresServiceNowDualWrite(t *t
 	}
 	withTestAuth(t, cfg)
 	// NewRouter itself doesn't call Validate (only cmd/api/main.go does), and
-	// this test needs no real Postgres pool for the same reason
-	// optional_database_test.go's tests don't: attachment routes must reach
-	// ServiceNow here, never a repository query, so a nil pool never gets
-	// touched.
+	// this test needs no real Postgres pool: an unauthenticated request must
+	// fail before anything ever reaches a repository query or ServiceNow,
+	// same nil-pool-safe pattern as optional_database_test.go.
 	router, _ := NewRouter(nil, cfg)
 
-	rec := postAttachment(t, router)
+	rec := postAttachment(t, router) // no x-user-id-token header
 
-	if !snAttachmentCallReceived {
-		t.Fatalf("expected POST /attachments to reach the ServiceNow integration service; it did not (response: %d %s)", rec.Code, rec.Body.String())
+	if snAttachmentCallReceived {
+		t.Fatal("expected ServiceNow to never be called for an unauthenticated request")
 	}
-	if rec.Code != http.StatusCreated {
-		t.Errorf("POST /attachments = %d, want 201 — body: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("POST /attachments (unauthenticated) = %d, want 401 — body: %s", rec.Code, rec.Body.String())
 	}
 }
 

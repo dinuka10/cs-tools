@@ -1240,7 +1240,34 @@ export type { InlineAttachment };
 export const INLINE_COMMENT_HTML_PURIFY: Record<string, never> = {};
 
 /**
+ * Matches a `src` that is exactly an attachment id: an optional single leading
+ * slash, a canonical hyphenated UUID or 32 hex chars (case-insensitive), and an
+ * optional `.iix` suffix, and nothing else (no query string, extra path
+ * segments, scheme or `//` prefix). Content migrated from the legacy data
+ * source carries inline images in this shape (`<img src="/<uuid>">`, with the
+ * `.iix` suffix dropped). Kept deliberately exact so ordinary image URLs are
+ * never mistaken for attachment references.
+ */
+const BARE_ATTACHMENT_SRC =
+  /^\/?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|[a-f0-9]{32})(?:\.iix)?$/i;
+
+/**
+ * Whether an inline `<img>` `src` is an attachment reference that must be
+ * resolved through the backend: either a `.iix` reference or a bare attachment
+ * id as found in migrated content (see {@link BARE_ATTACHMENT_SRC}).
+ *
+ * @param src - Raw src attribute.
+ * @returns {boolean} True when the src should be resolved as an attachment.
+ */
+export function isInlineImageRefSrc(src: string): boolean {
+  return src.includes(".iix") || BARE_ATTACHMENT_SRC.test(src.trim());
+}
+
+/**
  * Extracts ServiceNow-style attachment id from img src (relative /id.iix or absolute https://host/id.iix).
+ * A bare hyphenated UUID (`/<uuid>`, migrated content) is normalized to the
+ * 32-char lowercase form so it dedupes with the `.iix` form of the same
+ * attachment and reaches the existing fetch path in the shape it expects.
  *
  * @param src - Raw src attribute.
  * @returns {string} Suspected attachment id/sys_id or empty string.
@@ -1250,6 +1277,10 @@ export function extractInlineImageRefId(src: string): string {
   const fromPath = s.match(/\/([a-f0-9]{32})\.iix(?:\?|#|$)/i);
   if (fromPath) {
     return fromPath[1];
+  }
+  const bare = s.match(BARE_ATTACHMENT_SRC);
+  if (bare && bare[1].includes("-")) {
+    return bare[1].replace(/-/g, "").toLowerCase();
   }
   const tail =
     s

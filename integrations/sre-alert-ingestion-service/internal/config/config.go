@@ -30,9 +30,6 @@ import (
 // DefaultPath is used when CONFIG_PATH is unset; expected at the working directory root.
 const DefaultPath = "config.toml"
 
-// MaxWriteDeadline is alerts-core's gap_timeout; write_deadline must stay under it or ids get skipped.
-const MaxWriteDeadline = Duration(10 * time.Minute)
-
 // WriteMargin keeps request_wait under write_timeout, so a slow store answers 503, not a cut connection.
 const WriteMargin = Duration(time.Second)
 
@@ -41,10 +38,11 @@ type Config struct {
 	Server    ServerConfig    `toml:"server"`
 	Allocator AllocatorConfig `toml:"allocator"`
 	Store     StoreConfig     `toml:"store"`
-	Cassandra CassandraConfig `toml:"cassandra"`
+	Postgres  PostgresConfig  `toml:"postgres"`
 	Wake      WakeConfig      `toml:"wake"`
 	Reject    RejectConfig    `toml:"reject"`
-	Fallback  FallbackConfig  `toml:"fallback"`
+	Log       LogConfig       `toml:"log"`
+	Payloads  PayloadsConfig  `toml:"payloads"`
 	// LegacyAuthSection flags a leftover [auth] table, no longer read now auth is AUTH_ENABLED.
 	LegacyAuthSection bool `toml:"-"`
 }
@@ -55,19 +53,20 @@ type ServerConfig struct {
 	DrainDelay     Duration `toml:"drain_delay"`
 	RequestWait    Duration `toml:"request_wait"`
 	AllocatorDrain Duration `toml:"allocator_drain"`
-	ReadTimeout    Duration `toml:"read_timeout"`
-	WriteTimeout   Duration `toml:"write_timeout"`
-	IdleTimeout    Duration `toml:"idle_timeout"`
-	MaxBodyBytes   int64    `toml:"max_body_bytes"`
+	// PayloadDrain is reserved after allocator_drain for the final raw_alerts insert.
+	PayloadDrain Duration `toml:"payload_drain"`
+	ReadTimeout  Duration `toml:"read_timeout"`
+	WriteTimeout Duration `toml:"write_timeout"`
+	IdleTimeout  Duration `toml:"idle_timeout"`
+	MaxBodyBytes int64    `toml:"max_body_bytes"`
 }
 
-// AllocatorConfig tunes the id allocator: queue depth, batch size, writers and CAS attempts.
+// AllocatorConfig tunes the id allocator: queue depth, batch size, and writer concurrency.
 type AllocatorConfig struct {
 	QueueSize        int   `toml:"queue_size"`
 	QueueMaxBytes    int64 `toml:"queue_max_bytes"`
 	MaxBatch         int   `toml:"max_batch"`
 	WriteConcurrency int   `toml:"write_concurrency"`
-	ClaimMaxAttempts int   `toml:"claim_max_attempts"`
 }
 
 // StoreConfig tunes row writes: attempts per id, the doubling backoff base and the query timeout.
@@ -77,15 +76,21 @@ type StoreConfig struct {
 	QueryTimeout    Duration `toml:"query_timeout"`
 	ClaimTimeout    Duration `toml:"claim_timeout"`
 	WriteDeadline   Duration `toml:"write_deadline"`
-	// ReadBack reads every inserted row back before answering 201: 2 RU per alert.
-	ReadBack bool `toml:"read_back"`
 }
 
-// CassandraConfig tunes startup connection retry, matching sre-alert-core-service.
-type CassandraConfig struct {
+// PostgresConfig tunes startup connection retry, matching sre-alert-core-service, plus the warm pool floor and the credential check budget.
+type PostgresConfig struct {
 	ConnectMaxAttempts int      `toml:"connect_max_attempts"`
 	ConnectBaseDelay   Duration `toml:"connect_base_delay"`
 	ConnectTimeout     Duration `toml:"connect_timeout"`
+	// MinConns keeps this many connections open so a webhook after a quiet spell doesn't pay for a new TLS connection.
+	MinConns int `toml:"min_conns"`
+	// AuthTimeout bounds one integration_users refresh query.
+	AuthTimeout Duration `toml:"auth_timeout"`
+	// AuthRefreshInterval is how often the in-memory copy of integration_users is reloaded.
+	AuthRefreshInterval Duration `toml:"auth_refresh_interval"`
+	// AuthMaxStale is how long the last good copy serves while refreshes fail, before auth answers 503.
+	AuthMaxStale Duration `toml:"auth_max_stale"`
 }
 
 // WakeConfig bounds the fire-and-forget POST /alertz to alerts-core.
@@ -93,15 +98,22 @@ type WakeConfig struct {
 	Timeout Duration `toml:"timeout"`
 }
 
-// RejectConfig tunes the reject Chat card: the per vendor+error window and the body preview length.
+// RejectConfig tunes how much of a rejected webhook's body is kept for logging.
 type RejectConfig struct {
-	Window           Duration `toml:"window"`
-	BodyPreviewChars int      `toml:"body_preview_chars"`
+	BodyPreviewChars int `toml:"body_preview_chars"`
 }
 
-// FallbackConfig rate-limits the DB-failure Chat card.
-type FallbackConfig struct {
-	CardsPerMinute int `toml:"cards_per_minute"`
+// LogConfig bounds the raw webhook body logged before each transform.
+type LogConfig struct {
+	// PayloadMaxBytes caps the logged body; a longer one is logged truncated, and 0 turns the line off.
+	PayloadMaxBytes int64 `toml:"payload_max_bytes"`
+}
+
+// PayloadsConfig tunes the in-memory buffer of raw webhook bodies written to raw_alerts.
+type PayloadsConfig struct {
+	FlushInterval  Duration `toml:"flush_interval"`
+	MaxBufferBytes int64    `toml:"max_buffer_bytes"`
+	FlushTimeout   Duration `toml:"flush_timeout"`
 }
 
 // Duration wraps time.Duration so TOML values like "30s" decode via time.ParseDuration.
@@ -126,37 +138,46 @@ func (d Duration) Duration() time.Duration {
 func Defaults() Config {
 	return Config{
 		Server: ServerConfig{
-			ShutdownGrace:  Duration(25 * time.Second),
+			ShutdownGrace:  Duration(30 * time.Second),
 			DrainDelay:     Duration(5 * time.Second),
 			RequestWait:    Duration(10 * time.Second),
 			AllocatorDrain: Duration(10 * time.Second),
+			PayloadDrain:   Duration(5 * time.Second),
 			ReadTimeout:    Duration(10 * time.Second),
 			WriteTimeout:   Duration(30 * time.Second),
 			IdleTimeout:    Duration(60 * time.Second),
 			MaxBodyBytes:   1 << 20,
 		},
 		Allocator: AllocatorConfig{
-			QueueSize:        5000,
+			QueueSize:        10000,
 			QueueMaxBytes:    256 << 20,
-			MaxBatch:         200,
+			MaxBatch:         500,
 			WriteConcurrency: 16,
-			ClaimMaxAttempts: 20,
 		},
 		Store: StoreConfig{
 			InsertAttempts:  5,
 			InsertBaseDelay: Duration(250 * time.Millisecond),
-			QueryTimeout:    Duration(1500 * time.Millisecond),
+			QueryTimeout:    Duration(2 * time.Second),
 			ClaimTimeout:    Duration(5 * time.Second),
-			WriteDeadline:   Duration(5 * time.Minute),
+			WriteDeadline:   Duration(8 * time.Second),
 		},
-		Cassandra: CassandraConfig{
-			ConnectMaxAttempts: 5,
-			ConnectBaseDelay:   Duration(2 * time.Second),
-			ConnectTimeout:     Duration(10 * time.Second),
+		Postgres: PostgresConfig{
+			ConnectMaxAttempts:  5,
+			ConnectBaseDelay:    Duration(2 * time.Second),
+			ConnectTimeout:      Duration(10 * time.Second),
+			MinConns:            2,
+			AuthTimeout:         Duration(5 * time.Second),
+			AuthRefreshInterval: Duration(30 * time.Second),
+			AuthMaxStale:        Duration(15 * time.Minute),
 		},
-		Wake:     WakeConfig{Timeout: Duration(2 * time.Second)},
-		Reject:   RejectConfig{Window: Duration(15 * time.Minute), BodyPreviewChars: 500},
-		Fallback: FallbackConfig{CardsPerMinute: 5},
+		Wake:   WakeConfig{Timeout: Duration(2 * time.Second)},
+		Reject: RejectConfig{BodyPreviewChars: 500},
+		Log:    LogConfig{PayloadMaxBytes: 64 << 10},
+		Payloads: PayloadsConfig{
+			FlushInterval:  Duration(10 * time.Minute),
+			MaxBufferBytes: 32 << 20,
+			FlushTimeout:   Duration(30 * time.Second),
+		},
 	}
 }
 
@@ -193,8 +214,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("server.request_wait must be positive")
 	case c.Server.AllocatorDrain <= 0:
 		return fmt.Errorf("server.allocator_drain must be positive")
-	case c.Server.DrainDelay+c.Server.RequestWait+c.Server.AllocatorDrain > c.Server.ShutdownGrace:
-		return fmt.Errorf("server.drain_delay + request_wait + allocator_drain must not exceed shutdown_grace")
+	case c.Server.PayloadDrain <= 0:
+		return fmt.Errorf("server.payload_drain must be positive")
+	case c.Server.DrainDelay+c.Server.RequestWait+c.Server.AllocatorDrain+c.Server.PayloadDrain > c.Server.ShutdownGrace:
+		return fmt.Errorf("server.drain_delay + request_wait + allocator_drain + payload_drain must not exceed shutdown_grace")
 	case c.Server.ReadTimeout <= 0:
 		return fmt.Errorf("server.read_timeout must be positive")
 	case c.Server.WriteTimeout <= 0:
@@ -215,8 +238,6 @@ func (c Config) Validate() error {
 		return fmt.Errorf("allocator.max_batch must be positive")
 	case c.Allocator.WriteConcurrency <= 0:
 		return fmt.Errorf("allocator.write_concurrency must be positive")
-	case c.Allocator.ClaimMaxAttempts <= 0:
-		return fmt.Errorf("allocator.claim_max_attempts must be positive")
 	case c.Store.InsertAttempts <= 0:
 		return fmt.Errorf("store.insert_attempts must be positive")
 	case c.Store.InsertBaseDelay <= 0:
@@ -225,60 +246,63 @@ func (c Config) Validate() error {
 		return fmt.Errorf("store.query_timeout must be positive")
 	case c.Store.ClaimTimeout <= 0:
 		return fmt.Errorf("store.claim_timeout must be positive")
-	case c.Store.WriteDeadline <= 0 || c.Store.WriteDeadline >= MaxWriteDeadline:
-		return fmt.Errorf("store.write_deadline must be positive and under %v (alerts-core's gap_timeout)", MaxWriteDeadline.Duration())
-	case c.Cassandra.ConnectMaxAttempts <= 0:
-		return fmt.Errorf("cassandra.connect_max_attempts must be positive")
-	case c.Cassandra.ConnectBaseDelay <= 0:
-		return fmt.Errorf("cassandra.connect_base_delay must be positive")
-	case c.Cassandra.ConnectTimeout <= 0:
-		return fmt.Errorf("cassandra.connect_timeout must be positive")
+	case c.Store.WriteDeadline <= 0:
+		return fmt.Errorf("store.write_deadline must be positive")
+	case c.Store.WriteDeadline >= c.Server.RequestWait:
+		return fmt.Errorf("store.write_deadline must be under server.request_wait, or a sender can get 503 for an alert that was stored and resend it")
+	case c.Postgres.ConnectMaxAttempts <= 0:
+		return fmt.Errorf("postgres.connect_max_attempts must be positive")
+	case c.Postgres.ConnectBaseDelay <= 0:
+		return fmt.Errorf("postgres.connect_base_delay must be positive")
+	case c.Postgres.ConnectTimeout <= 0:
+		return fmt.Errorf("postgres.connect_timeout must be positive")
+	case c.Postgres.MinConns < 0:
+		return fmt.Errorf("postgres.min_conns must not be negative")
+	case c.Postgres.AuthTimeout <= 0:
+		return fmt.Errorf("postgres.auth_timeout must be positive")
+	case c.Postgres.AuthRefreshInterval <= 0:
+		return fmt.Errorf("postgres.auth_refresh_interval must be positive")
+	case c.Postgres.AuthMaxStale <= c.Postgres.AuthRefreshInterval:
+		return fmt.Errorf("postgres.auth_max_stale must exceed postgres.auth_refresh_interval, or one slow refresh would fail every request")
 	case c.Wake.Timeout <= 0:
 		return fmt.Errorf("wake.timeout must be positive")
-	case c.Reject.Window <= 0:
-		return fmt.Errorf("reject.window must be positive")
 	case c.Reject.BodyPreviewChars <= 0:
 		return fmt.Errorf("reject.body_preview_chars must be positive")
-	case c.Fallback.CardsPerMinute <= 0:
-		return fmt.Errorf("fallback.cards_per_minute must be positive")
+	case c.Log.PayloadMaxBytes < 0:
+		return fmt.Errorf("log.payload_max_bytes must not be negative")
+	case c.Payloads.FlushInterval <= 0:
+		return fmt.Errorf("payloads.flush_interval must be positive")
+	case c.Payloads.FlushTimeout <= 0:
+		return fmt.Errorf("payloads.flush_timeout must be positive")
+	case c.Payloads.MaxBufferBytes < 2*c.Server.MaxBodyBytes:
+		return fmt.Errorf("payloads.max_buffer_bytes must be at least 2 x server.max_body_bytes, so the largest body fits under the early-flush mark")
 	}
 	return nil
 }
 
-// Env is read from the environment; CASSANDRA_* and <VENDOR>_ALERT_CONFIG are read by their packages.
+// Env is read from the environment; PG* and <SOURCE>_ALERT_CONFIG are read by their packages.
 type Env struct {
 	Port string `env:"PORT" envDefault:"8080"`
 	// WakeURL is alerts-core's POST /alertz; empty skips the wake-up and the 10s poll still runs.
 	WakeURL string `env:"ALERT_CORE_WAKE_URL"`
-	// ChatWebhookURLs are Google Chat webhooks for reject/DB-failure cards; empty only logs them.
-	ChatWebhookURLs []string `env:"FALLBACK_CHAT_WEBHOOK_URLS" envSeparator:","`
 	// AuthEnabledRaw is AUTH_ENABLED, unparsed; read AuthEnabled.
 	AuthEnabledRaw string `env:"AUTH_ENABLED"`
 	// AuthAuditOnlyRaw is AUTH_AUDIT_ONLY, unparsed; read AuthAuditOnly.
 	AuthAuditOnlyRaw string `env:"AUTH_AUDIT_ONLY"`
 	AuthEnabled      bool   `env:"-"`
 	AuthAuditOnly    bool   `env:"-"`
-	// WakeUsername/WakeSecret are an integration_users credential for the wake call, sent only over https.
-	WakeUsername string `env:"ALERT_CORE_WAKE_USERNAME"`
-	WakeSecret   string `env:"ALERT_CORE_WAKE_SECRET"`
+	// WakeToken is the shared ALERT_CORE_WAKE_TOKEN alerts-core checks on /alertz, sent only over https.
+	WakeToken string `env:"ALERT_CORE_WAKE_TOKEN"`
 }
 
-// LoadEnv parses Env, trimming blanks out of the comma-separated Chat webhook list.
+// LoadEnv parses Env.
 func LoadEnv() (Env, error) {
 	var e Env
 	if err := env.Parse(&e); err != nil {
 		return Env{}, fmt.Errorf("env config: %w", err)
 	}
 	e.WakeURL = strings.TrimSpace(e.WakeURL)
-	e.WakeUsername = strings.TrimSpace(e.WakeUsername)
-	e.WakeSecret = strings.TrimSpace(e.WakeSecret)
-	urls := e.ChatWebhookURLs[:0]
-	for _, u := range e.ChatWebhookURLs {
-		if u = strings.TrimSpace(u); u != "" {
-			urls = append(urls, u)
-		}
-	}
-	e.ChatWebhookURLs = urls
+	e.WakeToken = strings.TrimSpace(e.WakeToken)
 	var err error
 	if e.AuthEnabled, err = parseBool("AUTH_ENABLED", e.AuthEnabledRaw); err != nil {
 		return Env{}, err

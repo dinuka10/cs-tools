@@ -27,6 +27,7 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 	integrationservice "github.com/wso2-open-operations/cs-tools/entity-service/internal/servicenow-integration-service"
 )
 
@@ -555,8 +556,6 @@ type snCreateChangeRequestPayload struct {
 	AffectedServicesText         *string  `json:"affectedServicesText,omitempty"`
 	AffectedComponentsText       *string  `json:"affectedComponentsText,omitempty"`
 	RollbackDurationText         *string  `json:"rollbackDurationText,omitempty"`
-	CustomerGroupID              *string  `json:"customerGroupId,omitempty"`
-	EnvironmentIDs               []string `json:"environmentIds,omitempty"`
 	DeploymentProductIDs         []string `json:"deploymentProductIds,omitempty"`
 	DurationInput                *int     `json:"durationInput,omitempty"`
 	IsPlanningVisibleToCustomers *bool    `json:"isPlanningVisibleToCustomers,omitempty"`
@@ -714,18 +713,32 @@ func toDownstreamUTCDateTime(field, value string) (string, error) {
 
 // CreateChangeRequest implements ChangeRequestService for the ServiceNow data source.
 func (s *snChangeRequestService) CreateChangeRequest(ctx context.Context, req domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+	if err := repository.RejectRemovedCreateFields(req); err != nil {
+		return domain.CreateChangeRequestResponse{}, err
+	}
 	if req.Subject == "" {
 		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: "subject is required"}
+	}
+	// ServiceNow's create payload has no project or deployment field; refuse
+	// rather than drop them silently. (The PostgreSQL-first dual-write service
+	// strips them before it mirrors, so this only fires when ServiceNow is the
+	// sole data source.)
+	if req.ProjectID != nil || len(req.DeploymentIDs) > 0 {
+		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: "projectId and deploymentIds are not supported on the ServiceNow data source"}
 	}
 	if req.Category != nil {
 		if _, ok := snCRCategoryIDMap[*req.Category]; !ok {
 			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid category %q", *req.Category)}
 		}
 	}
-	if req.Type != nil {
-		if _, ok := snCRCreateTypeIDMap[*req.Type]; !ok {
-			return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid type %q", *req.Type)}
-		}
+	// The type is mandatory and must be standard/normal/emergency -- it decides
+	// the approval flow ServiceNow runs (Standard: none; Normal: approvals;
+	// Emergency: expedited).
+	if err := repository.ValidateCreateChangeRequestType(req.Type); err != nil {
+		return domain.CreateChangeRequestResponse{}, err
+	}
+	if _, ok := snCRCreateTypeIDMap[*req.Type]; !ok {
+		return domain.CreateChangeRequestResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("invalid type %q", *req.Type)}
 	}
 	// A change request can only ever be created at New -- see
 	// snCreateChangeRequestPayload's own doc comment for why. req.State is
@@ -760,18 +773,12 @@ func (s *snChangeRequestService) CreateChangeRequest(ctx context.Context, req do
 		"groupId":             req.GroupID,
 		"assignedEngineerId":  req.AssignedEngineerID,
 		"requestedById":       req.RequestedByID,
-		"customerGroupId":     req.CustomerGroupID,
 	}
 	for field, val := range uuidFields {
 		if val != nil {
 			if err := validateUUIDs(field, []string{*val}); err != nil {
 				return domain.CreateChangeRequestResponse{}, err
 			}
-		}
-	}
-	if req.EnvironmentIDs != nil {
-		if err := validateUUIDs("environmentIds", req.EnvironmentIDs); err != nil {
-			return domain.CreateChangeRequestResponse{}, err
 		}
 	}
 	if req.DeploymentProductIDs != nil {
@@ -816,13 +823,9 @@ func (s *snChangeRequestService) CreateChangeRequest(ctx context.Context, req do
 		AffectedServicesText:         req.AffectedServicesText,
 		AffectedComponentsText:       req.AffectedComponentsText,
 		RollbackDurationText:         req.RollbackDurationText,
-		EnvironmentIDs:               uuidsToSysids(req.EnvironmentIDs),
 		DeploymentProductIDs:         uuidsToSysids(req.DeploymentProductIDs),
 		DurationInput:                req.DurationInput,
 		IsPlanningVisibleToCustomers: req.IsPlanningVisibleToCustomers,
-	}
-	if req.CustomerGroupID != nil {
-		payload.CustomerGroupID = strPtr(uuidToSysid(*req.CustomerGroupID))
 	}
 	if req.PlannedStartDate != nil {
 		v, err := toDownstreamUTCDateTime("plannedStartDate", *req.PlannedStartDate)
@@ -956,8 +959,6 @@ type snPatchChangeRequestPayload struct {
 	AffectedServicesText   json.RawMessage `json:"affectedServicesText,omitempty"`
 	AffectedComponentsText json.RawMessage `json:"affectedComponentsText,omitempty"`
 	RollbackDurationText   json.RawMessage `json:"rollbackDurationText,omitempty"`
-	CustomerGroupID        json.RawMessage `json:"customerGroupId,omitempty"`
-	EnvironmentIDs         json.RawMessage `json:"environmentIds,omitempty"`
 	DeploymentProductIDs   json.RawMessage `json:"deploymentProductIds,omitempty"`
 	DurationInput          json.RawMessage `json:"durationInput,omitempty"`
 	// Comment and WorkNote append a journal entry; they are never null (the
@@ -988,10 +989,16 @@ type snPatchChangeRequestResponse struct {
 }
 
 func (s *snChangeRequestService) PatchChangeRequest(ctx context.Context, id string, req domain.PatchChangeRequestRequest) (domain.PatchChangeRequestResponse, error) {
+	if err := repository.RejectRemovedPatchFields(req); err != nil {
+		return domain.PatchChangeRequestResponse{}, err
+	}
 	token := middleware.UserIDTokenFromContext(ctx)
 
 	if err := validateUUIDs("id", []string{id}); err != nil {
 		return domain.PatchChangeRequestResponse{}, err
+	}
+	if req.DeploymentIDs != nil {
+		return domain.PatchChangeRequestResponse{}, &apierror.ValidationError{Msg: "deploymentIds is not supported on the ServiceNow data source"}
 	}
 
 	if req.Title == nil && req.Description == nil && req.ProjectID == nil && req.CaseID == nil &&
@@ -1003,7 +1010,7 @@ func (s *snChangeRequestService) PatchChangeRequest(ctx context.Context, id stri
 		req.IsCustomerReviewed == nil && req.RequestApproval == nil &&
 		req.ImplementationPlan == nil && req.Priority == nil && req.Category == nil &&
 		req.RequestedByID == nil && req.AffectedServicesText == nil && req.AffectedComponentsText == nil &&
-		req.RollbackDurationText == nil && req.CustomerGroupID == nil && req.EnvironmentIDs == nil &&
+		req.RollbackDurationText == nil &&
 		req.DeploymentProductIDs == nil && req.Comment == nil && req.WorkNote == nil &&
 		req.DurationInput == nil && req.IsPlanningVisibleToCustomers == nil {
 		return domain.PatchChangeRequestResponse{}, &apierror.ValidationError{Msg: "at least one field must be provided"}
@@ -1091,19 +1098,13 @@ func (s *snChangeRequestService) PatchChangeRequest(ctx context.Context, id stri
 	// Tri-state UUID fields: only validate when a non-null value is being set;
 	// an explicit null (clear) or an omitted field needs no UUID validation.
 	triStateUUIDFields := map[string]**string{
-		"requestedById":   req.RequestedByID,
-		"customerGroupId": req.CustomerGroupID,
+		"requestedById": req.RequestedByID,
 	}
 	for field, val := range triStateUUIDFields {
 		if val != nil && *val != nil {
 			if err := validateUUIDs(field, []string{**val}); err != nil {
 				return domain.PatchChangeRequestResponse{}, err
 			}
-		}
-	}
-	if req.EnvironmentIDs != nil {
-		if err := validateUUIDs("environmentIds", *req.EnvironmentIDs); err != nil {
-			return domain.PatchChangeRequestResponse{}, err
 		}
 	}
 	if req.DeploymentProductIDs != nil {
@@ -1190,24 +1191,6 @@ func (s *snChangeRequestService) PatchChangeRequest(ctx context.Context, id stri
 			return domain.PatchChangeRequestResponse{}, fmt.Errorf("sn patch change request: marshal rollbackDurationText: %w", err)
 		}
 		payload.RollbackDurationText = v
-	}
-	if req.CustomerGroupID != nil {
-		var v any
-		if *req.CustomerGroupID != nil {
-			v = uuidToSysid(**req.CustomerGroupID)
-		}
-		raw, err := rawJSONOrNull(v)
-		if err != nil {
-			return domain.PatchChangeRequestResponse{}, fmt.Errorf("sn patch change request: marshal customerGroupId: %w", err)
-		}
-		payload.CustomerGroupID = raw
-	}
-	if req.EnvironmentIDs != nil {
-		b, err := json.Marshal(uuidsToSysids(*req.EnvironmentIDs))
-		if err != nil {
-			return domain.PatchChangeRequestResponse{}, fmt.Errorf("sn patch change request: marshal environmentIds: %w", err)
-		}
-		payload.EnvironmentIDs = b
 	}
 	if req.DeploymentProductIDs != nil {
 		b, err := json.Marshal(uuidsToSysids(*req.DeploymentProductIDs))
@@ -1517,7 +1500,7 @@ func mapSNChangeRequestDetailToView(cr snChangeRequestDetail) domain.ChangeReque
 		HasCustomerApproved:     cr.HasCustomerApproved,
 		HasCustomerReviewed:     cr.HasCustomerReviewed,
 		ApprovedOn:              cr.ApprovedOn,
-		LegalNextStates:         cr.LegalNextStates,
+		LegalNextStates:         withoutManualScheduled(cr.LegalNextStates, view.State),
 
 		// Field-parity additions.
 		ImplementationPlan:           cr.ImplementationPlan,
@@ -1552,21 +1535,11 @@ func mapSNChangeRequestDetailToView(cr snChangeRequestDetail) domain.ChangeReque
 	if cr.RequestedBy != nil {
 		result.RequestedBy = &domain.EntityRef{ID: sysidToUUID(cr.RequestedBy.ID), Name: cr.RequestedBy.Name}
 	}
-	if cr.CustomerGroup != nil {
-		result.CustomerGroup = &domain.EntityRef{ID: sysidToUUID(cr.CustomerGroup.ID), Name: cr.CustomerGroup.Name}
-	}
 	if cr.ChangeRequestType != nil {
 		result.ChangeRequestType = &cr.ChangeRequestType.Label
 	}
 	if cr.Likelihood != nil {
 		result.Likelihood = &cr.Likelihood.Label
-	}
-	if len(cr.Environments) > 0 {
-		envs := make([]domain.EntityRef, 0, len(cr.Environments))
-		for _, e := range cr.Environments {
-			envs = append(envs, domain.EntityRef{ID: sysidToUUID(e.ID), Name: e.Name})
-		}
-		result.Environments = envs
 	}
 	if len(cr.DeploymentProducts) > 0 {
 		products := make([]domain.EntityRef, 0, len(cr.DeploymentProducts))
@@ -1584,4 +1557,35 @@ func mapSNChangeRequestDetailToView(cr snChangeRequestDetail) domain.ChangeReque
 	}
 
 	return result
+}
+
+// withoutManualScheduled drops "scheduled" from the next states ServiceNow
+// offers. There is no manual "Schedule" action in the CSM flow: a change
+// becomes Scheduled when its CAB (or, for Emergency, ECAB) approval is granted,
+// so the portal must never be handed it as something to click -- the same rule
+// the PostgreSQL data source applies (legalChangeRequestNextStates). The one
+// exception is a change sitting in Customer Approval, where "scheduled" is the
+// action that records the customer's approval (also as on PostgreSQL).
+func withoutManualScheduled(states []string, state *string) []string {
+	if states == nil {
+		return nil
+	}
+	if state != nil && strings.EqualFold(*state, string(domain.ChangeRequestStateCustomerApproval)) {
+		return states
+	}
+	out := make([]string, 0, len(states))
+	for _, st := range states {
+		if strings.EqualFold(st, string(domain.ChangeRequestStateScheduled)) {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+// GetChangeRequestLinkOptions implements ChangeRequestService. The
+// project/deployment/environment cascade is derived from PostgreSQL tables, so
+// it is not available when ServiceNow is the data source.
+func (s *snChangeRequestService) GetChangeRequestLinkOptions(_ context.Context, _ domain.ChangeRequestLinkOptionsRequest) (domain.ChangeRequestLinkOptionsResponse, error) {
+	return domain.ChangeRequestLinkOptionsResponse{}, &apierror.ValidationError{Msg: "change request link options are not supported on the ServiceNow data source"}
 }

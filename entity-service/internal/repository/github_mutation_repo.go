@@ -250,6 +250,10 @@ func (r *githubMutationRepository) UpdateFromIssue(ctx context.Context, id strin
 	})
 }
 
+// githubSyncActor is what the rows this sync cancels are stamped with
+// (approval_stage_approver.updated_by).
+const githubSyncActor = "github-sync"
+
 func (r *githubMutationRepository) SetState(ctx context.Context, id, state string) (bool, error) {
 	ctx = withGithubSystemIdentity(ctx)
 	// IS DISTINCT FROM so a move to the state it already holds writes nothing:
@@ -259,11 +263,25 @@ func (r *githubMutationRepository) SetState(ctx context.Context, id, state strin
 		UPDATE change_request
 		SET state = $2::change_request_state_enum
 		WHERE id = $1::uuid AND state IS DISTINCT FROM $2::change_request_state_enum`
-	tag, err := r.db.Exec(ctx, query, id, state)
+	changed := false
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, query, id, state)
+		if err != nil {
+			return err
+		}
+		changed = tag.RowsAffected() > 0
+		if !changed {
+			return nil
+		}
+		// A state written from outside the approval flow leaves the approvals
+		// of the state it left actionable just like a PATCH would (a closed
+		// issue closing the change): cancel them in the same transaction.
+		return reconcileStaleApprovers(ctx, tx, id, githubSyncActor)
+	})
 	if err != nil {
 		return false, fmt.Errorf("github: set state %s on %s: %w", state, id, err)
 	}
-	return tag.RowsAffected() > 0, nil
+	return changed, nil
 }
 
 func (r *githubMutationRepository) AddComment(ctx context.Context, changeRequestID, content, createdBy string) error {

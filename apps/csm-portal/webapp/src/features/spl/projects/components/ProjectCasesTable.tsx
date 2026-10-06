@@ -14,8 +14,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Case links point at /spl/cases/:caseId, not this app's own /cases route
-// (that's CSM Portal's own, unrelated case-management feature).
+// Case links open the normal CSM case view at /cases/:caseId (SPL has no
+// case-detail page of its own).
 import { useEffect, useState } from "react";
 import { Box, type SelectChangeEvent } from "@wso2/oxygen-ui";
 import { useGetProjectCases } from "../api/useProjectsApi";
@@ -80,7 +80,7 @@ export default function ProjectCasesTable({ id, isTypeCloud }: { id: string; isT
     setStateValues(typeof value === "string" ? value.split(",") : value);
   };
   const handleCaseTableRowClick = (rowData: CaseDetails) => {
-    window.open(`/spl/cases/${rowData.id}`, "_blank");
+    window.open(`/cases/${rowData.id}`, "_blank");
   };
 
   const colNameArray = ["Number", "Case ID", "Short Description", "Case Type", "Priority", "State"];

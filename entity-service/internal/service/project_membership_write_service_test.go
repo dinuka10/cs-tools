@@ -184,8 +184,8 @@ func (f *fakeWriteMembershipRepo) Upsert(context.Context, domain.SalesforceMembe
 	return domain.SalesforceMembershipUpsertResult{}, errors.New("the portal writes use UpsertWithin")
 }
 
-func (f *fakeWriteMembershipRepo) DeactivateBySfID(context.Context, string, repository.AdminRoleBasisFunc) (bool, error) {
-	return false, errors.New("not used by the portal writes")
+func (f *fakeWriteMembershipRepo) DeactivateBySfID(context.Context, string, repository.AdminRoleBasisFunc) (bool, []domain.AffectedUser, error) {
+	return false, nil, errors.New("not used by the portal writes")
 }
 
 func (f *fakeWriteMembershipRepo) UpsertWithin(ctx context.Context, _, _ string, plan repository.MembershipWritePlan) (domain.SalesforceMembershipUpsertResult, error) {
@@ -255,6 +255,7 @@ type writeHarness struct {
 	steps    *fakeStepRepo
 	pub      *fakeInvitePublisher
 	failures *fakeFailureRecorder
+	cache    *fakeUserCache
 	svc      ProjectMembershipWriteService
 }
 
@@ -273,6 +274,7 @@ func newWriteHarness(t *testing.T, access AccessService) *writeHarness {
 		steps:    &fakeStepRepo{},
 		pub:      &fakeInvitePublisher{},
 		failures: &fakeFailureRecorder{},
+		cache:    newFakeUserCache(),
 	}
 	h.svc = NewProjectMembershipWriteService(MembershipWriteDeps{
 		Memberships: h.repo,
@@ -281,6 +283,7 @@ func newWriteHarness(t *testing.T, access AccessService) *writeHarness {
 		Publisher:   h.pub,
 		Failures:    h.failures,
 		Access:      access,
+		UserCache:   h.cache,
 	})
 	return h
 }

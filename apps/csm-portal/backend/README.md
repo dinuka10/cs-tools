@@ -227,7 +227,7 @@ fatal**, so a typo stops a deploy instead of silently emptying a page. They prev
 |---|---|
 | `CSM_TEAM_REGISTRY` | Team catalogue. `teamKey\|Display Name\|FAMILY\|groupId` rows separated by `,`; `FAMILY` and `groupId` are optional. Optional overall — unset means no teams (startup warns) |
 | `CSM_USER_ROLES` | Assignable-role allow-list, comma-separated. Optional; unset uses the built-in list |
-| `ASGARDEO_ROLE_IDS` | Role-key → Asgardeo role id mapping, `roleKey\|asgardeoRoleId` rows separated by `,` (e.g. `timecard_approver\|0bbeea4f-5ada-49ba-8f19-90ae6a116daa`). Optional overall and per-key — an unconfigured key just means that role's SCIM-backed feature (e.g. `GET /users/time-card-approvers`) 404s rather than being disabled at the route level |
+| `ASGARDEO_ROLE_IDS` | Real role name → identity-provider role id mapping, a JSON object string (e.g. `{"example-timecard-approver-role":"11111111-1111-1111-1111-111111111111"}`). Keyed by the role name exactly as it appears in `AUTH_<ROLE>_ROLES`, not a portal-role key. Optional overall and per-name — a real name with no entry here just means that role has no SCIM-backed feature wired up (e.g. `GET /users/time-card-approvers` 404s, and that portal role is absent from `GET /roles/grantable`) |
 
 ```bash
 # FAMILY is one of CRE-ABT, CRE, SRE-ABT, SRE (case insensitive). Any other
@@ -284,7 +284,14 @@ configured at all, nobody can use the portal.
 | `AUTH_USAGE_METRICS_VIEWER_ROLES` | view |
 | `AUTH_TIMECARD_APPROVER_ROLES` | view, time_cards_and_updates, and approving/rejecting a time card (`PATCH /time-cards/{id}` with `state` set — `cs_engineer` does NOT grant this) |
 | `AUTH_DASHBOARD_DESIGNER_ROLES` | view |
-| `AUTH_WORKNOTE_CREATOR_ROLES` | posting a `work_note`-type comment on a case only (`POST /cases/{id}/comments`) — not a customer-visible reply, and none of `write`'s other actions. `cs_engineer`/`admin` already grant this via `write`; unset is a normal, supported state (like `AUTH_SALES_SOLUTIONS_ROLES`), not a misconfiguration — startup does not warn about it |
+| `AUTH_WORKNOTE_CREATOR_ROLES` | posting a `work_note`-type comment on a case only (`POST /cases/{id}/comments`) — not a customer-visible reply, and none of `write`'s other actions. `cs_engineer`/`admin` already grant this via `write`; a plain `viewer` does NOT (it is read-only), so give this role to anyone who should add work notes without full write; unset is a normal, supported state (like `AUTH_SALES_SOLUTIONS_ROLES`), not a misconfiguration — startup does not warn about it |
+
+A worknote-creator- or escalator-only caller is provisioned a platform `"user"` record
+on first use rather than needing to go through the admin "Add User" flow first: before
+posting a work note or creating/removing a case escalation, this backend checks whether
+the caller already has one (`GET /users/me`) and, if not, creates it from the caller's
+own token (`given_name`/`family_name`/`email`), granted the `internal` role. A
+`cs_engineer`/`admin` caller is assumed already provisioned and skips this check.
 
 ```bash
 # Several token roles can grant one portal role; any one is enough.
@@ -301,7 +308,7 @@ AUTH_ESCALATOR_ROLES=example-escalators-role,example-leads-role
 | `escalate` | `POST /cases/{id}/escalations` — escalator and admin only |
 | `download_attachment` | `GET /attachments/{id}/content`, `POST /attachments/{id}/share` |
 | `write` | every other `POST`/`PATCH`/`DELETE`, including case, incident and change-request comments — except the `admin`-only routes below |
-| `admin` | `POST /users` (create a new platform user) — held by the `admin` role alone; `cs_engineer` does not grant it |
+| `admin` | `POST /users` (create a new platform user), `GET /roles/grantable` (which portal roles that endpoint can grant) — held by the `admin` role alone; `cs_engineer` does not grant it |
 | `security_center` | `POST /products/vulnerabilities/search`, `GET /products/vulnerabilities/{id}`, plus security-report cases (a `POST /cases/search`/`GET /cases/{id}` request naming case type `security_report_analysis`) — `cs_engineer` and `admin` only, even though every other role also holding `view` can otherwise read cases and products freely. See `CaseHandler.WithAccessGuard`'s own doc comment for why `GET /cases/{id}` cannot enforce this per-case (the response's `type` field is null on the Postgres data source) |
 
 A caller whose token holds none of the required roles gets `403`. Escalation and
@@ -403,8 +410,9 @@ backend/
 - `PATCH /users/me` — Update current user profile (`phoneNumber` via SCIM, `timeZone` via entity service)
 - `POST /users/search` — Search users; optional `filters` (`searchQuery`, `roles`, `userNames`, `emails`, `active`) and `sortBy` (`field`, `order`); response shape depends on data source (`User` for postgres, `SNUser` for ServiceNow)
 - `GET /users/{id}` — Get one user's full profile (both data sources); adds `teams` (derived from `groups`) and, for external contacts only, `externalAccount` (`exists`/`locked`, from SCIM's "external" org search). For an internal (WSO2 staff) target, `roles` is replaced with the same portal-role vocabulary `GET /users/me` reports (`viewer`/`escalator`/.../`admin`), sourced from that user's own SCIM role assignment (filtered to this portal's `app-csm-*` roles) rather than entity-service's own role data — entity-service's `roles` is left as-is for an external contact, a genuinely different vocabulary. All three enrichments (teams, externalAccount, roles) are best-effort — absent/unchanged rather than failing the request if their lookup fails
-- `POST /users` — Create a new user (`firstName`, `lastName`, `email` required to have at least one of firstName/lastName; optional `roles`, validated against the configured role allow-list). **Admin-only** (`admin` permission — see "Access control" above); Postgres data source only. `roles` is also how a caller sets the new user's type (entity-service derives `userType` from role membership) — the Add User form sends exactly one of `internal`/`external`. Granting `internal`/`admin` for a non-`@wso2.com` email is rejected with 400
-- `GET /users/time-card-approvers` — Lists the real Asgardeo membership (`{id, email}` per member) of the configured `timecard_approver` role, via the SCIM operations service — authoritative over, and potentially different from, entity-service's own Postgres `role`/`user_role` tables. Returns 404 unless `ASGARDEO_ROLE_IDS` configures a `timecard_approver` entry; a SCIM 401/403 (e.g. a missing roles-read scope on this backend's own SCIM credentials) is reported as 502, never passed through as the caller's own 401/403 (see "Listing time card approvers via SCIM" in `CLAUDE.md`)
+- `POST /users` — Create a new user (`firstName`, `lastName`, `email` required to have at least one of firstName/lastName; optional `roles`, validated against the configured role allow-list). **Admin-only** (`admin` permission — see "Access control" above); Postgres data source only. `roles` is also how a caller sets the new user's type (entity-service derives `userType` from role membership) — the Add User form sends exactly one of `internal`/`external`. Granting `internal`/`admin` for a non-`@wso2.com` email is rejected with 400. A separate, unrelated optional field, `grantRoles` (portal role keys, e.g. `["cs_engineer"]`), grants each via SCIM once the user exists — an unknown key is a 400, a SCIM-side failure is logged but does not fail the create (see "Granting portal roles on user creation" in `CLAUDE.md`)
+- `GET /users/time-card-approvers` — Lists the real Asgardeo membership (`{id, email}` per member, merged and deduplicated across every real role name `AUTH_TIMECARD_APPROVER_ROLES` configures an id for) of the `timecard_approver` role, via the SCIM operations service — authoritative over, and potentially different from, entity-service's own Postgres `role`/`user_role` tables. Returns 404 unless `ASGARDEO_ROLE_IDS` configures at least one `timecard_approver` real role name; a SCIM 401/403 (e.g. a missing roles-read scope on this backend's own SCIM credentials) is reported as 502, never passed through as the caller's own 401/403 (see "Listing time card approvers via SCIM" in `CLAUDE.md`)
+- `GET /roles/grantable` — Lists the portal role keys `POST /users`' own `grantRoles` field can grant in this deployment (just the key, e.g. `cs_engineer` — never the real role name/id behind it). **Admin-only**, same gate as `POST /users` itself
 
 ### Accounts
 

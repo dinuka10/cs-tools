@@ -20,7 +20,11 @@
 -- as a one-off step after migrations. All values are fake/dummy, safe for
 -- a public repo (no real names, emails, or ids).
 --
--- Idempotent: safe to run more than once (ON CONFLICT DO NOTHING throughout).
+-- Idempotent: safe to run more than once. Most rows are ON CONFLICT DO NOTHING;
+-- the change request approval personas and the CHG-FIXED-* fixtures at the end
+-- are SELF-HEALING instead (upserted / deleted and re-inserted), so an
+-- already-seeded database converges to the current fixtures on a re-run -- and
+-- the fixtures are put back to their starting state each time (see there).
 
 BEGIN;
 
@@ -58,6 +62,35 @@ INSERT INTO deployment (id, created_on, updated_on, created_by, updated_by, numb
   ('00000000-0000-0000-0000-000000000501', now(), now(), 'seed', 'seed', 'DEP-0001', 'Production', 'PRIMARY_PRODUCTION', true, '00000000-0000-0000-0000-000000000401')
 ON CONFLICT (id) DO NOTHING;
 
+-- A second and third deployment for the same project, each with its own
+-- deployed products, so the change request form's cascade (Customer Project ->
+-- Deployments -> Deployment products) has something to show:
+-- Production (PRIMARY_PRODUCTION) runs API Manager 4.3.0 and Identity Server
+-- 7.0.0, Staging runs API Manager 4.4.0 only, Development runs nothing yet. A
+-- deployment's environment role is its type, so choosing Production + Staging
+-- gives three deployment products; choosing Development alone gives none.
+INSERT INTO deployment (id, created_on, updated_on, created_by, updated_by, number, name, type, is_active, project_id) VALUES
+  ('00000000-0000-0000-0000-000000000502', now(), now(), 'seed', 'seed', 'DEP-0002', 'Staging',     'STAGING',     true, '00000000-0000-0000-0000-000000000401'),
+  ('00000000-0000-0000-0000-000000000503', now(), now(), 'seed', 'seed', 'DEP-0003', 'Development', 'DEVELOPMENT', true, '00000000-0000-0000-0000-000000000401')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO product (id, created_on, updated_on, created_by, updated_by, manufacturer, category, name) VALUES
+  ('00000000-0000-0000-0000-000000000511', now(), now(), 'seed', 'seed', 'WSO2', 'SOFTWARE', 'WSO2 API Manager'),
+  ('00000000-0000-0000-0000-000000000512', now(), now(), 'seed', 'seed', 'WSO2', 'SOFTWARE', 'WSO2 Identity Server')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO product_version (id, created_on, updated_on, created_by, updated_by, version, product_id, current_support_status, release_date) VALUES
+  ('00000000-0000-0000-0000-000000000521', now(), now(), 'seed', 'seed', '4.3.0', '00000000-0000-0000-0000-000000000511', 'AVAILABLE', '2024-06-01'),
+  ('00000000-0000-0000-0000-000000000522', now(), now(), 'seed', 'seed', '4.4.0', '00000000-0000-0000-0000-000000000511', 'AVAILABLE', '2025-02-01'),
+  ('00000000-0000-0000-0000-000000000523', now(), now(), 'seed', 'seed', '7.0.0', '00000000-0000-0000-0000-000000000512', 'AVAILABLE', '2024-03-01')
+ON CONFLICT DO NOTHING;
+
+INSERT INTO deployed_product (id, created_on, updated_on, created_by, updated_by, number, name, active, life_cycle_stage_status, life_cycle_stage, core_count, project_id, deployment_id, product_id, version_id, product_category) VALUES
+  ('00000000-0000-0000-0000-000000000531', now(), now(), 'seed', 'seed', 'DP-0001', 'WSO2 API Manager 4.3.0',      true, 'AVAILABLE', 'OPERATIONAL', 8, '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000501', '00000000-0000-0000-0000-000000000511', '00000000-0000-0000-0000-000000000521', 'PDP'),
+  ('00000000-0000-0000-0000-000000000532', now(), now(), 'seed', 'seed', 'DP-0002', 'WSO2 Identity Server 7.0.0', true, 'AVAILABLE', 'OPERATIONAL', 4, '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000501', '00000000-0000-0000-0000-000000000512', '00000000-0000-0000-0000-000000000523', 'PDP'),
+  ('00000000-0000-0000-0000-000000000533', now(), now(), 'seed', 'seed', 'DP-0003', 'WSO2 API Manager 4.4.0',      true, 'AVAILABLE', 'OPERATIONAL', 4, '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000502', '00000000-0000-0000-0000-000000000511', '00000000-0000-0000-0000-000000000522', 'PDP')
+ON CONFLICT DO NOTHING;
+
 -- One case (work_item + case row).
 INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by, number, wso2_id, subject, type, account_id, project_id, deployment_id, opened_by_user_id, assigned_to_id, description) VALUES
   ('00000000-0000-0000-0000-000000000601', now(), now(), 'seed', 'seed', 'CASE-0001', 'CASE-0001', 'Sample case seeded for local dev', 'CASE', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000501', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed data for docker-compose local dev stack.')
@@ -79,7 +112,7 @@ INSERT INTO time_card (id, created_on, updated_on, created_by, updated_by, case_
   ('00000000-0000-0000-0000-000000000801', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000601', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000001', CURRENT_DATE, true, 'SUBMITTED', 30, 'Seeded time card for local dev.')
 ON CONFLICT (id) DO NOTHING;
 
--- One ABT team with both seeded users as members, for GET /teams/{id}/members.
+-- One ABT team with the seeded users as members, for GET /teams/{id}/members.
 -- key is required (migration 000101_schedule_team_key_catalogue.up.sql added
 -- it NOT NULL) -- lower(name), matching that migration's own backfill
 -- convention for a row that predates it, since this one is inserted fresh
@@ -104,5 +137,401 @@ ON CONFLICT (id) DO NOTHING;
 
 UPDATE account SET cre_team_id = '00000000-0000-0000-0000-000000000901'
 WHERE id = '00000000-0000-0000-0000-000000000301';
+
+-- Same team, on the group side: team_member.group_id (distinct from team_id --
+-- see entity-service's own CLAUDE.md, "Change requests", "team_member.group_id is
+-- the real column for this") is what change_request's approver auto-provisioning
+-- reads, not team_id. It is left NULL by the plain INSERT above (and an
+-- ON CONFLICT DO NOTHING re-run would never backfill it either), so it is set
+-- explicitly here, unconditionally, once the "group" row above exists
+-- (group_id's FK requires it) -- same always-apply-regardless-of-conflict shape
+-- as the account.cre_team_id UPDATE just above.
+--
+-- jane.doe stays a member of the TEAM (GET /teams/{id}/members, her own
+-- /users/me) but is deliberately NOT in the group (group_id NULL): she is the
+-- requester persona of the change request fixtures, not one of their approvers.
+-- john.smith (a customer) stays in the group on purpose: he is the standing
+-- probe of the INTERNAL-only approver pools -- an external member of the
+-- assigned group who must never be provisioned as an approver of an internal
+-- stage (see "Approver pools" in entity-service's CLAUDE.md).
+UPDATE team_member SET group_id = NULL
+WHERE id = '00000000-0000-0000-0000-000000000902';
+UPDATE team_member SET group_id = '00000000-0000-0000-0000-000000000901'
+WHERE id = '00000000-0000-0000-0000-000000000903';
+
+-- ---------------------------------------------------------------------------
+-- Change request approval personas: a separate set of people to exercise the
+-- approval and customer-approval flows, so the fixtures below do not hang on
+-- jane.doe / john.smith (whose rows stay -- cases, time cards and the other
+-- seed data use them).
+--
+--   WSO2 staff (INTERNAL, role 'internal') -- the approvers of the internal
+--   stages (Peer, CAB, ECAB, Review):
+--     alice.perera@example.com    Alice Perera
+--     bob.fernando@example.com    Bob Fernando
+--     carol.silva@example.com     Carol Silva
+--   They are members of "Example Corp ABT" (group 901, the assigned group of
+--   every fixture below), of "CAB Approval", of "ECAB Approval" and of
+--   "Devops Approval" (the peer approval fallback group, seeded here so the
+--   fallback can be exercised locally).
+--
+--   Customers (EXTERNAL, role 'customer') -- registered contacts of project 401
+--   "Example Corp Production", i.e. the Customer Group asked at Customer
+--   Approval / Customer Review:
+--     dave.mendis@example.com        Dave Mendis
+--     erin.jayawardena@example.com   Erin Jayawardena
+--
+-- "user".user_type is derived from the roles by recompute_user_type() (trigger
+-- on user_role), so these are INTERNAL / EXTERNAL without being set by hand.
+-- Two traps, both from seed-team-schedule.sql's own notes: never grant the
+-- internal role to a customer (recompute checks internal before external, so
+-- that customer would become INTERNAL and be handed unrestricted scope over
+-- every project), and never give these grants created_by = 'seed' -- that file
+-- deletes every 'seed' internal grant of anyone outside its own roster.
+INSERT INTO "user" (id, created_on, updated_on, created_by, updated_by, user_name, name, first_name, last_name, email, is_active, is_system_user) VALUES
+  ('00000000-0000-0000-0000-000000000011', now(), now(), 'seed', 'seed', 'alice.perera@example.com',       'Alice Perera',       'Alice', 'Perera',     'alice.perera@example.com',       true, false),
+  ('00000000-0000-0000-0000-000000000012', now(), now(), 'seed', 'seed', 'bob.fernando@example.com',       'Bob Fernando',       'Bob',   'Fernando',   'bob.fernando@example.com',       true, false),
+  ('00000000-0000-0000-0000-000000000013', now(), now(), 'seed', 'seed', 'carol.silva@example.com',        'Carol Silva',        'Carol', 'Silva',      'carol.silva@example.com',        true, false),
+  ('00000000-0000-0000-0000-000000000021', now(), now(), 'seed', 'seed', 'dave.mendis@example.com',        'Dave Mendis',        'Dave',  'Mendis',     'dave.mendis@example.com',        true, false),
+  ('00000000-0000-0000-0000-000000000022', now(), now(), 'seed', 'seed', 'erin.jayawardena@example.com',   'Erin Jayawardena',   'Erin',  'Jayawardena','erin.jayawardena@example.com',   true, false)
+ON CONFLICT (id) DO NOTHING;
+
+-- No created_by on purpose (see above).
+INSERT INTO user_role (id, created_on, updated_on, user_id, role_id) VALUES
+  ('00000000-0000-0000-0000-000000000211', now(), now(), '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000101'),
+  ('00000000-0000-0000-0000-000000000212', now(), now(), '00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-000000000101'),
+  ('00000000-0000-0000-0000-000000000213', now(), now(), '00000000-0000-0000-0000-000000000013', '00000000-0000-0000-0000-000000000101'),
+  ('00000000-0000-0000-0000-000000000221', now(), now(), '00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000102'),
+  ('00000000-0000-0000-0000-000000000222', now(), now(), '00000000-0000-0000-0000-000000000022', '00000000-0000-0000-0000-000000000102')
+ON CONFLICT (id) DO NOTHING;
+-- Self-healing: a customer persona never holds the internal role.
+DELETE FROM user_role
+WHERE user_id IN ('00000000-0000-0000-0000-000000000021', '00000000-0000-0000-0000-000000000022')
+  AND role_id = '00000000-0000-0000-0000-000000000101';
+
+-- Example Corp ABT (group 901): the three internal personas. team_member.team_id
+-- is NOT NULL, so the team fills it; the membership that counts is group_id.
+INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id, group_id) VALUES
+  ('00000000-0000-0000-0000-000000000904', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000011', '00000000-0000-0000-0000-000000000901'),
+  ('00000000-0000-0000-0000-000000000905', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000012', '00000000-0000-0000-0000-000000000901'),
+  ('00000000-0000-0000-0000-000000000906', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000013', '00000000-0000-0000-0000-000000000901')
+ON CONFLICT (id) DO UPDATE SET team_id = EXCLUDED.team_id, user_id = EXCLUDED.user_id, group_id = EXCLUDED.group_id;
+
+-- CAB Approval / ECAB Approval membership (migration 0188 creates the two
+-- groups, empty). A Normal change cannot be sent for approval, and its peer
+-- approval cannot cascade to CAB, unless the CAB group has an eligible (active,
+-- internal) member -- so the three internal personas sit in both groups, which
+-- lets the fixtures run the full Request Approval -> Peer -> CAB -> Scheduled
+-- (Normal) and Request Approval -> ECAB -> Scheduled (Emergency) flows locally.
+-- (jane.doe and john.smith held these seats before; their rows 1101-1104 are
+-- removed so an already-seeded database converges.)
+DELETE FROM team_member WHERE id IN (
+  '00000000-0000-0000-0000-000000001101', '00000000-0000-0000-0000-000000001102',
+  '00000000-0000-0000-0000-000000001103', '00000000-0000-0000-0000-000000001104');
+INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id, group_id) VALUES
+  ('00000000-0000-0000-0000-000000001111', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000011', '00000000-0000-4000-8000-00000000ca01'),
+  ('00000000-0000-0000-0000-000000001112', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000012', '00000000-0000-4000-8000-00000000ca01'),
+  ('00000000-0000-0000-0000-000000001113', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000013', '00000000-0000-4000-8000-00000000ca01'),
+  ('00000000-0000-0000-0000-000000001121', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000011', '00000000-0000-4000-8000-00000000eca1'),
+  ('00000000-0000-0000-0000-000000001122', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000012', '00000000-0000-4000-8000-00000000eca1'),
+  ('00000000-0000-0000-0000-000000001123', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000013', '00000000-0000-4000-8000-00000000eca1')
+ON CONFLICT (id) DO UPDATE SET team_id = EXCLUDED.team_id, user_id = EXCLUDED.user_id, group_id = EXCLUDED.group_id;
+
+-- Devops Approval: the peer approval fallback group (domain.PeerApprovalFallbackGroupName),
+-- used when a Normal change has no assigned group or its assigned group yields
+-- no eligible member. Not created by any migration, so it is seeded here -- only
+-- when no group of that name exists (a synced environment may already mirror
+-- one, and a second must not be added), and its members attach to whichever
+-- group of that name is found first.
+INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name, description, is_active)
+SELECT '00000000-0000-4000-8000-0000000de001'::uuid, now(), now(), 'seed', 'seed',
+       'Devops Approval', 'Peer approval fallback group: the peer approvers of a Normal change whose assigned group yields nobody.', true
+WHERE NOT EXISTS (SELECT 1 FROM "group" WHERE name = 'Devops Approval')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO team_member (id, created_on, updated_on, created_by, updated_by, team_id, user_id, group_id)
+SELECT m.id, now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000000901'::uuid, m.user_id,
+       (SELECT g.id FROM "group" g WHERE g.name = 'Devops Approval' ORDER BY g.created_on, g.id LIMIT 1)
+FROM (VALUES
+  ('00000000-0000-0000-0000-000000001131'::uuid, '00000000-0000-0000-0000-000000000011'::uuid),
+  ('00000000-0000-0000-0000-000000001132'::uuid, '00000000-0000-0000-0000-000000000012'::uuid),
+  ('00000000-0000-0000-0000-000000001133'::uuid, '00000000-0000-0000-0000-000000000013'::uuid)
+) AS m(id, user_id)
+ON CONFLICT (id) DO UPDATE SET user_id = EXCLUDED.user_id, group_id = EXCLUDED.group_id;
+
+-- An earlier version of this seed modelled the Customer Group as a "group" of
+-- members ("Example Corp Customer Approvers", 911; 912 for the second customer)
+-- with jane.doe / john.smith in it. The Customer Group is now derived from the
+-- project's registered contacts (below) and these groups are referenced by
+-- nothing, so remove them -- and their memberships -- from a database that was
+-- seeded by that version. (No-op on a fresh one.)
+DELETE FROM team_member WHERE group_id IN (
+  '00000000-0000-0000-0000-000000000911', '00000000-0000-0000-0000-000000000912');
+DELETE FROM "group" WHERE id IN (
+  '00000000-0000-0000-0000-000000000911', '00000000-0000-0000-0000-000000000912');
+
+-- Customer Group: the registered contacts of the change request's Customer
+-- Project, derived live and read-only (entity-service CLAUDE.md, "Customer
+-- Group"). A contact is a project_contact in state REGISTERED holding the
+-- PORTAL_USER project role (through project_contact_group -> project_group ->
+-- project_group_role -> project_role) whose "user" is active; they are the
+-- people asked at Customer Approval / Customer Review. Two customers are seeded
+-- so the isolation is demonstrable:
+--   Example Corp (account 301)  project 401 "Example Corp Production"
+--                               <- registered contacts dave.mendis, erin.jayawardena
+--   Other Corp   (account 302)  project 402 "Other Corp Production"
+--                               <- registered contact sam.other
+-- A change request of project 401 is only ever put to dave / erin, one of
+-- project 402 only to sam.other. (project_role / project_group rows are
+-- normally synced from ServiceNow; they are seeded here for the local stack.)
+INSERT INTO "user" (id, created_on, updated_on, created_by, updated_by, user_name, name, first_name, last_name, email, is_active, is_system_user) VALUES
+  ('00000000-0000-0000-0000-000000000003', now(), now(), 'seed', 'seed', 'sam.other@othercorp.example', 'Sam Other', 'Sam', 'Other', 'sam.other@othercorp.example', true, false)
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO account (id, created_on, updated_on, created_by, updated_by, name, number, sf_id, customer_success_manager_id, country, city, drive_location) VALUES
+  ('00000000-0000-0000-0000-000000000302', now(), now(), 'seed', 'seed', 'Other Corp', 'ACC-0002', 'SF-0002', '00000000-0000-0000-0000-000000000001', 'United Kingdom', 'London', 'https://drive.example.com/other-corp')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO project (id, created_on, updated_on, created_by, updated_by, key, sf_id, name, account_id, is_active, project_type_id) VALUES
+  ('00000000-0000-0000-0000-000000000402', now(), now(), 'seed', 'seed', 'OTHERCORP-PROJ-1', 'SF-PROJ-0002', 'Other Corp Production', '00000000-0000-0000-0000-000000000302', true, '00000000-0000-0000-0000-0000000000a3')
+ON CONFLICT (id) DO UPDATE SET project_type_id = COALESCE(project.project_type_id, EXCLUDED.project_type_id);
+
+INSERT INTO deployment (id, created_on, updated_on, created_by, updated_by, number, name, type, is_active, project_id) VALUES
+  ('00000000-0000-0000-0000-000000000541', now(), now(), 'seed', 'seed', 'DEP-0010', 'Other Corp Production', 'PRIMARY_PRODUCTION', true, '00000000-0000-0000-0000-000000000402')
+ON CONFLICT (id) DO NOTHING;
+
+-- The PORTAL_USER role and the "General Access" project group that carries it.
+INSERT INTO project_role (id, created_on, updated_on, created_by, updated_by, role) VALUES
+  ('00000000-0000-0000-0000-000000001401', now(), now(), 'seed', 'seed', 'PORTAL_USER')
+ON CONFLICT (role) DO NOTHING;
+INSERT INTO project_group (id, created_on, updated_on, created_by, updated_by, "group") VALUES
+  ('00000000-0000-0000-0000-000000001402', now(), now(), 'seed', 'seed', 'General Access')
+ON CONFLICT ("group") DO NOTHING;
+INSERT INTO project_group_role (id, created_on, updated_on, created_by, updated_by, project_group_id, project_role_id)
+SELECT '00000000-0000-0000-0000-000000001403', now(), now(), 'seed', 'seed', pg.id, pr.id
+FROM project_group pg, project_role pr
+WHERE pg."group" = 'General Access' AND pr.role = 'PORTAL_USER'
+ON CONFLICT DO NOTHING;
+
+-- jane.doe and john.smith were registered contacts of project 401 (rows
+-- 1421/1422 and their project_contact_group links 1431/1432) before the
+-- personas above; they no longer are. Their account_contact rows (1411/1412)
+-- stay: they are still contacts of the Example Corp ACCOUNT, just not
+-- registered on a project. Self-healing for an already-seeded database.
+DELETE FROM project_contact_group WHERE id IN (
+  '00000000-0000-0000-0000-000000001431', '00000000-0000-0000-0000-000000001432');
+DELETE FROM project_contact WHERE id IN (
+  '00000000-0000-0000-0000-000000001421', '00000000-0000-0000-0000-000000001422');
+
+INSERT INTO account_contact (id, created_on, updated_on, created_by, updated_by, is_active, user_name, account_id) VALUES
+  ('00000000-0000-0000-0000-000000001411', now(), now(), 'seed', 'seed', true, 'jane.doe@example.com', '00000000-0000-0000-0000-000000000301'),
+  ('00000000-0000-0000-0000-000000001412', now(), now(), 'seed', 'seed', true, 'john.smith@example.com', '00000000-0000-0000-0000-000000000301'),
+  ('00000000-0000-0000-0000-000000001413', now(), now(), 'seed', 'seed', true, 'sam.other@othercorp.example', '00000000-0000-0000-0000-000000000302'),
+  ('00000000-0000-0000-0000-000000001414', now(), now(), 'seed', 'seed', true, 'dave.mendis@example.com', '00000000-0000-0000-0000-000000000301'),
+  ('00000000-0000-0000-0000-000000001415', now(), now(), 'seed', 'seed', true, 'erin.jayawardena@example.com', '00000000-0000-0000-0000-000000000301')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO project_contact (id, created_on, updated_on, created_by, updated_by, email, state, account_contact_id, project_id) VALUES
+  ('00000000-0000-0000-0000-000000001423', now(), now(), 'seed', 'seed', 'sam.other@othercorp.example', 'REGISTERED', '00000000-0000-0000-0000-000000001413', '00000000-0000-0000-0000-000000000402'),
+  ('00000000-0000-0000-0000-000000001424', now(), now(), 'seed', 'seed', 'dave.mendis@example.com', 'REGISTERED', '00000000-0000-0000-0000-000000001414', '00000000-0000-0000-0000-000000000401'),
+  ('00000000-0000-0000-0000-000000001425', now(), now(), 'seed', 'seed', 'erin.jayawardena@example.com', 'REGISTERED', '00000000-0000-0000-0000-000000001415', '00000000-0000-0000-0000-000000000401')
+ON CONFLICT (id) DO UPDATE SET state = 'REGISTERED', project_id = EXCLUDED.project_id, account_contact_id = EXCLUDED.account_contact_id;
+
+INSERT INTO project_contact_group (id, created_on, updated_on, created_by, updated_by, project_contact_id, project_group_id)
+SELECT c.id, now(), now(), 'seed', 'seed', c.contact, pg.id
+FROM (VALUES
+  ('00000000-0000-0000-0000-000000001433'::uuid, '00000000-0000-0000-0000-000000001423'::uuid),
+  ('00000000-0000-0000-0000-000000001434'::uuid, '00000000-0000-0000-0000-000000001424'::uuid),
+  ('00000000-0000-0000-0000-000000001435'::uuid, '00000000-0000-0000-0000-000000001425'::uuid)
+) AS c(id, contact), project_group pg
+WHERE pg."group" = 'General Access'
+ON CONFLICT (id) DO NOTHING;
+
+-- "Lumen Works Platform": registered customer contacts for the generated project.
+-- The seed-generator (a separate, randomised pass that runs AFTER this script)
+-- creates projects with random names; "Lumen Works Platform" is one of them, with
+-- generated contacts that do not qualify as a Customer Group (no "user" row, no
+-- PORTAL_USER project role). So that a change request on that project has
+-- customer approvers, two real customer users are registered on it here:
+--     mira.santos@lumenworks.example   Mira Santos
+--     noel.prasad@lumenworks.example   Noel Prasad
+-- They meet the same criteria as the Example Corp contacts above: a REGISTERED
+-- project_contact holding the PORTAL_USER role (through the "General Access"
+-- project group), whose "user" is active and a customer (role 'customer', so
+-- EXTERNAL; never the internal role). The project is found BY NAME because its id
+-- is random per database; where no project of that name exists this block does
+-- nothing, and it takes effect on the next seed run after the generator has
+-- created it (`docker-compose up -d migrate` re-runs this script).
+INSERT INTO "user" (id, created_on, updated_on, created_by, updated_by, user_name, name, first_name, last_name, email, is_active, is_system_user) VALUES
+  ('00000000-0000-0000-0000-000000000023', now(), now(), 'seed', 'seed', 'mira.santos@lumenworks.example', 'Mira Santos', 'Mira', 'Santos', 'mira.santos@lumenworks.example', true, false),
+  ('00000000-0000-0000-0000-000000000024', now(), now(), 'seed', 'seed', 'noel.prasad@lumenworks.example', 'Noel Prasad', 'Noel', 'Prasad', 'noel.prasad@lumenworks.example', true, false)
+ON CONFLICT (id) DO NOTHING;
+
+-- No created_by on purpose (see the personas above).
+INSERT INTO user_role (id, created_on, updated_on, user_id, role_id) VALUES
+  ('00000000-0000-0000-0000-000000000223', now(), now(), '00000000-0000-0000-0000-000000000023', '00000000-0000-0000-0000-000000000102'),
+  ('00000000-0000-0000-0000-000000000224', now(), now(), '00000000-0000-0000-0000-000000000024', '00000000-0000-0000-0000-000000000102')
+ON CONFLICT (id) DO NOTHING;
+DELETE FROM user_role
+WHERE user_id IN ('00000000-0000-0000-0000-000000000023', '00000000-0000-0000-0000-000000000024')
+  AND role_id = '00000000-0000-0000-0000-000000000101';
+
+WITH lumen AS (
+  SELECT id, account_id FROM project
+  WHERE name = 'Lumen Works Platform' AND account_id IS NOT NULL
+  ORDER BY created_on, id LIMIT 1
+)
+INSERT INTO account_contact (id, created_on, updated_on, created_by, updated_by, is_active, user_name, account_id)
+SELECT c.id, now(), now(), 'seed', 'seed', true, c.user_name, lumen.account_id
+FROM lumen, (VALUES
+  ('00000000-0000-0000-0000-000000001416'::uuid, 'mira.santos@lumenworks.example'),
+  ('00000000-0000-0000-0000-000000001417'::uuid, 'noel.prasad@lumenworks.example')
+) AS c(id, user_name)
+ON CONFLICT (id) DO UPDATE SET account_id = EXCLUDED.account_id, is_active = true;
+
+WITH lumen AS (
+  SELECT id FROM project
+  WHERE name = 'Lumen Works Platform' AND account_id IS NOT NULL
+  ORDER BY created_on, id LIMIT 1
+)
+INSERT INTO project_contact (id, created_on, updated_on, created_by, updated_by, email, state, account_contact_id, project_id)
+SELECT c.id, now(), now(), 'seed', 'seed', c.email, 'REGISTERED', c.account_contact_id, lumen.id
+FROM lumen, (VALUES
+  ('00000000-0000-0000-0000-000000001426'::uuid, 'mira.santos@lumenworks.example', '00000000-0000-0000-0000-000000001416'::uuid),
+  ('00000000-0000-0000-0000-000000001427'::uuid, 'noel.prasad@lumenworks.example', '00000000-0000-0000-0000-000000001417'::uuid)
+) AS c(id, email, account_contact_id)
+ON CONFLICT (id) DO UPDATE SET state = 'REGISTERED', project_id = EXCLUDED.project_id, account_contact_id = EXCLUDED.account_contact_id;
+
+INSERT INTO project_contact_group (id, created_on, updated_on, created_by, updated_by, project_contact_id, project_group_id)
+SELECT c.id, now(), now(), 'seed', 'seed', c.contact, pg.id
+FROM (VALUES
+  ('00000000-0000-0000-0000-000000001436'::uuid, '00000000-0000-0000-0000-000000001426'::uuid),
+  ('00000000-0000-0000-0000-000000001437'::uuid, '00000000-0000-0000-0000-000000001427'::uuid)
+) AS c(id, contact), project_group pg
+WHERE pg."group" = 'General Access'
+  AND EXISTS (SELECT 1 FROM project_contact pc WHERE pc.id = c.contact)
+ON CONFLICT (id) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Change request fixtures: eight fixed-UUID change requests (block 1001+) giving
+-- Playwright E2E specs a real, deterministic change request to navigate straight
+-- to by id/number at every stage of its lifecycle, since the webapp's own
+-- "Create Change Request" flow always 503s on this data source (work_item.number
+-- has no DB sequence -- see entity-service's own CLAUDE.md, "CreateCase and case
+-- numbers"/"Change requests"). Each is a work_item (type CHANGE_REQUEST) +
+-- change_request row, the same shared-primary-key extension shape as the
+-- "case"/work_item pair above. wso2_id is left unset: it's nullable for change
+-- requests specifically (migration 0021's own comment -- "change_request work
+-- items have no wso2_id data"), unlike the case fixture above, whose type
+-- requires it.
+--
+-- SELF-HEALING: these fixtures are driven forward by the specs (a request for
+-- approval, an approval, a customer decision), and the plain
+-- ON CONFLICT DO NOTHING every other row in this file uses would leave a
+-- mutated row mutated -- and an already-seeded database holding the pre-persona
+-- fixtures (jane.doe / john.smith as approvers and contacts) would never pick up
+-- the new ones. So running this file RESETS them: every approval stage and
+-- approver of the eight is deleted and re-inserted below, and the work_item /
+-- change_request rows are upserted back to their starting state (state, owner
+-- fields, customer flags and stamps, schedule and hold columns). Re-running the
+-- seed (`docker-compose up -d migrate`) is therefore the way to put the
+-- fixtures back; the Playwright suite does exactly that before it starts.
+--
+--   CHG-FIXED-001  NEW, no assignment group: "Request Approval is blocked until a
+--                  team is assigned". requested_by_user_id = john.smith.
+--   CHG-FIXED-002  NEW, assignment group 901: Request Approval provisions the
+--                  Peer Approval stage for 901's active INTERNAL members (alice,
+--                  bob, carol); john.smith, an external member of the group, is
+--                  skipped. requested_by_user_id is NULL on this and the fixtures
+--                  below so nobody is excluded as the creator.
+--   CHG-FIXED-003  ASSESS, Peer Approval stage with alice, bob, carol REQUESTED:
+--                  the first to approve cascades to Authorize (CAB Approval) and
+--                  cancels the siblings.
+--   CHG-FIXED-004  AUTHORIZE, Peer Approval already decided (alice approved, bob
+--                  and carol cancelled).
+--   CHG-FIXED-005  Standard, NEW, Customer Approval ticked: Request Approval
+--                  lands in Customer Approval, where project 401's contacts (dave,
+--                  erin) are asked.
+--   CHG-FIXED-006  Normal, REVIEW, Customer Review ticked: Review offers
+--                  customer_review instead of closed.
+--   CHG-FIXED-007  Normal, CUSTOMER_APPROVAL on project 401 with its Customer
+--                  Approval stage provisioned: dave and erin REQUESTED; the first
+--                  to approve schedules the change, a rejection cancels it.
+--   CHG-FIXED-008  CUSTOMER_REVIEW on project 401 with its Customer Review stage
+--                  provisioned: dave and erin REQUESTED; approving closes it,
+--                  rejecting moves it to Rollback.
+-- The customer stages have no assignment group (the Customer Group is the
+-- project's contacts, not a "group" row) and carry an explicit checkpoint_label
+-- (migration 0179), which is how they are recognised.
+DELETE FROM approval_stage_approver WHERE work_item_id IN (
+  '00000000-0000-0000-0000-000000001001', '00000000-0000-0000-0000-000000001002',
+  '00000000-0000-0000-0000-000000001003', '00000000-0000-0000-0000-000000001004',
+  '00000000-0000-0000-0000-000000001201', '00000000-0000-0000-0000-000000001202',
+  '00000000-0000-0000-0000-000000001303', '00000000-0000-0000-0000-000000001304');
+DELETE FROM approval_stage WHERE work_item_id IN (
+  '00000000-0000-0000-0000-000000001001', '00000000-0000-0000-0000-000000001002',
+  '00000000-0000-0000-0000-000000001003', '00000000-0000-0000-0000-000000001004',
+  '00000000-0000-0000-0000-000000001201', '00000000-0000-0000-0000-000000001202',
+  '00000000-0000-0000-0000-000000001303', '00000000-0000-0000-0000-000000001304');
+
+INSERT INTO work_item (id, created_on, updated_on, created_by, updated_by, number, subject, type, account_id, project_id, assignment_group_id, opened_by_user_id, assigned_to_id, description) VALUES
+  ('00000000-0000-0000-0000-000000001001', now(), now(), 'seed', 'seed', 'CHG-FIXED-001', 'E2E fixture: New change request with no assigned team', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', NULL, '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture for Playwright E2E coverage: New state, no assignment_group_id -- Move to Assess must be blocked until a team is assigned.'),
+  ('00000000-0000-0000-0000-000000001002', now(), now(), 'seed', 'seed', 'CHG-FIXED-002', 'E2E fixture: New change request with an assigned team', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture for Playwright E2E coverage: New state, assignment_group_id set to the seeded Example Corp ABT group -- Move to Assess must succeed and auto-provision that team''s active internal members (alice, bob, carol) as peer approvers; john.smith, a customer in the group, is skipped.'),
+  ('00000000-0000-0000-0000-000000001003', now(), now(), 'seed', 'seed', 'CHG-FIXED-003', 'E2E fixture: change request in Assess with three pending approvers', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture for Playwright E2E coverage: Assess state with three requested peer approvers (alice, bob, carol) on one stage -- approving one must cascade to Authorize and cancel the others.'),
+  ('00000000-0000-0000-0000-000000001004', now(), now(), 'seed', 'seed', 'CHG-FIXED-004', 'E2E fixture: change request in Authorize with a resolved approval', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture for Playwright E2E coverage: Authorize state with a resolved peer approval (alice approved, bob and carol cancelled) -- a terminal approval decision already applied.'),
+  ('00000000-0000-0000-0000-000000001201', now(), now(), 'seed', 'seed', 'CHG-FIXED-005', 'E2E fixture: Standard change requiring customer approval', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture for Playwright E2E coverage: Standard change in New with the Customer Approval checkbox ticked -- Request Approval must land in Customer Approval, where the project''s contacts (dave, erin) are asked.'),
+  ('00000000-0000-0000-0000-000000001202', now(), now(), 'seed', 'seed', 'CHG-FIXED-006', 'E2E fixture: change in Review requiring customer review', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture for Playwright E2E coverage: Review state with the Customer Review checkbox ticked -- Review must offer customer_review instead of closed.'),
+  ('00000000-0000-0000-0000-000000001303', now(), now(), 'seed', 'seed', 'CHG-FIXED-007', 'E2E fixture: change in Customer Approval with a pending customer group approval', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture: Customer Approval state on project 401, Customer Approval stage with two requested approvers (the project''s registered contacts dave.mendis, erin.jayawardena).'),
+  ('00000000-0000-0000-0000-000000001304', now(), now(), 'seed', 'seed', 'CHG-FIXED-008', 'E2E fixture: change in Customer Review with a pending customer group review', 'CHANGE_REQUEST', '00000000-0000-0000-0000-000000000301', '00000000-0000-0000-0000-000000000401', '00000000-0000-0000-0000-000000000901', '00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001', 'Seed fixture: Customer Review state on project 401, Customer Review stage with two requested approvers (the project''s registered contacts dave.mendis, erin.jayawardena).')
+ON CONFLICT (id) DO UPDATE SET
+  number = EXCLUDED.number, subject = EXCLUDED.subject, description = EXCLUDED.description,
+  account_id = EXCLUDED.account_id, project_id = EXCLUDED.project_id,
+  assignment_group_id = EXCLUDED.assignment_group_id,
+  opened_by_user_id = EXCLUDED.opened_by_user_id, assigned_to_id = EXCLUDED.assigned_to_id,
+  updated_on = now();
+
+INSERT INTO change_request (id, state, change_model, priority, impact, category, risk, change_request_type, requested_by_user_id, justification, customer_approval_required, customer_review_required) VALUES
+  ('00000000-0000-0000-0000-000000001001', 'NEW'::change_request_state_enum, NULL, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, '00000000-0000-0000-0000-000000000002', 'Seed fixture: no team assigned, used to cover the compulsory-team gate before Assess.', false, false),
+  ('00000000-0000-0000-0000-000000001002', 'NEW'::change_request_state_enum, NULL, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, NULL, 'Seed fixture: team assigned, used to cover Assess-entry approver auto-provisioning.', false, false),
+  ('00000000-0000-0000-0000-000000001003', 'ASSESS'::change_request_state_enum, NULL, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, NULL, 'Seed fixture: Assess state, approval already provisioned, used to cover the approve/cancel-sibling cascade.', false, false),
+  ('00000000-0000-0000-0000-000000001004', 'AUTHORIZE'::change_request_state_enum, NULL, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, NULL, 'Seed fixture: Authorize state, approval already decided, used to cover a terminal-approval-state display.', false, false),
+  ('00000000-0000-0000-0000-000000001201', 'NEW'::change_request_state_enum, 'STANDARD'::change_request_change_model_enum, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, NULL, 'Seed fixture: Standard change, Customer Approval ticked.', true, false),
+  ('00000000-0000-0000-0000-000000001202', 'REVIEW'::change_request_state_enum, 'NORMAL'::change_request_change_model_enum, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, NULL, 'Seed fixture: Review state, Customer Review ticked.', false, true),
+  ('00000000-0000-0000-0000-000000001303', 'CUSTOMER_APPROVAL'::change_request_state_enum, 'NORMAL'::change_request_change_model_enum, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, NULL, 'Seed fixture: Customer Approval with the project''s customer contacts.', true, false),
+  ('00000000-0000-0000-0000-000000001304', 'CUSTOMER_REVIEW'::change_request_state_enum, 'NORMAL'::change_request_change_model_enum, 'MODERATE'::change_request_priority_enum, 'LOW'::change_request_impact_enum, 'SOFTWARE'::change_request_category_enum, 'LOW'::change_request_risk_enum, 'GENERAL'::change_request_type_enum, NULL, 'Seed fixture: Customer Review with the project''s customer contacts.', false, true)
+ON CONFLICT (id) DO UPDATE SET
+  state = EXCLUDED.state, change_model = EXCLUDED.change_model, priority = EXCLUDED.priority,
+  impact = EXCLUDED.impact, category = EXCLUDED.category, risk = EXCLUDED.risk,
+  change_request_type = EXCLUDED.change_request_type,
+  requested_by_user_id = EXCLUDED.requested_by_user_id, justification = EXCLUDED.justification,
+  customer_approval_required = EXCLUDED.customer_approval_required,
+  customer_review_required = EXCLUDED.customer_review_required,
+  -- whatever a spec or a manual walk-through stamped on the way
+  approval = NULL, is_customer_approval_required = NULL, is_customer_review_required = NULL,
+  start_on = NULL, end_on = NULL, closed_by_user_id = NULL, closed_on = NULL,
+  is_on_hold = NULL, on_hold_reason = NULL, customer_group_id = NULL;
+
+INSERT INTO approval_stage (id, created_on, updated_on, created_by, updated_by, work_item_id, assignment_group_id, raw_status, checkpoint_label) VALUES
+  ('00000000-0000-0000-0000-000000001005', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001003', '00000000-0000-0000-0000-000000000901', 'requested', 'Peer Approval'),
+  ('00000000-0000-0000-0000-000000001008', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001004', '00000000-0000-0000-0000-000000000901', 'approved', 'Peer Approval'),
+  ('00000000-0000-0000-0000-000000001305', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001303', NULL, 'requested', 'Customer Approval'),
+  ('00000000-0000-0000-0000-000000001306', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001304', NULL, 'requested', 'Customer Review');
+
+-- raw_status/status use the approval flow's lowercase vocabulary ("requested",
+-- not "REQUESTED"; migration 0089's own doc comment).
+INSERT INTO approval_stage_approver (id, created_on, updated_on, created_by, updated_by, stage_id, work_item_id, approver_user_id, status) VALUES
+  -- CHG-FIXED-003: alice, bob, carol all REQUESTED
+  ('00000000-0000-0000-0000-000000001006', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001005', '00000000-0000-0000-0000-000000001003', '00000000-0000-0000-0000-000000000011', 'requested'),
+  ('00000000-0000-0000-0000-000000001007', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001005', '00000000-0000-0000-0000-000000001003', '00000000-0000-0000-0000-000000000012', 'requested'),
+  ('00000000-0000-0000-0000-000000001011', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001005', '00000000-0000-0000-0000-000000001003', '00000000-0000-0000-0000-000000000013', 'requested'),
+  -- CHG-FIXED-004: alice approved, bob and carol cancelled
+  ('00000000-0000-0000-0000-000000001009', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001008', '00000000-0000-0000-0000-000000001004', '00000000-0000-0000-0000-000000000011', 'approved'),
+  ('00000000-0000-0000-0000-000000001010', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001008', '00000000-0000-0000-0000-000000001004', '00000000-0000-0000-0000-000000000012', 'cancelled'),
+  ('00000000-0000-0000-0000-000000001012', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001008', '00000000-0000-0000-0000-000000001004', '00000000-0000-0000-0000-000000000013', 'cancelled'),
+  -- CHG-FIXED-007 (Customer Approval) / CHG-FIXED-008 (Customer Review): dave, erin REQUESTED
+  ('00000000-0000-0000-0000-000000001307', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001305', '00000000-0000-0000-0000-000000001303', '00000000-0000-0000-0000-000000000021', 'requested'),
+  ('00000000-0000-0000-0000-000000001308', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001305', '00000000-0000-0000-0000-000000001303', '00000000-0000-0000-0000-000000000022', 'requested'),
+  ('00000000-0000-0000-0000-000000001309', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001306', '00000000-0000-0000-0000-000000001304', '00000000-0000-0000-0000-000000000021', 'requested'),
+  ('00000000-0000-0000-0000-000000001310', now(), now(), 'seed', 'seed', '00000000-0000-0000-0000-000000001306', '00000000-0000-0000-0000-000000001304', '00000000-0000-0000-0000-000000000022', 'requested');
 
 COMMIT;

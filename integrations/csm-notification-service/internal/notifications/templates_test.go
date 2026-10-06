@@ -53,7 +53,7 @@ func TestSanitizeRichText_StructureAndFormatting(t *testing.T) {
 		{
 			name:  "heading followed by a paragraph stays separated",
 			input: "<h2>Summary</h2><p>Details</p>",
-			want:  "Summary<br>Details",
+			want:  `<h2 style="margin:12px 0 4px;font-size:22px;font-weight:600;line-height:1.3;">Summary</h2>Details`,
 		},
 		{
 			name:  "plain text with no markup passes through unchanged",
@@ -77,8 +77,8 @@ func TestSanitizeRichText_StructureAndFormatting(t *testing.T) {
 		},
 		{
 			name:  "an unrecognized tag is dropped, its text kept",
-			input: `<table><tr><td>cell text</td></tr></table>`,
-			want:  "cell text",
+			input: `<section><font color="red">some text</font></section>`,
+			want:  "some text",
 		},
 		{
 			name:  "a literal < a user actually typed is escaped, not stripped",
@@ -677,5 +677,247 @@ func TestRenderProjectContactRegisteredEmail(t *testing.T) {
 	}
 	if strings.Contains(got, "<!-- [") || strings.Count(got, "<!DOCTYPE") != 1 {
 		t.Error("welcome email has an unsubstituted placeholder or is not one document")
+	}
+}
+
+// TestSanitizeRichText_Tables is a regression test for a real reported bug:
+// an announcement's product/version table arrived in the recipient's inbox as
+// one value per line — no rows, no columns — because table/tr/th/td weren't
+// on the allow-list and every cell's <p> closed as a bare "<br>". The source
+// here is the editor's own output shape (Lexical): <colgroup><col>, inline
+// styles on every cell, and a <p> inside each cell.
+func TestSanitizeRichText_Tables(t *testing.T) {
+	const th = emailTHOpen
+	const td = emailTDOpen
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name: "editor table keeps rows and columns, cell paragraphs add no blank lines",
+			input: `<table><colgroup><col><col></colgroup><tbody>` +
+				`<tr><th style="border: 1px solid black;"><p><b><strong class="x">Product</strong></b></p></th><th><p><b>Level</b></p></th></tr>` +
+				`<tr><td style="border: 1px solid black;"><p style="text-align: left;">WSO2 API Manager</p></td><td><p>13</p></td></tr>` +
+				`</tbody></table><p>after</p>`,
+			want: emailTableOpen +
+				"<tr>" + th + "<b><strong>Product</strong></b></th>" + th + "<b>Level</b></th></tr>" +
+				"<tr>" + td + "WSO2 API Manager</td>" + td + "13</td></tr>" +
+				"</table>after",
+		},
+		{
+			name:  "a void <col> never strands the stack, so </table> still closes the table",
+			input: `<table><colgroup><col><col></colgroup><tr><td>a</td></tr></table>tail`,
+			want:  emailTableOpen + "<tr>" + td + "a</td></tr></table>tail",
+		},
+		{
+			name:  "pretty-printed source with whitespace between cells",
+			input: "<table>\n <thead>\n  <tr>\n   <th>Version</th>\n  </tr>\n </thead>\n <tbody>\n  <tr>\n   <td>4.2.0</td>\n  </tr>\n </tbody>\n</table>",
+			want:  emailTableOpen + "\n \n  <tr>\n   " + th + "Version</th>\n  </tr>\n \n \n  <tr>\n   " + td + "4.2.0</td>\n  </tr>\n \n</table>",
+		},
+		{
+			name:  "a cell's own multi-paragraph content keeps its inner break but loses the edges",
+			input: `<table><tr><td><p>one</p><p>two</p></td></tr></table>`,
+			want:  emailTableOpen + "<tr>" + td + "one<br>two</td></tr></table>",
+		},
+		{
+			name:  "an empty cell stays an empty cell",
+			input: `<table><tr><td><p><br></p></td><td>x</td></tr></table>`,
+			want:  emailTableOpen + "<tr>" + td + "</td>" + td + "x</td></tr></table>",
+		},
+		{
+			name:  "a list inside a cell survives",
+			input: `<table><tr><td><ul><li>a</li></ul></td></tr></table>`,
+			want:  emailTableOpen + "<tr>" + td + "<ul><li>a</li></ul></td></tr></table>",
+		},
+		{
+			name:  "source attributes and styles never reach the output",
+			input: `<table onclick="evil()" style="background:url(x)"><tr><td onmouseover="evil()" style="x:y" colspan="9">c</td></tr></table>`,
+			want:  emailTableOpen + "<tr>" + td + "c</td></tr></table>",
+		},
+		{
+			name:  "an unclosed table is closed at the end so it can't swallow the template footer",
+			input: `<table><tr><td>cell`,
+			want:  emailTableOpen + "<tr>" + td + "cell</td></tr></table>",
+		},
+		{
+			name:  "an unclosed bold is closed at the end too",
+			input: `<p>start <b>bold forever`,
+			want:  "start <b>bold forever</b>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, images := sanitizeRichText(tt.input, &inlineImageBudget{})
+			if got != tt.want {
+				t.Errorf("sanitizeRichText(%q)\n got: %q\nwant: %q", tt.input, got, tt.want)
+			}
+			if len(images) != 0 {
+				t.Errorf("returned %d images, want 0", len(images))
+			}
+		})
+	}
+}
+
+// TestSanitizeRichText_VoidElementsDontBreakLaterCloseTags covers the stack
+// bug the table fix exposed: a void element (<hr>) used to be pushed and
+// never popped, so the </li> after it was silently dropped.
+func TestSanitizeRichText_VoidElementsDontBreakLaterCloseTags(t *testing.T) {
+	got, _ := sanitizeRichText(`<ul><li>a<hr>b</li></ul>`, &inlineImageBudget{})
+	want := "<ul><li>ab</li></ul>"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestRenderCaseCreatedEmail_AnnouncementTableRendersAsTable is the end-to-end
+// shape of the reported bug: the real announcement description (product /
+// version / U2 level matrix) must come out of the case-created email as a
+// <table> with a row per product, not as loose lines — and the table must be
+// closed before the template's own footer links, even when the source's
+// markup left it open.
+func TestRenderCaseCreatedEmail_AnnouncementTableRendersAsTable(t *testing.T) {
+	const rows = `<colgroup><col><col><col></colgroup><tbody>` +
+		`<tr><th><p><b>Product Name</b></p></th><th><p><b>Product Version</b></p></th><th><p><b>U2 Update Level</b></p></th></tr>` +
+		`<tr><td><p>WSO2 API Manager</p></td><td><p>4.6.0</p></td><td><p>12</p></td></tr>` +
+		`<tr><td><p>WSO2 Traffic Manager</p></td><td><p>4.5.0</p></td><td><p>47</p></td></tr>`
+
+	tests := []struct {
+		name string
+		desc string
+	}{
+		{"well-formed table", `<p>Solution</p><table>` + rows + `</tbody></table><p>Best regards</p>`},
+		// No </tbody> or </table>: the sanitizer must close them itself, or the
+		// footer below would end up inside the table.
+		{"unclosed table", `<p>Solution</p><table>` + rows},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, _ := RenderCaseCreatedEmail(CaseCreatedEmailData{
+				ReporterName: "Jane Doe",
+				ProjectName:  "PROJ",
+				CaseNumber:   "CS0001",
+				CaseTitle:    "Announcement",
+				CaseType:     "Announcement",
+				Description:  tt.desc,
+				CaseLink:     "https://x/case",
+				CommentLink:  "https://x/comment",
+			})
+			if got := strings.Count(out, "<tr>"); got < 3 {
+				t.Errorf("rendered email has %d <tr> rows from the announcement table, want at least 3", got)
+			}
+			for _, cell := range []string{">WSO2 API Manager</td>", ">4.6.0</td>", ">12</td>", ">WSO2 Traffic Manager</td>"} {
+				if !strings.Contains(out, cell) {
+					t.Errorf("rendered email is missing table cell %q", cell)
+				}
+			}
+
+			// The template has its own tables (the case details block, the
+			// layout wrappers), so a bare Index(out, "</table>") would land on
+			// one of those, not on the description's. Anchor on the table this
+			// sanitizer emitted, then require its own close — and require that
+			// close to come before the footer, which is the point of the check.
+			start := strings.Index(out, emailTableOpen)
+			footer := strings.Index(out, "Add Comment")
+			if start < 0 || footer < 0 {
+				t.Fatalf("rendered email is missing the description table (at %d) or the footer (at %d)", start, footer)
+			}
+			closeRel := strings.Index(out[start:], "</table>")
+			if closeRel < 0 {
+				t.Fatal("the description table is never closed")
+			}
+			if start+closeRel > footer {
+				t.Error("the table swallowed the email footer: Add Comment appears before the table's close")
+			}
+		})
+	}
+}
+
+// TestSanitizeRichText_EditorFormats pins every inline/block format the
+// announcement editor's toolbar can produce, using the HTML Lexical itself
+// exports for each (captured from the real editor, including its wrapper
+// spans/classes/white-space styles). Before this, strikethrough, inline and
+// block code, quotes, headings and alignment all collapsed to plain text, so
+// a customer received something different from what the author composed.
+func TestSanitizeRichText_EditorFormats(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "strikethrough",
+			input: `<p><s><span class="editor-text-strikethrough" style="white-space: pre-wrap;">old</span></s></p>`,
+			want:  "<s>old</s>",
+		},
+		{
+			name:  "inline code",
+			input: `<p>run <code spellcheck="false" style="white-space: pre-wrap;"><span class="editor-text-code">make migrate</span></code> first</p>`,
+			want:  "run " + emailCodeOpen + "make migrate</code> first",
+		},
+		{
+			name:  "code block keeps its own whitespace and newlines",
+			input: "<pre spellcheck=\"false\"><span style=\"white-space: pre-wrap;\">a := 1\n  b := 2</span></pre><p>after</p>",
+			want:  emailPreOpen + "a := 1\n  b := 2</pre>after",
+		},
+		{
+			name:  "quote",
+			input: `<blockquote><span style="white-space: pre-wrap;">wise words</span></blockquote>`,
+			want:  emailQuoteOpen + "wise words</blockquote>",
+		},
+		{
+			name:  "every heading level keeps its own size",
+			input: `<h1>a</h1><h3>b</h3><h6>c</h6>`,
+			want: `<h1 style="margin:12px 0 4px;font-size:26px;font-weight:600;line-height:1.3;">a</h1>` +
+				`<h3 style="margin:12px 0 4px;font-size:19px;font-weight:600;line-height:1.3;">b</h3>` +
+				`<h6 style="margin:12px 0 4px;font-size:14px;font-weight:600;line-height:1.3;">c</h6>`,
+		},
+		{
+			name:  "centered paragraph",
+			input: `<p style="text-align: center;"><span style="white-space: pre-wrap;">hello</span></p><p>next</p>`,
+			want:  `<div style="text-align:center;">hello<br></div>next`,
+		},
+		{
+			name:  "right-aligned and justified paragraphs",
+			input: `<p style="text-align: right;">r</p><p style="text-align: justify;">j</p>`,
+			want:  `<div style="text-align:right;">r<br></div><div style="text-align:justify;">j<br></div>`,
+		},
+		{
+			name:  "alignment keyword is matched case-insensitively and re-emitted lowercase",
+			input: `<p style="TEXT-ALIGN: CENTER">x</p>`,
+			want:  `<div style="text-align:center;">x<br></div>`,
+		},
+		{
+			name:  "centered heading",
+			input: `<h2 style="text-align: center;">T</h2>`,
+			want:  `<h2 style="margin:12px 0 4px;font-size:22px;font-weight:600;line-height:1.3;text-align:center;">T</h2>`,
+		},
+		{
+			name:  "the default alignments add nothing",
+			input: `<p style="text-align: start;">a</p><p style="text-align: left;">b</p>`,
+			want:  "a<br>b",
+		},
+		{
+			name:  "no other style from the source rides along with the alignment",
+			input: `<p style="text-align:center;background:url(javascript:evil());color:red">x</p>`,
+			want:  `<div style="text-align:center;">x<br></div>`,
+		},
+		{
+			name:  "a value that only contains the keyword is not an alignment",
+			input: `<p style="text-align: center-ish">x</p>`,
+			want:  "x",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, images := sanitizeRichText(tt.input, &inlineImageBudget{})
+			if got != tt.want {
+				t.Errorf("sanitizeRichText(%q)\n got: %q\nwant: %q", tt.input, got, tt.want)
+			}
+			if len(images) != 0 {
+				t.Errorf("returned %d images, want 0", len(images))
+			}
+		})
 	}
 }

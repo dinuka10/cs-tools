@@ -1428,7 +1428,8 @@ func (s *snCaseService) publishCommentAdded(ctx context.Context, req domain.Crea
 		slog.InfoContext(ctx, "sn create comment: case.comment_added not published, could not resolve comment author's display name", "caseId", req.CaseID)
 		return
 	}
-	publishCommentAddedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, cv, req, commentID, author.Name)
+	isSupportEngineerResponse := req.Type == domain.CommentTypeComment && s.isSupportEngineerAuthorSN(ctx, req.CaseID, author.Email)
+	publishCommentAddedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, s.ProjectOnboardingInfo, cv, req, commentID, author.Name, author.Email, isSupportEngineerResponse)
 }
 
 // publishCommentAddedEvent is publishCommentAdded's actual body, factored
@@ -1443,8 +1444,12 @@ func (s *snCaseService) publishCommentAdded(ctx context.Context, req domain.Crea
 // getCaseByID callback: every caller now needs the fetched case before this
 // function even runs (to decide whether there are recipients worth an
 // author lookup for — see publishCommentAdded's own doc comment), so a
-// callback here would only risk double-fetching.
-func publishCommentAddedEvent(ctx context.Context, publisher EventPublisherService, resolveAccountDefaultWatcherEmails func(context.Context, string) ([]string, error), cv domain.CaseView, req domain.CreateCaseCommentRequest, commentID, authorName string) {
+// callback here would only risk double-fetching. isSupportEngineerResponse
+// is likewise resolved by each caller (isSupportEngineerAuthorSN here,
+// caseService.isSupportEngineerAuthor on the Postgres side) rather than
+// looked up here, since "is this author a support engineer" is answered via
+// a different mechanism on each data source.
+func publishCommentAddedEvent(ctx context.Context, publisher EventPublisherService, resolveAccountDefaultWatcherEmails func(context.Context, string) ([]string, error), resolveProjectOnboardingInfo func(context.Context, string) (string, bool, error), cv domain.CaseView, req domain.CreateCaseCommentRequest, commentID, authorName, authorEmail string, isSupportEngineerResponse bool) {
 	if publisher == nil {
 		return
 	}
@@ -1461,17 +1466,38 @@ func publishCommentAddedEvent(ctx context.Context, publisher EventPublisherServi
 		return
 	}
 
+	// Best-effort, same posture as resolveCaseDefaultWatcherEmails just
+	// above: a lookup failure must not block the email reaction this
+	// function primarily exists for -- the Chat alert this enriches is
+	// itself a secondary, best-effort reaction on the consuming side (see
+	// csm-notification-service's own checkFrustration).
+	var onboardingStatus string
+	var isEvaluationAccount bool
+	if resolveProjectOnboardingInfo != nil && cv.ProjectDetails != nil {
+		var err error
+		onboardingStatus, isEvaluationAccount, err = resolveProjectOnboardingInfo(ctx, cv.ProjectDetails.ID)
+		if err != nil {
+			slog.WarnContext(ctx, "create comment: resolve project onboarding info for case.comment_added failed", "caseId", req.CaseID, "error", err)
+		}
+	}
+
 	payload, err := json.Marshal(events.CommentAddedPayload{
-		Name:           authorName,
-		ProjectID:      cv.ProjectDetails.ID,
-		CaseID:         req.CaseID,
-		CaseNumber:     cv.Number,
-		WSO2CaseID:     cv.InternalID,
-		CaseTitle:      cv.Subject,
-		CaseComment:    req.Content,
-		CommentID:      commentID,
-		IsInternalNote: req.Type == domain.CommentTypeWorkNote,
-		Recipients:     recipients,
+		Name:                      authorName,
+		ProjectID:                 cv.ProjectDetails.ID,
+		CaseID:                    req.CaseID,
+		CaseNumber:                cv.Number,
+		WSO2CaseID:                cv.InternalID,
+		CaseTitle:                 cv.Subject,
+		CaseComment:               req.Content,
+		CommentID:                 commentID,
+		IsInternalNote:            req.Type == domain.CommentTypeWorkNote,
+		Recipients:                recipients,
+		AuthorEmail:               authorEmail,
+		Product:                   caseProductName(cv),
+		Team:                      caseTeamName(cv),
+		IsEvaluationAccount:       isEvaluationAccount,
+		ProjectOnboardingStatus:   onboardingStatus,
+		IsSupportEngineerResponse: isSupportEngineerResponse,
 	})
 	if err != nil {
 		slog.ErrorContext(ctx, "create comment: encode case.comment_added payload failed", "caseId", req.CaseID, "error", err)
@@ -1559,28 +1585,38 @@ func (s *snCaseService) applyResponseSLAOnComment(ctx context.Context, req domai
 		slog.InfoContext(ctx, "sn create comment: response SLA not evaluated, could not resolve comment author's email", "caseId", req.CaseID)
 		return
 	}
-
-	usersResp, err := s.userSvc.SearchUsers(ctx, domain.SearchUsersRequest{
-		Pagination: domain.Pagination{Limit: 1},
-		Filters:    domain.SearchUsersFilters{Emails: []string{author.Email}},
-	})
-	if err != nil {
-		slog.ErrorContext(ctx, "sn create comment: response SLA not evaluated, user role lookup failed", "caseId", req.CaseID)
-		return
-	}
-
-	isSupportEngineer := false
-	for _, u := range usersResp.Users {
-		if slices.Contains(u.Roles, s.csEngineerRole) {
-			isSupportEngineer = true
-			break
-		}
-	}
-	if !isSupportEngineer {
+	if !s.isSupportEngineerAuthorSN(ctx, req.CaseID, author.Email) {
 		return
 	}
 
 	s.slaEngine.CompleteResponseClock(ctx, req.CaseID)
+}
+
+// isSupportEngineerAuthorSN resolves whether authorEmail belongs to a user
+// holding s.csEngineerRole, via s.userSvc.SearchUsers — shared by
+// applyResponseSLAOnComment (the CSM-native SLA engine's own response-clock
+// completion, above) and publishCommentAdded's own
+// IsSupportEngineerResponse flag on the published case.comment_added event.
+// s.csEngineerRole being "" (unconfigured), an empty authorEmail, or a
+// failed role lookup all answer false — can't confirm, not an error.
+func (s *snCaseService) isSupportEngineerAuthorSN(ctx context.Context, caseID, authorEmail string) bool {
+	if s.csEngineerRole == "" || authorEmail == "" {
+		return false
+	}
+	usersResp, err := s.userSvc.SearchUsers(ctx, domain.SearchUsersRequest{
+		Pagination: domain.Pagination{Limit: 1},
+		Filters:    domain.SearchUsersFilters{Emails: []string{authorEmail}},
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "sn create comment: support-engineer role lookup failed", "caseId", caseID)
+		return false
+	}
+	for _, u := range usersResp.Users {
+		if slices.Contains(u.Roles, s.csEngineerRole) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyCaseStateSLAEffects best-effort applies the CSM-native SLA engine's
@@ -1987,6 +2023,16 @@ func (s *snCaseService) ProjectContactEmailsByRole(ctx context.Context, projectI
 	return s.pgFallback.ProjectContactEmailsByRole(ctx, projectID, role)
 }
 
+// ProjectOnboardingInfo implements CaseService. account/project are
+// Postgres-only concepts, same reasoning as ProjectContactEmailsByRole just
+// above — delegates to pgFallback when configured, empty/no-error otherwise.
+func (s *snCaseService) ProjectOnboardingInfo(ctx context.Context, projectID string) (string, bool, error) {
+	if s.pgFallback == nil {
+		return "", false, nil
+	}
+	return s.pgFallback.ProjectOnboardingInfo(ctx, projectID)
+}
+
 // AccountDefaultWatcherEmails implements CaseService. account/project are
 // Postgres-only concepts, same reasoning as ProjectContactEmailsByRole just
 // above — delegates to pgFallback when configured, empty/no-error otherwise.
@@ -2328,6 +2374,12 @@ type snCreateCommentResponse struct {
 // override; this is a plain passthrough, kept only so this type still
 // satisfies CaseService.
 func (s *snCaseService) CreateCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, _ string) (domain.CreateCaseCommentResponse, error) {
+	return s.CreateCaseComment(ctx, req)
+}
+
+// CreateInternalCaseComment implements CaseService. ServiceNow applies its own
+// rules to who may write what, so this is the same call as CreateCaseComment.
+func (s *snCaseService) CreateInternalCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
 	return s.CreateCaseComment(ctx, req)
 }
 

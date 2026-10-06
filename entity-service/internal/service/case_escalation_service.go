@@ -119,7 +119,15 @@ func (s *caseEscalationService) CreateCaseEscalation(ctx context.Context, caseID
 	if action != nil {
 		effectiveAction = domain.EscalationAction(strings.ToUpper(string(*action)))
 	}
-	if _, err := s.caseSvc.CreateCaseComment(ctx, domain.CreateCaseCommentRequest{
+	//
+	// This is an internal write: a WORK_NOTE is an internal record (migration
+	// 0191 refuses an external caller both reading and writing one), and a
+	// customer can escalate their own case. CreateInternalCaseComment writes the
+	// row as the system identity. The escalation above already ran under the
+	// caller's identity, so caseID is a case they are allowed to act on, and
+	// nothing from this call is returned to the caller, who gets the escalation
+	// only.
+	if _, err := s.caseSvc.CreateInternalCaseComment(ctx, domain.CreateCaseCommentRequest{
 		CaseID:  caseID,
 		Type:    domain.CommentTypeWorkNote,
 		Content: caseEscalationWorkNoteContent(effectiveAction, resp.Escalation),

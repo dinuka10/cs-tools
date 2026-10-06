@@ -64,13 +64,18 @@ func main() {
 	// request path.
 	dir := loadDirectory()
 
-	// Role-key -> Asgardeo role id mapping (ASGARDEO_ROLE_IDS), e.g.
-	// "timecard_approver|0bbeea4f-5ada-49ba-8f19-90ae6a116daa" -- used by
-	// handlers that need a role's real Asgardeo membership via the SCIM
-	// operations service's get-by-id endpoint (see GET /users/time-card-approvers
-	// below). Optional and empty by default: an unconfigured key just means
-	// that role's SCIM-backed feature is not wired up in this deployment.
-	asgardeoRoleIDs, err := directory.ParseAsgardeoRoleIDs(os.Getenv("ASGARDEO_ROLE_IDS"))
+	// Real role name -> identity-provider role id mapping (ASGARDEO_ROLE_IDS),
+	// a JSON object string, e.g.
+	// {"example-timecard-approver-role":"11111111-1111-1111-1111-111111111111"}.
+	// Keyed by the real role name (the same strings AUTH_<ROLE>_ROLES already
+	// lists), not an invented portal-role key -- see directory.ParseRoleIDs's
+	// own doc comment for why. Used by handlers that need a role's real
+	// membership via the SCIM operations service (GET
+	// /users/time-card-approvers, POST /users' own grant, GET
+	// /roles/grantable below). Optional and empty by default: a real role
+	// name with no entry here just means that role has no SCIM-backed
+	// feature wired up in this deployment.
+	roleIDsByName, err := directory.ParseRoleIDs(os.Getenv("ASGARDEO_ROLE_IDS"))
 	if err != nil {
 		slog.Error("invalid ASGARDEO_ROLE_IDS", "err", err)
 		os.Exit(1)
@@ -125,6 +130,8 @@ func main() {
 	announcementRegistryHandler := handler.NewAnnouncementRegistryHandler(customerEntityClient)
 	productHandler := handler.NewProductHandler(customerEntityClient)
 	deploymentHandler := handler.NewDeploymentHandler(customerEntityClient)
+	kbArticleHandler := handler.NewKBArticleHandler(customerEntityClient)
+	kbAdminHandler := handler.NewKBAdminHandler(customerEntityClient)
 	changeRequestHandler := handler.NewChangeRequestHandler(customerEntityClient)
 	itServiceHandler := handler.NewITServiceHandler(customerEntityClient)
 	serviceOfferingHandler := handler.NewServiceOfferingHandler(customerEntityClient)
@@ -173,8 +180,18 @@ func main() {
 	// One guard authorises every route below (including /spl/*) and also
 	// backs the permissions GET /users/me reports, so the two cannot drift
 	// apart. Built before the SPL block below since its SPL handlers need
-	// it too.
-	accessGuard := handler.NewAccessGuard(loadAccessConfig())
+	// it too. accessCfg is also kept (not just the guard built from it) since
+	// grantableRoles below needs the same AUTH_<ROLE>_ROLES lists directly.
+	accessCfg := loadAccessConfig()
+	accessGuard := handler.NewAccessGuard(accessCfg)
+
+	// Which portal roles CreateUser may grant via SCIM when an admin adds a
+	// new user through the webapp, each already resolved to its real role ID
+	// -- see handler.ResolveGrantableRoles's own doc comment. Empty when
+	// ASGARDEO_ROLE_IDS configures none of AUTH_<ROLE>_ROLES' real role
+	// names, in which case GET /roles/grantable reports none and CreateUser
+	// rejects any grantRoles value as unknown.
+	grantableRoles := handler.ResolveGrantableRoles(accessCfg, roleIDsByName)
 
 	// SupportPortalLite — off by default; see loadViewerConfig. Ported
 	// from digiops-cs/apps/support-portal-lite's Ballerina backend, which is
@@ -309,12 +326,20 @@ func main() {
 	}
 	healthHandler := handler.NewHealthHandler(scimClient, updatesClient, notificationPinger, integrationPinger, engineeringPinger)
 
-	// timecardApproverRoleID is optional: empty means ASGARDEO_ROLE_IDS has no
-	// "timecard_approver" entry, in which case GetTimeCardApprovers itself
-	// returns 404 rather than the route going unregistered -- see its own
-	// route registration below for why.
-	timecardApproverRoleID := asgardeoRoleIDs["timecard_approver"]
-	usersHandler := handler.NewUsersHandler(scimClient, customerEntityClient, dir, sftpgoAttachmentStorageEnabled, timecardApproverRoleID).WithAccessGuard(accessGuard)
+	// timecardApproverRoleIDs is optional: empty means none of
+	// AUTH_TIMECARD_APPROVER_ROLES' real role names has a configured ID, in
+	// which case GetTimeCardApprovers itself returns 404 rather than the
+	// route going unregistered -- see its own route registration below for
+	// why. More than one ID is possible: AUTH_TIMECARD_APPROVER_ROLES can name
+	// several real role names, each with its own configured ID, and an
+	// approver holding any one of them must be listed. Derived from
+	// grantableRoles (the same resolution CreateUser's own grant uses) rather
+	// than a second, parallel lookup.
+	timecardApproverRoleIDs := handler.RoleIDsForKey(grantableRoles, "timecard_approver")
+	usersHandler := handler.NewUsersHandler(scimClient, customerEntityClient, dir, sftpgoAttachmentStorageEnabled, timecardApproverRoleIDs).
+		WithAccessGuard(accessGuard).
+		WithGrantableRoles(grantableRoles)
+	grantableRolesHandler := handler.NewGrantableRolesHandler(grantableRoles)
 	dashboardHandler := handler.NewDashboardHandler(accessGuard)
 	caseHandler = caseHandler.WithAccessGuard(accessGuard)
 	timeCardHandler = timeCardHandler.WithAccessGuard(accessGuard)
@@ -416,15 +441,22 @@ func main() {
 	route("DELETE /users/me/saved-filter-views", handler.PermAuthenticated, usersHandler.DeleteSavedFilterView)
 	route("POST /users/me/saved-filter-views/reorder", handler.PermAuthenticated, usersHandler.ReorderSavedFilterView)
 	route("POST /users/search", handler.PermView, usersHandler.SearchUsers)
+	// Batch id-to-name lookup for the KB article lists (author and
+	// reviewer columns). Not /users/search with an id filter: that filter
+	// is ServiceNow-only and 400s against Postgres.
+	route("POST /users/by-ids", handler.PermView, usersHandler.GetUsersByIDs)
 	route("GET /users/{id}", handler.PermView, usersHandler.GetUser)
 	route("POST /users", handler.PermAdmin, usersHandler.CreateUser)
-	// Registered unconditionally, even when timecardApproverRoleID is empty:
+	// Registered unconditionally, even when timecardApproverRoleIDs is empty:
 	// GetTimeCardApprovers itself returns 404 when disabled. Registering it
 	// only when configured would instead let the request fall through to the
 	// wildcard GET /users/{id} above, which rejects the literal path segment
 	// "time-card-approvers" as an invalid UUID with 400, not a clean 404.
 	route("GET /users/time-card-approvers", handler.PermView, usersHandler.GetTimeCardApprovers)
 	route("POST /roles/search", handler.PermView, referenceHandler.SearchRoles)
+	// Admin-only: the portal roles an admin may grant a new user via POST
+	// /users' own grantRoles field -- the Add User dialog's only caller.
+	route("GET /roles/grantable", handler.PermAdmin, grantableRolesHandler.GetGrantableRoles)
 	route("POST /teams/search", handler.PermView, referenceHandler.SearchTeams)
 	route("GET /teams/{id}/members", handler.PermViewSharedEntity, teamHandler.GetTeamMembers)
 	route("GET /accounts/{id}", handler.PermViewSharedEntity, accountHandler.GetAccount)
@@ -468,6 +500,24 @@ func main() {
 	route("GET /products/github-repo", handler.PermView, productHandler.GetProductRepoMapping)
 	route("POST /products/{id}/versions/search", handler.PermView, productHandler.SearchProductVersions)
 	route("POST /deployments", handler.PermWrite, deploymentHandler.PostDeployment)
+	route("POST /kb-articles", handler.PermWrite, kbArticleHandler.CreateKBArticle)
+	route("GET /kb-articles/{id}", handler.PermView, kbArticleHandler.GetKBArticle)
+	route("POST /kb-articles/search", handler.PermView, kbArticleHandler.SearchKBArticles)
+	route("PATCH /kb-articles/{id}/state", handler.PermWrite, kbArticleHandler.PatchKBArticleState)
+	route("PATCH /kb-articles/{id}", handler.PermWrite, kbArticleHandler.PatchKBArticleContent)
+	route("GET /knowledge-bases", handler.PermView, kbArticleHandler.ListKnowledgeBases)
+	route("POST /knowledge-bases", handler.PermAdmin, kbAdminHandler.CreateKnowledgeBase)
+	route("PATCH /knowledge-bases/{id}", handler.PermAdmin, kbAdminHandler.UpdateKnowledgeBaseName)
+	route("PATCH /knowledge-bases/{id}/active", handler.PermAdmin, kbAdminHandler.SetKnowledgeBaseActive)
+	route("POST /kb-manager-users/search", handler.PermAdmin, kbAdminHandler.SearchKBManagerUsers)
+	route("POST /kb-manager-users", handler.PermAdmin, kbAdminHandler.CreateKBManagerUser)
+	route("DELETE /kb-manager-users", handler.PermAdmin, kbAdminHandler.DeleteKBManagerUser)
+	route("POST /kb-manager-groups/search", handler.PermAdmin, kbAdminHandler.SearchKBManagerGroups)
+	route("POST /kb-manager-groups", handler.PermAdmin, kbAdminHandler.CreateKBManagerGroup)
+	route("DELETE /kb-manager-groups", handler.PermAdmin, kbAdminHandler.DeleteKBManagerGroup)
+	route("GET /kb-managers/my-knowledge-bases", handler.PermView, kbArticleHandler.ListMyManagedKnowledgeBases)
+	route("DELETE /kb-articles/{id}", handler.PermWrite, kbArticleHandler.DeleteKBArticle)
+	route("GET /kb-articles/{id}/history", handler.PermView, kbArticleHandler.ListKBArticleHistory)
 	route("POST /deployments/search", handler.PermView, deploymentHandler.SearchDeployments)
 	route("PATCH /deployments/{id}", handler.PermWrite, deploymentHandler.PatchDeployment)
 	route("POST /deployments/{id}/products", handler.PermWrite, deploymentHandler.PostDeployedProduct)
@@ -481,9 +531,14 @@ func main() {
 	route("PATCH /change-requests/{id}", handler.PermWrite, changeRequestHandler.PatchChangeRequest)
 	route("POST /change-requests/search", handler.PermViewOperations, changeRequestHandler.SearchChangeRequests)
 	route("POST /change-requests/aggregate", handler.PermViewOperations, changeRequestHandler.AggregateChangeRequests)
+	route("POST /change-requests/link-options", handler.PermViewOperations, changeRequestHandler.GetChangeRequestLinkOptions)
 	route("POST /services/search", handler.PermView, itServiceHandler.SearchITServices)
 	route("POST /service-offerings/search", handler.PermView, serviceOfferingHandler.SearchServiceOfferings)
 	route("POST /groups/search", handler.PermView, groupHandler.SearchGroups)
+	// One group and its members -- what opens from a change request approval
+	// stage's assignment group. A "group" id (from the approvals response), not a
+	// team id; internal staff only (entity-service refuses anyone else).
+	route("GET /groups/{id}", handler.PermView, groupHandler.GetGroup)
 
 	// Team Schedule. Reads only for now, so everything sits under view: any
 	// role that can see the portal can see who is on the rota. Editing the
@@ -546,6 +601,7 @@ func main() {
 	route("POST /problems/search", handler.PermViewOperations, problemHandler.SearchProblems)
 	route("POST /problems/aggregate", handler.PermViewOperations, problemHandler.AggregateProblems)
 	route("GET /incident-tasks/{id}", handler.PermViewOperations, incidentTaskHandler.GetIncidentTask)
+	route("PATCH /incident-tasks/{id}", handler.PermWrite, incidentTaskHandler.PatchIncidentTask)
 	route("POST /incident-tasks/search", handler.PermViewOperations, incidentTaskHandler.SearchIncidentTasks)
 	route("POST /incident-tasks/aggregate", handler.PermViewOperations, incidentTaskHandler.AggregateIncidentTasks)
 	route("POST /outages", handler.PermWrite, outageHandler.CreateOutage)

@@ -22,6 +22,11 @@ import type { ReactElement } from "react";
 import { MemoryRouter } from "react-router";
 import CsmCaseCommentBubble from "@features/csm-cases/components/CsmCaseCommentBubble";
 import type { CsmCaseComment } from "@features/csm-cases/types/csmCases";
+import { useResolvedInlineImageHtml } from "@features/csm-cases/api/useResolvedInlineImageHtml";
+import {
+  extractIixAttachmentIds,
+  replaceInlineImageSrcs,
+} from "@features/csm-cases/utils/inlineImages";
 
 vi.mock("@features/csm-cases/api/useResolvedInlineImageHtml", () => ({
   // Pass the sanitized HTML straight through — no attachment resolution in
@@ -108,6 +113,33 @@ describe("CsmCaseCommentBubble", () => {
     renderWithProviders(<CsmCaseCommentBubble comment={makeComment({})} />);
     expect(screen.getByText("Hello there")).toBeInTheDocument();
     expect(screen.getByText("Jane Doe")).toBeInTheDocument();
+  });
+
+  it("resolves a bare-uuid inline image inside a [code] wrapper (migrated content)", () => {
+    const uuid = "0f15cbcc-c36b-8310-af2f-404599013196";
+    const dataUrl = "data:image/png;base64,AAAA";
+    // Use the real extract/replace helpers behind the mocked hook, so the
+    // sanitized HTML the bubble hands over is what actually gets resolved.
+    vi.mocked(useResolvedInlineImageHtml).mockImplementationOnce((html) => {
+      const ids = extractIixAttachmentIds(html);
+      return {
+        resolvedHtml: replaceInlineImageSrcs(
+          html,
+          new Map(ids.map((id) => [id, dataUrl])),
+        ),
+        isLoading: false,
+      };
+    });
+    const { container } = renderWithProviders(
+      <CsmCaseCommentBubble
+        comment={makeComment({
+          bodyHtml: `[code]<p><img src="/${uuid}"><br></p>[/code]`,
+        })}
+      />,
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img?.getAttribute("src")).toBe(dataUrl);
   });
 
   it("returns null for a comment with no displayable content", () => {

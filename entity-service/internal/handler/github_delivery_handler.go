@@ -50,7 +50,7 @@ const maxGithubDeliveryBody = int64(3 << 20)
 // credential is what stands in for the signature across that hop.
 type GithubDeliveryHandler struct {
 	svc service.GithubSyncService
-	// internalClientIDs is config.Config.AuthInternalClientIDs.
+	// internalClientIDs is config.Config.M2MClientIDs.
 	internalClientIDs map[string]bool
 }
 

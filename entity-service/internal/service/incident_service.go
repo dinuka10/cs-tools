@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -36,6 +37,71 @@ func incidentStateToEnum(s domain.IncidentState) string {
 		return "CANCELED"
 	}
 	return string(s)
+}
+
+// incidentResolutionCodeToEnum maps domain.IncidentResolutionCode to
+// incident_resolution_code_enum's real labels (migration 0058). Two differ:
+// the enum spells "Solved (Work Around)" 'SOLVED_WORK_AROUND' and "Not
+// Actionable Alert" 'NOT_ACTIONABLE_ALERT'. Any other value (the domain type
+// is a plain string, unchecked at decode) returns ok=false.
+func incidentResolutionCodeToEnum(c domain.IncidentResolutionCode) (string, bool) {
+	switch c {
+	case domain.IncidentResolutionCodeSolvedWorkaround:
+		return "SOLVED_WORK_AROUND", true
+	case domain.IncidentResolutionCodeNotActionable:
+		return "NOT_ACTIONABLE_ALERT", true
+	case domain.IncidentResolutionCodeSolvedPermanently, domain.IncidentResolutionCodeNotSolvedNotReproducible,
+		domain.IncidentResolutionCodeFalseAlarm, domain.IncidentResolutionCodeDuplicate:
+		return string(c), true
+	default:
+		return "", false
+	}
+}
+
+// incidentLifecycleUpdateFromRequest validates and maps the state-transition
+// fields of an UPDATE (state, assignedEngineerId, resolutionCode,
+// resolutionNotes, resolvedById) to their Postgres form. ok reports whether
+// any of them was set. No field is required by any state here -- In Progress
+// in particular needs no assignee or assignment group, matching ServiceNow;
+// the Resolved/Closed resolution requirement is checked by the repository,
+// which can see what is already on the record.
+func incidentLifecycleUpdateFromRequest(req domain.UpdateIncidentRequest) (u repository.IncidentLifecycleUpdate, ok bool, err error) {
+	if req.State != nil {
+		if !validIncidentState[*req.State] {
+			return u, false, &apierror.ValidationError{Msg: "invalid state: " + string(*req.State)}
+		}
+		v := incidentStateToEnum(*req.State)
+		u.State = &v
+		ok = true
+	}
+	if req.ResolutionCode != nil {
+		v, valid := incidentResolutionCodeToEnum(*req.ResolutionCode)
+		if !valid {
+			return u, false, &apierror.ValidationError{Msg: "invalid resolutionCode: " + string(*req.ResolutionCode)}
+		}
+		u.ResolutionCode = &v
+		ok = true
+	}
+	for field, val := range map[string]*string{"assignedEngineerId": req.AssignedEngineerID, "resolvedById": req.ResolvedByID} {
+		if val != nil {
+			if err := validateUUIDs(field, []string{*val}); err != nil {
+				return u, false, err
+			}
+		}
+	}
+	if req.AssignedEngineerID != nil {
+		u.AssignedEngineerID = req.AssignedEngineerID
+		ok = true
+	}
+	if req.ResolvedByID != nil {
+		u.ResolvedByID = req.ResolvedByID
+		ok = true
+	}
+	if req.ResolutionNotes != nil {
+		u.ResolutionNotes = req.ResolutionNotes
+		ok = true
+	}
+	return u, ok, nil
 }
 
 // incidentPriorityToEnum maps domain.IncidentPriority to
@@ -207,20 +273,36 @@ type incidentService struct {
 	// own doc comment. Set only via NewIncidentServiceWithSNMirror. Backs
 	// UpdateIncident's best-effort async ServiceNow mirror write.
 	snWriteback *SNWritebackDispatcher
-	// eventPublisher is nil in every mode except
-	// DATA_SOURCE=postgres-servicenow-dual-write. createIncidentSNFirst
-	// publishes incident.created itself, after CreateIncidentFromServiceNow
+	// eventPublisher publishes incident.created after a create has committed
+	// to Postgres: createIncidentPortal (plain Postgres) and
+	// createIncidentSNFirst (dual-write) both do. createIncidentSNFirst
+	// publishes it itself, after CreateIncidentFromServiceNow
 	// succeeds -- the mirror IncidentService above is always constructed
 	// with its own publisher=nil in this mode, specifically so it never
 	// publishes prematurely (before the Postgres insert this mode's reads
 	// actually depend on has even been attempted). See
 	// publishIncidentCreatedEvent's doc comment for the full reasoning.
 	eventPublisher EventPublisherService
+	// updatable is set by the constructors whose instance may write an incident update
+	// (NewIncidentServiceWithPublisher, NewIncidentServiceWithSNMirror). NewIncidentService stays
+	// read-only for updates whatever it is given.
+	updatable bool
 }
 
 // NewIncidentService constructs an IncidentService backed by Postgres.
-func NewIncidentService(repo repository.IncidentRepository) IncidentService {
-	return &incidentService{repo: repo}
+func NewIncidentService(repo repository.IncidentRepository, eventPublisher EventPublisherService) IncidentService {
+	return &incidentService{repo: repo, eventPublisher: eventPublisher}
+}
+
+// NewIncidentServiceWithPublisher is NewIncidentService for DATA_SOURCE=postgres when the platform
+// creates incidents itself, with no ServiceNow behind it: CreateIncident publishes incident.created once
+// the Postgres insert commits (the event the call-escalation ladders start from) and keeps the create's
+// notes as comments, and UpdateIncident writes the engineer's claim (state, assignee, resolution) and
+// work notes and comments. A create is attributed to the forwarded user, else the calling client's id
+// (actorOf); userRepo resolves a forwarded end-user token for UpdateIncident, whose notes from a
+// service caller with none are incidentSystemActorEmail.
+func NewIncidentServiceWithPublisher(repo repository.IncidentRepository, userRepo repository.UserRepository, eventPublisher EventPublisherService) IncidentService {
+	return &incidentService{repo: repo, userRepo: userRepo, eventPublisher: eventPublisher, updatable: true}
 }
 
 // NewIncidentServiceWithSNMirror is NewIncidentService plus the wiring
@@ -244,7 +326,7 @@ func NewIncidentService(repo repository.IncidentRepository) IncidentService {
 // a fixed background worker pool plus one sn_writeback_failures repository,
 // nothing incident-specific about it.
 func NewIncidentServiceWithSNMirror(repo repository.IncidentRepository, userRepo repository.UserRepository, mirror IncidentService, eventPublisher EventPublisherService, dispatcher *SNWritebackDispatcher) IncidentService {
-	return &incidentService{repo: repo, userRepo: userRepo, snMirror: mirror, eventPublisher: eventPublisher, snWriteback: dispatcher}
+	return &incidentService{repo: repo, userRepo: userRepo, snMirror: mirror, eventPublisher: eventPublisher, snWriteback: dispatcher, updatable: true}
 }
 
 // incidentSystemActorEmail is UpdateIncident's comment.created_by fallback
@@ -281,6 +363,10 @@ func (s *incidentService) resolveActor(ctx context.Context) (domain.User, error)
 	email, err := emailFromJWT(token)
 	if err != nil {
 		return domain.User{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+	}
+	if s.userRepo == nil {
+		// NewIncidentService carries no user repository; comment.created_by is free text, so the email will do.
+		return domain.User{Email: email}, nil
 	}
 	return s.userRepo.GetUserByEmail(ctx, email)
 }
@@ -360,9 +446,13 @@ func (s *incidentService) SearchIncidentActivities(ctx context.Context, req doma
 // CreateIncident implements IncidentService.
 //
 // Under DATA_SOURCE=postgres-servicenow-dual-write (snMirror != nil), this
-// delegates to createIncidentSNFirst instead of the plain Postgres path's
-// ServiceUnavailableError below -- see that method's own doc comment.
+// delegates to createIncidentSNFirst -- see that method's own doc comment.
+// Otherwise it is createIncidentPortal, the native Postgres create.
 func (s *incidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	var err error
+	if req, err = s.withAssignmentGroupFromService(ctx, req); err != nil {
+		return domain.CreateIncidentResponse{}, err
+	}
 	if s.snMirror != nil {
 		// ConfigurationItemID has no backing column on this data source at
 		// all (unlike Subcategory/AssignedEngineerID/WatchList/
@@ -384,33 +474,106 @@ func (s *incidentService) CreateIncident(ctx context.Context, req domain.CreateI
 		}
 		return s.createIncidentSNFirst(ctx, req)
 	}
-	if req.ConfigurationItemID != nil {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "configurationItemId is not supported for this data source"}
-	}
 	return s.createIncidentPortal(ctx, req)
 }
 
-// createIncidentPortal implements CreateIncident's plain-Postgres path
-// (s.snMirror == nil, no ServiceNow at all) -- unblocked by migration 0140's
-// next_portal_work_item_number(), the same product decision that used to
-// defer this (see CLAUDE.md, "CreateCase and case numbers"). createdBy is
-// resolved from the caller's own JWT email claim -- the same
-// middleware.UserIDTokenFromContext + emailFromJWT chain
-// problemService.createProblemSNFirst already uses -- since there is no
-// ServiceNow response to take it from on this path. Unlike createIncidentSNFirst,
-// there is no publishIncidentCreatedEvent call here yet: that helper's own
-// payload assumes the ServiceNow-sourced fields this path never has (see its
-// own doc comment) -- left as a follow-up rather than guessed at.
-func (s *incidentService) createIncidentPortal(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
-	token := middleware.UserIDTokenFromContext(ctx)
-	if token == "" {
-		return domain.CreateIncidentResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+// withAssignmentGroupFromService sets an incident's assignment group to its
+// service's support group.
+//
+// *** THE ONLY PLACE THE GROUP IS CHOSEN. *** The create request has no
+// assignmentGroupId (see domain.CreateIncidentRequest.AssignmentGroupID), so
+// the portal, the microapp, alert-born incidents from sre-alert-core-service
+// and any M2M client all get the same group from one call, read live from the
+// service as ServiceNow's alert business rule does. Done before either create
+// path, so in dual-write mode ServiceNow and Postgres get the same group.
+//
+// A service with no support group leaves the incident unassigned. An invalid
+// service id is left for request validation to reject.
+func (s *incidentService) withAssignmentGroupFromService(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentRequest, error) {
+	req.AssignmentGroupID = nil
+	serviceID := strings.TrimSpace(req.ServiceID)
+	if serviceID == "" || validateUUIDs("serviceId", []string{serviceID}) != nil || s.repo == nil {
+		return req, nil
 	}
-	createdBy, err := emailFromJWT(token)
+	group, err := s.repo.SupportGroupOfService(ctx, serviceID)
 	if err != nil {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+		return req, err
 	}
-	return s.repo.CreateIncident(ctx, req, createdBy)
+	if group != "" {
+		req.AssignmentGroupID = &group
+	}
+	return req, nil
+}
+
+// createIncidentPortal implements CreateIncident's plain-Postgres path
+// (s.snMirror == nil, no ServiceNow at all). It reproduces ServiceNow's
+// IncidentUtils.createIncident, the script include behind the ServiceNow
+// path's POST:
+//
+//   - state New (the column default) and priority from impact x urgency
+//     (incidentPriorityFor);
+//   - every optional field IncidentUtils sets when present, including
+//     subcategory, assigned engineer, configuration item and watch list;
+//   - additionalComments and workNotes written as journal entries (COMMENT /
+//     WORK_NOTE rows) once the record exists, not as fields on it;
+//   - incident.created published after the insert commits, the event the
+//     ServiceNow path publishes and csm-notification-service consumes.
+//
+// The number is the portal's own (next_portal_work_item_number, migration
+// 0140), as for every other type created natively; INC numbers come with the
+// native numbering cutover (migration 0180).
+//
+// The actor is the caller's validated identity (actorOf): the user's email,
+// or the client id of a machine caller such as alert ingestion, which has no
+// user token to forward.
+func (s *incidentService) createIncidentPortal(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	if err := validateCreateIncidentRequest(req); err != nil {
+		return domain.CreateIncidentResponse{}, err
+	}
+
+	var subcategoryValue *string
+	if req.Subcategory != nil {
+		v := snIncidentSubcategoryKeyMap[*req.Subcategory]
+		subcategoryValue = &v
+	}
+
+	resp, err := s.repo.CreateIncident(ctx, req, incidentPriorityFor(req.Impact, req.Urgency), subcategoryValue, actorOf(ctx))
+	if err != nil {
+		return domain.CreateIncidentResponse{}, err
+	}
+	// The enriched publish, not the title-only one. This create path arrived
+	// from upstream calling the 4-argument form, which predates the escalation
+	// ladder: it publishes an incident.created carrying only the subject, with
+	// no team, priority or contactType. The ladder resolves its rungs from
+	// those fields, so an incident created here -- which includes every one
+	// raised by alert ingestion -- would reach csm-notification-service with
+	// nothing to escalate on, and no ladder would run for it.
+	publishIncidentCreatedEvent(ctx, s.eventPublisher, req, resp.Incident.ID,
+		resp.Incident.Number, resp.Incident.CreatedOn, s.GetIncidentByID)
+	return resp, nil
+}
+
+// incidentPriorityFor is ServiceNow's stock priority lookup (dl_u_priority):
+// impact x urgency to priority, as an incident_priority_enum label. The
+// create form's preview (webapp utils/incidentPriorityMatrix.ts) shows the
+// same matrix.
+//
+//	impact \ urgency   HIGH       MEDIUM     LOW
+//	HIGH              CRITICAL   HIGH       MODERATE
+//	MEDIUM            HIGH       MODERATE   LOW
+//	LOW               MODERATE   LOW        PLANNING
+func incidentPriorityFor(impact domain.IncidentImpact, urgency domain.IncidentUrgency) string {
+	rank := func(v string) int {
+		switch v {
+		case "HIGH":
+			return 0
+		case "MEDIUM":
+			return 1
+		default:
+			return 2
+		}
+	}
+	return [...]string{"CRITICAL", "HIGH", "MODERATE", "LOW", "PLANNING"}[rank(string(impact))+rank(string(urgency))]
 }
 
 // createIncidentSNFirst implements CreateIncident's
@@ -461,26 +624,34 @@ func (s *incidentService) createIncidentSNFirst(ctx context.Context, req domain.
 	// doc comment for why this can't just be snIncidentService's own
 	// automatic publish (that fires right after the ServiceNow POST, before
 	// this Postgres insert was even attempted).
-	publishIncidentCreatedEvent(ctx, s.eventPublisher, req, resp.Incident.ID)
+	publishIncidentCreatedEvent(ctx, s.eventPublisher, req, resp.Incident.ID, snResp.Incident.Number, snResp.Incident.CreatedOn, s.GetIncidentByID)
 	return resp, nil
 }
 
-// UpdateIncident is not supported for the plain PostgreSQL data source
-// (s.snWriteback == nil): several fields have no backing column at all
-// (AssignmentGroupID, ConfigurationItemID, WatchList), same blocker
-// UpdateIncident always had here.
+// UpdateIncident supports two field groups, under
+// DATA_SOURCE=postgres-servicenow-dual-write (s.snWriteback != nil) and on
+// plain DATA_SOURCE=postgres when this instance creates its own incidents
+// (NewIncidentServiceWithPublisher; alert-born SRE incidents need their
+// follow-up alerts as work notes and their engineer's claim). There the
+// writes below are the whole result and there is no ServiceNow mirror. The
+// read-only NewIncidentService still answers 503. The two groups:
 //
-// Under DATA_SOURCE=postgres-servicenow-dual-write (s.snWriteback != nil),
-// this supports EXACTLY WorkNotes and AdditionalComments -- a deliberate,
-// narrow scope, not a stepping stone left half-built: every other field
-// (Subject/Priority/State/Category/Subcategory/ContactType/ResolutionCode/
-// ParentID/ParentIncidentID/AssignmentGroupID/AssignedEngineerID/ServiceID/
-// ServiceOfferingID/ConfigurationItemID/ChangeRequestID/ProblemID/
-// CausedByID/ResolvedByID/ResolutionNotes/IncidentReport/WatchList) is
-// rejected with a ValidationError if set, mirroring caseService.UpdateCase's
-// own narrow-field-set rejection style/wording (case_service.go) --
-// wiring up incident State/Priority/etc against their real backing Postgres
-// columns is separate, future work.
+//   - The state transition the portal's incident action bar sends:
+//     State, plus AssignedEngineerID (the "claim" sent with In Progress on
+//     an unassigned incident) and ResolutionCode/ResolutionNotes/
+//     ResolvedByID (sent with Resolved/Closed). Written to incident/work_item
+//     in one transaction by IncidentRepository.UpdateIncidentLifecycle; see
+//     repository.IncidentLifecycleUpdate for the rules. No state requires an
+//     assignee or group (In Progress included), matching ServiceNow. These
+//     used to be rejected here, so no incident could leave New in this mode.
+//   - WorkNotes and AdditionalComments (below).
+//
+// Every other field (Subject/Priority/Category/Subcategory/ContactType/
+// ParentID/ParentIncidentID/AssignmentGroupID/ServiceID/ServiceOfferingID/
+// ConfigurationItemID/ChangeRequestID/ProblemID/CausedByID/IncidentReport/
+// WatchList) is still rejected with a ValidationError if set, mirroring
+// caseService.UpdateCase's narrow-field-set rejection style -- wiring those
+// up is separate, future work.
 //
 // WorkNotes/AdditionalComments each become their own comment row
 // (comment.work_item_id = req.ID, IncidentRepository.CreateIncidentComment)
@@ -509,7 +680,8 @@ func (s *incidentService) createIncidentSNFirst(ctx context.Context, req domain.
 // with a request carrying only ID plus the field(s) actually being
 // mirrored -- no narrow patcher interface needed, unlike case's.
 func (s *incidentService) UpdateIncident(ctx context.Context, req domain.UpdateIncidentRequest) (domain.UpdateIncidentResponse, error) {
-	if s.snWriteback == nil {
+	if !s.updatable {
+		// NewIncidentService: a plain read-only Postgres instance that does not create incidents either.
 		return domain.UpdateIncidentResponse{}, &apierror.ServiceUnavailableError{
 			Msg: "updating an incident is not available on this data source yet",
 		}
@@ -517,17 +689,22 @@ func (s *incidentService) UpdateIncident(ctx context.Context, req domain.UpdateI
 	if err := validateUUIDs("id", []string{req.ID}); err != nil {
 		return domain.UpdateIncidentResponse{}, err
 	}
-	if req.Subject != nil || req.Priority != nil || req.State != nil || req.Category != nil ||
-		req.Subcategory != nil || req.ContactType != nil || req.ResolutionCode != nil ||
+	if req.Subject != nil || req.Priority != nil || req.Category != nil ||
+		req.Subcategory != nil || req.ContactType != nil ||
 		req.ParentID != nil || req.ParentIncidentID != nil || req.AssignmentGroupID != nil ||
-		req.AssignedEngineerID != nil || req.ServiceID != nil || req.ServiceOfferingID != nil ||
+		req.ServiceID != nil || req.ServiceOfferingID != nil ||
 		req.ConfigurationItemID != nil || req.ChangeRequestID != nil || req.ProblemID != nil ||
-		req.CausedByID != nil || req.ResolvedByID != nil || req.ResolutionNotes != nil ||
-		req.IncidentReport != nil || req.WatchList != nil {
-		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "subject, priority, state, category, subcategory, contactType, resolutionCode, parentId, parentIncidentId, assignmentGroupId, assignedEngineerId, serviceId, serviceOfferingId, configurationItemId, changeRequestId, problemId, causedById, resolvedById, resolutionNotes, incidentReport, and watchList are only supported for the ServiceNow data source"}
+		req.CausedByID != nil || req.IncidentReport != nil || req.WatchList != nil {
+		// Kept under the BFF's 256-byte upstream error excerpt, so the reason
+		// still reaches the portal intact if that cap is ever lowered again.
+		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "subject, priority, category, subcategory, contactType, parentId, parentIncidentId, assignmentGroupId, serviceId, serviceOfferingId, configurationItemId, changeRequestId, problemId, causedById, incidentReport and watchList cannot be updated on this data source yet"}
 	}
-	if req.WorkNotes == nil && req.AdditionalComments == nil {
-		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "at least one of workNotes or additionalComments must be provided"}
+	lifecycle, hasLifecycle, err := incidentLifecycleUpdateFromRequest(req)
+	if err != nil {
+		return domain.UpdateIncidentResponse{}, err
+	}
+	if !hasLifecycle && req.WorkNotes == nil && req.AdditionalComments == nil {
+		return domain.UpdateIncidentResponse{}, &apierror.ValidationError{Msg: "at least one of state, assignedEngineerId, resolutionCode, resolutionNotes, resolvedById, workNotes or additionalComments must be provided"}
 	}
 
 	actor, err := s.resolveActor(ctx)
@@ -535,32 +712,65 @@ func (s *incidentService) UpdateIncident(ctx context.Context, req domain.UpdateI
 		return domain.UpdateIncidentResponse{}, err
 	}
 
-	if req.WorkNotes != nil {
-		if _, err := s.repo.CreateIncidentComment(ctx, req.ID, domain.CommentTypeWorkNote, *req.WorkNotes, actor.Email); err != nil {
-			return domain.UpdateIncidentResponse{}, err
+	// The incident before this change, so a claim or a move out of NEW can be told apart from a
+	// re-send of what it already had (publishIncidentStopSignals). Read only when one could follow.
+	var before domain.IncidentView
+	if s.eventPublisher != nil && (req.State != nil || req.AssignedEngineerID != nil) {
+		if b, err := s.repo.GetIncidentByID(ctx, req.ID); err == nil {
+			before = b
+		} else {
+			slog.WarnContext(ctx, "update incident: could not read the incident before the change; no stop signal will be sent",
+				"incidentId", req.ID, "error", err)
 		}
 	}
-	if req.AdditionalComments != nil {
-		if _, err := s.repo.CreateIncidentComment(ctx, req.ID, domain.CommentTypeComment, *req.AdditionalComments, actor.Email); err != nil {
+
+	if hasLifecycle {
+		if actor.ID != "" {
+			lifecycle.DefaultResolvedByID = &actor.ID
+		}
+		// The notes ride in the state change's transaction: a failed note leaves nothing saved.
+		lifecycle.WorkNotes, lifecycle.AdditionalComments = req.WorkNotes, req.AdditionalComments
+		if err := s.repo.UpdateIncidentLifecycle(ctx, req.ID, lifecycle, actor.Email); err != nil {
 			return domain.UpdateIncidentResponse{}, err
 		}
+	} else if err := s.repo.CreateIncidentNotes(ctx, req.ID, req.WorkNotes, req.AdditionalComments, actor.Email); err != nil {
+		// Both notes commit together, so a retry after a failed second insert cannot save the first twice.
+		return domain.UpdateIncidentResponse{}, err
 	}
 
 	view, err := s.repo.GetIncidentByID(ctx, req.ID)
 	if err != nil {
 		return domain.UpdateIncidentResponse{}, err
 	}
+	publishIncidentStopSignals(ctx, s.eventPublisher, req, before, view)
 
 	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
-	// only (guaranteed by the s.snWriteback == nil guard above). Postgres has
+	// only (guaranteed by the s.snWriteback == nil return just below). Postgres has
 	// already committed both comment rows by this point; this fires after,
 	// asynchronously, and never affects this response. mirrorReq carries only
 	// ID plus the field(s) this call actually set -- never forwards req
 	// itself -- so this can never accidentally carry an unsupported field
 	// into the mirror call.
-	mirrorReq := domain.UpdateIncidentRequest{ID: req.ID, WorkNotes: req.WorkNotes, AdditionalComments: req.AdditionalComments}
+	if s.snWriteback == nil {
+		// DATA_SOURCE=postgres creating its own incidents: there is no ServiceNow copy to keep in step.
+		return domain.UpdateIncidentResponse{Message: "Incident updated successfully", Incident: view}, nil
+	}
+	mirrorReq := domain.UpdateIncidentRequest{
+		ID:                 req.ID,
+		State:              req.State,
+		AssignedEngineerID: req.AssignedEngineerID,
+		ResolutionCode:     req.ResolutionCode,
+		ResolutionNotes:    req.ResolutionNotes,
+		ResolvedByID:       req.ResolvedByID,
+		WorkNotes:          req.WorkNotes,
+		AdditionalComments: req.AdditionalComments,
+	}
 	s.snWriteback.Dispatch(ctx, "incident", req.ID, "update",
-		map[string]any{"id": req.ID, "workNotes": req.WorkNotes, "additionalComments": req.AdditionalComments},
+		map[string]any{
+			"id": req.ID, "state": req.State, "assignedEngineerId": req.AssignedEngineerID,
+			"resolutionCode": req.ResolutionCode, "resolutionNotes": req.ResolutionNotes, "resolvedById": req.ResolvedByID,
+			"workNotes": req.WorkNotes, "additionalComments": req.AdditionalComments,
+		},
 		func(writeCtx context.Context) error {
 			_, err := s.snMirror.UpdateIncident(writeCtx, mirrorReq)
 			return err

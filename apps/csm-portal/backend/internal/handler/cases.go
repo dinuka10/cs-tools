@@ -113,6 +113,11 @@ type entityCaseClient interface {
 	// call that backs GET /users/me. Needed by the public-comment ownership
 	// guard; see CaseHandler.resolveCurrentUserID.
 	GetUserMe(ctx context.Context) ([]byte, error)
+	// CreateUser calls POST /users on the entity service — used alongside
+	// GetUserMe by ensureUserProvisioned (see that function's own doc
+	// comment) to provision a worknote_creator-/escalator-only caller who
+	// has no "user" row yet.
+	CreateUser(ctx context.Context, body []byte) ([]byte, error)
 }
 
 // CaseHandler handles HTTP requests for case operations, delegating to the
@@ -487,6 +492,11 @@ func (h *CaseHandler) CreateCaseComment(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		body = rebuilt
+
+		// A worknote_creator-only caller (not cs_engineer/admin, who already
+		// hold full PermWrite and are assumed provisioned) may have no "user"
+		// row yet — see ensureUserProvisioned's own doc comment.
+		ensureUserProvisioned(r.Context(), h.entity, user)
 	}
 
 	if reqMeta.Type != "work_note" {
@@ -1680,6 +1690,11 @@ func (h *CaseHandler) CreateCaseEscalation(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusForbidden, ErrMsgForbidden)
 		return
 	}
+
+	// This route's permission (PermEscalate) is escalator-or-admin only —
+	// cs_engineer never holds it — so every caller reaching this point may
+	// have no "user" row yet. See ensureUserProvisioned's own doc comment.
+	ensureUserProvisioned(r.Context(), h.entity, user)
 
 	result, err := h.entity.CreateCaseEscalation(r.Context(), caseID, body)
 	if err != nil {

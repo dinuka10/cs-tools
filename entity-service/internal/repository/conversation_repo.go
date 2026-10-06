@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
 	"golang.org/x/sync/errgroup"
@@ -32,17 +33,12 @@ import (
 // ConversationRepository defines the persistence operations for conversation
 // (migration 0057), a work_item type extension (id IS work_item.id) --
 // same shared-PK pattern as "case"/change_request. conversation itself has
-// only a `state` column beyond the shared PK; InitialMessage/MessageCount
-// have no backing column at all and are derived from the generic `comment`
-// table (migration 0040, keyed by work_item_id): InitialMessage is the
-// earliest comment's content, MessageCount is the total comment count --
-// the only tables in this schema that could plausibly answer "what was said
-// in this conversation."
-//
-// CreateConversation has no Postgres implementation: work_item.number has
-// no DB default and no backing sequence anywhere in migrations/, the same
-// blocker CaseRepository.CreateCase/ChangeRequestRepository's own doc
-// comment already describe.
+// only a `state` column beyond the shared PK. InitialMessage is
+// work_item.description, where csm-sync-service lands ServiceNow's
+// u_initial_message (the field SN's own API returned as initialMessage),
+// falling back to the earliest comment for a row with no description.
+// MessageCount is the conversation's total comment count (the generic
+// `comment` table, migration 0040, keyed by work_item_id).
 type ConversationRepository interface {
 	// SearchConversations returns a filtered, sorted, paginated slice of
 	// conversations together with the total count of matching rows before
@@ -54,6 +50,25 @@ type ConversationRepository interface {
 	// UpdateConversation transitions the conversation's state, returning the
 	// updated summary. Returns a NotFoundError if id does not exist.
 	UpdateConversation(ctx context.Context, id string, state domain.ConversationState, actorEmail string) (domain.UpdatedConversation, error)
+	// CreateConversation inserts a conversation (work_item + conversation
+	// rows) in one transaction. Returns a ForbiddenError when the caller is
+	// not a member of the project, a ValidationError when the project does
+	// not exist.
+	CreateConversation(ctx context.Context, in CreateConversationInput) (domain.CreatedConversation, error)
+}
+
+// CreateConversationInput is CreateConversation's input. ID and Number are
+// empty for a natively created conversation (both generated here), and set
+// to ServiceNow's values when ServiceNow created it first
+// (DATA_SOURCE=postgres-servicenow-dual-write).
+type CreateConversationInput struct {
+	ID             string
+	Number         string
+	ProjectID      string
+	Subject        string
+	InitialMessage string
+	CreatedBy      string
+	State          domain.ConversationState
 }
 
 type conversationRepo struct {
@@ -188,7 +203,7 @@ func (r *conversationRepo) SearchConversations(ctx context.Context, req domain.S
 	countQuery := "SELECT COUNT(*) " + conversationFromJoins + " " + where
 	dataQuery := fmt.Sprintf(
 		`SELECT wi.id, wi.number, p.id, p.name, case_wi.id, case_wi.number, c.state::TEXT,
-		        wi.created_on, u.id, wi.created_by, u.name, u.first_name, u.last_name
+		        wi.created_on, u.id, wi.created_by, u.name, u.first_name, u.last_name, wi.description
 		 %s %s
 		 ORDER BY %s %s, wi.id
 		 LIMIT $%d OFFSET $%d`,
@@ -216,8 +231,9 @@ func (r *conversationRepo) SearchConversations(ctx context.Context, req domain.S
 		defer rows.Close()
 
 		type row struct {
-			view       domain.SearchConversationView
-			workItemID string
+			view        domain.SearchConversationView
+			workItemID  string
+			description *string
 		}
 		var out []row
 		for rows.Next() {
@@ -230,9 +246,10 @@ func (r *conversationRepo) SearchConversations(ctx context.Context, req domain.S
 				userID                            *string
 				createdBy                         string
 				userName, userFirstName, userLast *string
+				description                       *string
 			)
 			if err := rows.Scan(&id, &number, &projID, &projName, &caseID, &caseNumber, &state,
-				&createdOn, &userID, &createdBy, &userName, &userFirstName, &userLast); err != nil {
+				&createdOn, &userID, &createdBy, &userName, &userFirstName, &userLast, &description); err != nil {
 				return fmt.Errorf("scan conversation: %w", err)
 			}
 			v := domain.SearchConversationView{ID: &id, Number: &number, CreatedOn: createdOn.UTC().Format(time.RFC3339)}
@@ -255,7 +272,7 @@ func (r *conversationRepo) SearchConversations(ctx context.Context, req domain.S
 				uid = *userID
 			}
 			v.CreatedBy = domain.NewUserReference(uid, createdBy, name)
-			out = append(out, row{view: v, workItemID: id})
+			out = append(out, row{view: v, workItemID: id, description: description})
 		}
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("iterate conversations: %w", err)
@@ -272,7 +289,7 @@ func (r *conversationRepo) SearchConversations(ctx context.Context, req domain.S
 		result := make([]domain.SearchConversationView, len(out))
 		for i, o := range out {
 			s := stats[o.workItemID]
-			o.view.InitialMessage = s.initialMessage
+			o.view.InitialMessage = initialMessage(o.description, s.initialMessage)
 			o.view.MessageCount = s.count
 			result[i] = o.view
 		}
@@ -291,7 +308,7 @@ func (r *conversationRepo) SearchConversations(ctx context.Context, req domain.S
 func (r *conversationRepo) GetConversation(ctx context.Context, id string) (domain.ConversationDetails, error) {
 	query := `
 		SELECT wi.id, wi.number, p.id, p.name, case_wi.id, case_wi.number, c.state::TEXT,
-		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by
+		       wi.created_on, wi.created_by, wi.updated_on, wi.updated_by, wi.description
 		` + conversationFromJoins + `
 		WHERE wi.id = $1 AND wi.type = 'CONVERSATION'`
 
@@ -302,10 +319,11 @@ func (r *conversationRepo) GetConversation(ctx context.Context, id string) (doma
 		state                *string
 		createdOn, updatedOn time.Time
 		createdBy, updatedBy string
+		description          *string
 	)
 	err := r.db.QueryRow(ctx, query, id).Scan(
 		&id2, &number, &projID, &projName, &caseID, &caseNumber, &state,
-		&createdOn, &createdBy, &updatedOn, &updatedBy,
+		&createdOn, &createdBy, &updatedOn, &updatedBy, &description,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ConversationDetails{}, &apierror.NotFoundError{Msg: "conversation not found"}
@@ -334,11 +352,22 @@ func (r *conversationRepo) GetConversation(ctx context.Context, id string) (doma
 	if err != nil {
 		return domain.ConversationDetails{}, err
 	}
-	if s, ok := stats[id2]; ok {
-		d.InitialMessage = s.initialMessage
-		d.MessageCount = s.count
-	}
+	s := stats[id2]
+	d.InitialMessage = initialMessage(description, s.initialMessage)
+	d.MessageCount = s.count
 	return d, nil
+}
+
+// initialMessage prefers work_item.description (ServiceNow's
+// u_initial_message, or the first message of a conversation created here)
+// over the earliest comment, which need not be what the customer first
+// asked (the REST create path stores only the assistant's reply as a
+// comment).
+func initialMessage(description, earliestComment *string) *string {
+	if description != nil && *description != "" {
+		return description
+	}
+	return earliestComment
 }
 
 // UpdateConversation implements ConversationRepository.
@@ -387,5 +416,69 @@ func (r *conversationRepo) UpdateConversation(ctx context.Context, id string, st
 		UpdatedOn: updatedOn.UTC().Format(time.RFC3339),
 		UpdatedBy: actorEmail,
 		State:     &stateStr,
+	}, nil
+}
+
+// insertConversationWorkItemQuery inserts the work_item half of a
+// conversation. id/number are COALESCEd so one query serves both callers:
+// NULL generates them (gen_random_uuid(), next_portal_work_item_number(),
+// migration 0140 -- the same numbering every natively created work item
+// uses), and a ServiceNow-first create supplies its own. COALESCE evaluates
+// lazily, so a supplied number never draws from the sequence. Subject and
+// description carry the first message the same way csm-sync-service lands
+// u_initial_message (truncated subject, full description).
+const insertConversationWorkItemQuery = `
+	INSERT INTO work_item (
+		id, created_on, updated_on, created_by, updated_by,
+		number, subject, description, type, project_id
+	)
+	VALUES (
+		COALESCE($1::uuid, gen_random_uuid()), NOW(), NOW(), $2, $2,
+		COALESCE($3, next_portal_work_item_number()), $4, $5, 'CONVERSATION'::work_item_type_enum, $6::uuid
+	)
+	RETURNING id, number, created_on`
+
+// CreateConversation implements ConversationRepository. The two inserts are
+// separate statements rather than one CTE: conversation_write (migration
+// 0190) looks the project up from work_item, and a sibling CTE's insert is
+// not visible to that subquery, while an earlier statement in the same
+// transaction is.
+func (r *conversationRepo) CreateConversation(ctx context.Context, in CreateConversationInput) (domain.CreatedConversation, error) {
+	var (
+		id, number string
+		createdOn  time.Time
+	)
+	err := r.db.InTx(ctx, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, insertConversationWorkItemQuery,
+			nullIfEmpty(in.ID), in.CreatedBy, nullIfEmpty(in.Number), in.Subject, in.InitialMessage, in.ProjectID,
+		).Scan(&id, &number, &createdOn); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO conversation (id, state) VALUES ($1, $2::text::conversation_state_enum)`,
+			id, conversationStateToEnum(in.State),
+		); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		if IsRLSPolicyViolation(err) {
+			return domain.CreatedConversation{}, &apierror.ForbiddenError{Msg: "not authorized to create conversations for this project"}
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation: project_id
+			return domain.CreatedConversation{}, &apierror.ValidationError{Msg: "projectId does not exist: " + in.ProjectID}
+		}
+		return domain.CreatedConversation{}, fmt.Errorf("create conversation: %w", err)
+	}
+
+	state := string(in.State)
+	return domain.CreatedConversation{
+		ID:        id,
+		Number:    number,
+		CreatedBy: in.CreatedBy,
+		CreatedOn: createdOn.UTC().Format(time.RFC3339),
+		State:     &state,
 	}, nil
 }

@@ -63,6 +63,16 @@ SELECT md5('seed-team-'||key)::uuid, now(), now(), 'seed', 'seed', display, key,
 FROM _team
 ON CONFLICT (id) DO NOTHING;
 
+-- GET /groups/search (the "Assignment group" picker) lists `team` rows, but
+-- work_item.assignment_group_id references "group". In a real deployment every
+-- team has a ServiceNow-synced "group" row with the same id; locally there is no
+-- sync, so picking a seeded team failed the FK on create. Mirror each team into
+-- "group" by id.
+INSERT INTO "group" (id, created_on, updated_on, created_by, updated_by, name, group_email, is_active)
+SELECT id, now(), now(), 'seed', 'seed', name, group_email, true
+FROM team
+ON CONFLICT (id) DO NOTHING;
+
 -- An ABT whose real rota has been imported (import-abt-roster.py) is not
 -- generated as well: the roster would be half real engineers, half stand-ins.
 -- The team row itself stays, above; only its generated people and rota go.

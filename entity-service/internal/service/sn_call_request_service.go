@@ -264,6 +264,26 @@ func (s *snCallRequestService) CreateCallRequest(ctx context.Context, req domain
 	return resp, nil
 }
 
+// createCallRequestSNFirstDetails implements callRequestSNCreator (see
+// call_request_service.go) -- the dual-write CREATE path's entry point into
+// this service, returning the raw id/createdBy ServiceNow assigned rather
+// than the wire-shaped domain.CreateCallRequestResponse the public
+// CreateCallRequest above returns.
+func (s *snCallRequestService) createCallRequestSNFirstDetails(ctx context.Context, req domain.CreateCallRequestRequest) (id, createdBy string, createdOn time.Time, err error) {
+	resp, err := s.CreateCallRequest(ctx, req)
+	if err != nil {
+		return "", "", time.Time{}, err
+	}
+	if resp.CallRequest.ID == "" {
+		return "", "", time.Time{}, &apierror.DownstreamError{Msg: "The upstream service returned an invalid response to the call request create request."}
+	}
+	// The reply's createdOn is a wall-clock string in a non-UTC zone (the
+	// same concern createDeploymentSNFirstDetails's own doc comment
+	// documents for deployment's reply) -- the current time is used instead
+	// of parsing it.
+	return resp.CallRequest.ID, resp.CallRequest.CreatedBy, time.Now().UTC(), nil
+}
+
 // SearchCallRequests implements CallRequestService.
 func (s *snCallRequestService) SearchCallRequests(ctx context.Context, req domain.SearchCallRequestsRequest) (domain.SearchCallRequestsResponse, error) {
 	if err := normalizePagination(&req.Pagination); err != nil {

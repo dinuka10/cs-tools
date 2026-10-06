@@ -28,8 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"sre-alert-ingestion-service/internal/auth"
-	"sre-alert-ingestion-service/internal/server"
+	"sre-alert-ingestion-service/internal/transport/auth"
+	"sre-alert-ingestion-service/internal/transport/server"
 )
 
 // blockingPipeline holds each request until release is closed.
@@ -81,7 +81,7 @@ func startInFlight(t *testing.T, pipe *blockingPipeline) (*server.Server, *http.
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	srv := server.New(server.Options{
-		Logger: logger, Auth: auth.None{}, Pipeline: pipe, Vendors: []string{"aws"},
+		Logger: logger, Auth: auth.None{}, Pipeline: pipe, Sources: []string{"aws"},
 		MaxBodyBytes: 1 << 20, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second,
 	})
 	httpSrv := srv.HTTPServer("")
@@ -93,7 +93,7 @@ func startInFlight(t *testing.T, pipe *blockingPipeline) (*server.Server, *http.
 
 	status := make(chan int, 1)
 	go func() {
-		resp, err := http.Post("http://"+ln.Addr().String()+server.VendorRoutePrefix+"aws", "application/json", strings.NewReader(`{}`))
+		resp, err := http.Post("http://"+ln.Addr().String()+server.SourceRoutePrefix+"aws", "application/json", strings.NewReader(`{}`))
 		if err != nil {
 			status <- 0
 			return
@@ -116,7 +116,7 @@ func TestShutdown_DrainsInFlightRequestBeforeClosingAllocator(t *testing.T) {
 	done := make(chan struct{})
 	b := budget{DrainDelay: 10 * time.Millisecond, RequestWait: 2 * time.Second, AllocatorDrain: time.Second}
 	go func() {
-		shutdown(ctx, logger, srv, httpSrv, fakeAlloc{events: events}, b, func(context.Context) { events.add("after") })
+		shutdown(ctx, logger, srv, httpSrv, fakeAlloc{events: events}, fakeRaw{events: events}, b, func(context.Context) { events.add("after") })
 		close(done)
 	}()
 
@@ -144,7 +144,7 @@ func TestShutdown_DrainsInFlightRequestBeforeClosingAllocator(t *testing.T) {
 		t.Errorf("in-flight request status = %d, want 201", got)
 	}
 	<-done
-	want := []string{"request done", "allocator closed", "after"}
+	want := []string{"request done", "allocator closed", "payloads closed", "after"}
 	if got := events.all(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Errorf("shutdown order = %v, want %v", got, want)
 	}
@@ -165,9 +165,46 @@ func TestShutdown_StuckRequestKeepsAllocatorBudget(t *testing.T) {
 	b := budget{DrainDelay: 10 * time.Millisecond, RequestWait: 100 * time.Millisecond, AllocatorDrain: 300 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	shutdown(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), srv, httpSrv, alloc, b)
+	shutdown(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), srv, httpSrv, alloc, nil, b)
 
 	if closeErr != nil || left < 250*time.Millisecond {
 		t.Errorf("allocator got %v left (err %v), want its full %v", left, closeErr, b.AllocatorDrain)
+	}
+}
+
+type fakeRaw struct {
+	events  *eventLog
+	onClose func(ctx context.Context)
+}
+
+func (f fakeRaw) Close(ctx context.Context) {
+	if f.onClose != nil {
+		f.onClose(ctx)
+	}
+	if f.events != nil {
+		f.events.add("payloads closed")
+	}
+}
+
+// TestShutdown_PayloadsGetTheirOwnBudget: even when the grace context has run out, the final raw body insert still gets its full payload_drain.
+func TestShutdown_PayloadsGetTheirOwnBudget(t *testing.T) {
+	events := &eventLog{}
+	pipe := &blockingPipeline{entered: make(chan struct{}, 1), release: make(chan struct{}), events: events}
+	srv, httpSrv, _ := startInFlight(t, pipe)
+	defer close(pipe.release)
+
+	var left time.Duration
+	var rawErr error
+	raw := fakeRaw{onClose: func(ctx context.Context) {
+		d, _ := ctx.Deadline()
+		left, rawErr = time.Until(d), ctx.Err()
+	}}
+	b := budget{DrainDelay: 10 * time.Millisecond, RequestWait: 100 * time.Millisecond, AllocatorDrain: 50 * time.Millisecond, PayloadDrain: 300 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	shutdown(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), srv, httpSrv, fakeAlloc{events: events}, raw, b)
+
+	if rawErr != nil || left < 250*time.Millisecond {
+		t.Errorf("payloads got %v left (err %v), want their full %v", left, rawErr, b.PayloadDrain)
 	}
 }

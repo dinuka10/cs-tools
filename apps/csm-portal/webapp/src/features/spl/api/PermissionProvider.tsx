@@ -23,7 +23,7 @@ import { PermissionContext, type Permissions } from "./permissionsContext";
 // now reading the same backend-`roles` array (`GET /users/me`) as every
 // other permission check in this app instead of Asgardeo groups — see
 // useAccess.ts for why the earlier client-side-groups exception was
-// removed. Three independent booleans, each a role-membership check — UI
+// removed. Two independent booleans, each a role-membership check — UI
 // guidance only: the Go backend enforces its own copies of these same
 // checks server-side (internal/handler/auth.go's requireSPLPermission).
 export function PermissionProvider({ children }: { children: ReactNode }) {
@@ -39,13 +39,7 @@ export function PermissionProvider({ children }: { children: ReactNode }) {
     const held = new Set(roles ?? []);
     const full = held.has(PORTAL_ROLE.csEngineer) || held.has(PORTAL_ROLE.admin);
     return {
-      // Mirrors the backend's PermCreateWorkNote (internal/handler/access.go):
-      // full write (cs_engineer/admin) can always post a work note, and the
-      // narrower worknote_creator role can post one too, just nothing else --
-      // see CaseDetailPage.tsx's composer, the only caller of this flag.
-      canAddWorkNotes: full || held.has(PORTAL_ROLE.worknoteCreator),
       canAddEscalations: full || held.has(PORTAL_ROLE.escalator),
-      canDownloadAttachments: full || held.has(PORTAL_ROLE.attachmentDownloader),
       canViewUsageMetrics: full || held.has(PORTAL_ROLE.usageMetricsViewer),
     };
   }, [roles]);

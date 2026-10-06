@@ -83,6 +83,8 @@ type fakeMembershipRepo struct {
 	deactivated   []string
 	deactivateOK  bool
 	deactivateErr error
+	// deactivateAffected is the users the DELETED path reports changing.
+	deactivateAffected []domain.AffectedUser
 	// deactivateBasis is the admin-role basis the DELETED path handed over,
 	// so a test can run it the way the repository would.
 	deactivateBasis repository.AdminRoleBasisFunc
@@ -97,16 +99,20 @@ func (f *fakeMembershipRepo) Upsert(_ context.Context, in domain.SalesforceMembe
 	return domain.SalesforceMembershipUpsertResult{
 		ProjectID:             "proj-1",
 		ProjectContactID:      "pc-1",
+		UserID:                "user-1",
 		CreatedUser:           true,
 		CreatedProjectContact: !f.rowAlreadyExisted,
 		PreviousState:         f.previousState,
 	}, nil
 }
 
-func (f *fakeMembershipRepo) DeactivateBySfID(_ context.Context, id string, basis repository.AdminRoleBasisFunc) (bool, error) {
+func (f *fakeMembershipRepo) DeactivateBySfID(_ context.Context, id string, basis repository.AdminRoleBasisFunc) (bool, []domain.AffectedUser, error) {
 	f.deactivated = append(f.deactivated, id)
 	f.deactivateBasis = basis
-	return f.deactivateOK, f.deactivateErr
+	if f.deactivateErr != nil {
+		return false, nil, f.deactivateErr
+	}
+	return f.deactivateOK, f.deactivateAffected, nil
 }
 
 func (f *fakeMembershipRepo) UpsertWithin(context.Context, string, string, repository.MembershipWritePlan) (domain.SalesforceMembershipUpsertResult, error) {
@@ -218,6 +224,7 @@ type ingestHarness struct {
 	states   *fakeIngestStateRepo
 	accounts *stubSalesforceAccountRepo
 	pub      *fakeInvitePublisher
+	cache    *fakeUserCache
 	svc      SalesforceEventService
 }
 
@@ -236,8 +243,9 @@ func newIngestHarness(pc salesentity.ProjectContact, contact salesentity.Contact
 		contacts: &fakeContactRepo{deactivateFound: true},
 		states:   &fakeIngestStateRepo{},
 		accounts: &stubSalesforceAccountRepo{accountsBySfID: map[string]string{testAccountID: testAccountCSMID}},
+		cache:    newFakeUserCache(),
 	}
-	ingest := MembershipIngest{Memberships: h.repo, Steps: h.steps, SalesEntity: h.se, Contacts: h.contacts}
+	ingest := MembershipIngest{Memberships: h.repo, Steps: h.steps, SalesEntity: h.se, Contacts: h.contacts, UserCache: h.cache}
 	if withPublisher {
 		h.pub = &fakeInvitePublisher{}
 		ingest.Publisher = h.pub

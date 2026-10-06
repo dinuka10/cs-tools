@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -357,6 +358,65 @@ func TestSendSeverityChangedAlert_RejectsMissingCaseNumber(t *testing.T) {
 	c := NewGoogleChatClient(GoogleChatConfig{AudienceSpaces: []GoogleChatAudienceSpace{{Audience: "api-manager", WebhookURL: "https://example.com"}}})
 	if err := c.SendSeverityChangedAlert(context.Background(), "api-manager", "High (P2)", "#EA580C", "Low (P4)", "#6B7280", "", "WSO2-1000", "title", "Team Nova", "https://example.com/cases/1"); err == nil {
 		t.Fatal("expected error for empty caseNumber, got nil")
+	}
+}
+
+// TestSendFrustrationAlert_FormatsFrustrationLevelAsADecimal guards against
+// a real bug this call site had: caseAlertLine stringifies every arg before
+// formatting (see its own doc comment), so passing frustrationLevel straight
+// through with a %.2f verb produced a Go fmt verb-mismatch string
+// (%!f(string=0.91)) in the actual Chat card instead of "0.91".
+func TestSendFrustrationAlert_FormatsFrustrationLevelAsADecimal(t *testing.T) {
+	var capturedBody chatCardMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewGoogleChatClient(GoogleChatConfig{AudienceSpaces: []GoogleChatAudienceSpace{{Audience: "api-manager", WebhookURL: srv.URL}}})
+
+	err := c.SendFrustrationAlert(context.Background(), "api-manager",
+		"CS0448647", "WSO2-1000", "WSO2 API Manager", "High urgency and explicit expression of frustration indicate dissatisfaction.",
+		0.91, "https://csm.example.com/cases/CASE-1")
+	if err != nil {
+		t.Fatalf("SendFrustrationAlert returned error: %v", err)
+	}
+
+	got := capturedBody.CardsV2[0].Card.Sections[0].Widgets[0].TextParagraph.Text
+	if strings.Contains(got, "%!f") {
+		t.Fatalf("card text = %q, contains a Go fmt verb-mismatch marker", got)
+	}
+	want := `<b>WSO2 API Manager</b><br>Frustration level: <b>0.91</b><br>High urgency and explicit expression of frustration indicate dissatisfaction.<br><a href="https://csm.example.com/cases/CASE-1">View case</a>`
+	if got != want {
+		t.Errorf("card text = %q, want %q", got, want)
+	}
+}
+
+// TestSendFrustrationAlert_DoesNotThread guards against a real bug: an
+// earlier version set Thread.ThreadKey to the same chatThreadKey(caseNumber)
+// value case.created/case.acknowledged use, which buried every frustration
+// alert as a reply under that case's (possibly old, scrolled-past)
+// case.created message instead of posting as its own visible, standalone
+// message -- the opposite of what a frustration alert is for.
+func TestSendFrustrationAlert_DoesNotThread(t *testing.T) {
+	var capturedBody chatCardMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := NewGoogleChatClient(GoogleChatConfig{AudienceSpaces: []GoogleChatAudienceSpace{{Audience: "api-manager", WebhookURL: srv.URL}}})
+
+	err := c.SendFrustrationAlert(context.Background(), "api-manager",
+		"CS0448647", "WSO2-1000", "WSO2 API Manager", "reason", 0.91, "https://csm.example.com/cases/CASE-1")
+	if err != nil {
+		t.Fatalf("SendFrustrationAlert returned error: %v", err)
+	}
+
+	if capturedBody.Thread != nil {
+		t.Errorf("Thread = %+v, want nil (frustration alerts must not thread)", capturedBody.Thread)
 	}
 }
 

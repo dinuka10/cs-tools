@@ -49,7 +49,7 @@ import AsyncEntityMultiSelect from "@components/AsyncEntityMultiSelect";
 import { computeIncidentPriority } from "@features/csm-operations/utils/incidentPriorityMatrix";
 import {
   CATEGORY_OPTIONS,
-  CONTACT_TYPE_OPTIONS,
+  CHANNEL_OPTIONS,
   IMPACT_OPTIONS,
   SUBCATEGORY_OPTIONS_BY_CATEGORY,
   URGENCY_OPTIONS,
@@ -141,18 +141,17 @@ export default function CreateIncidentPage(): JSX.Element {
   const [description, setDescription] = useState(originCaseState?.description ?? "");
   const [category, setCategory] = useState<BeIncidentCategory | "">(UNSET);
   const [subcategory, setSubcategory] = useState<BeIncidentSubcategory | "">(UNSET);
-  const [contactType, setContactType] = useState<BeIncidentContactType | "">(UNSET);
+  // "Channel" in the UI; sent as the wire field `contactType` (see CHANNEL_OPTIONS).
+  const [channel, setChannel] = useState<BeIncidentContactType | "">(UNSET);
   const [impact, setImpact] = useState<BeIncidentImpact | "">(UNSET);
   const [urgency, setUrgency] = useState<BeIncidentUrgency | "">(UNSET);
   const [callerId, setCallerId] = useState("");
   const [serviceId, setServiceId] = useState("");
   const [serviceOfferingId, setServiceOfferingId] = useState("");
   const [configurationItemId, setConfigurationItemId] = useState("");
-  // Derived from the selected Service's ServiceNow `support_group` — not
-  // independently pickable. `assignmentGroupId` is what's actually submitted
-  // (unchanged shape); `derivedAssignmentGroup` only carries the name for
-  // display in the read-only field below.
-  const [assignmentGroupId, setAssignmentGroupId] = useState("");
+  // The backend sets the assignment group from the selected Service's
+  // support group — the create payload has no assignmentGroupId. This only
+  // shows the user which group that will be, in the read-only field below.
   const [derivedAssignmentGroup, setDerivedAssignmentGroup] = useState<BeEntityRef | null>(
     null,
   );
@@ -205,8 +204,11 @@ export default function CreateIncidentPage(): JSX.Element {
 
   const isShortDescriptionValid = shortDescription.trim().length > 0;
   const isCategoryValid = !!category;
-  const isSubcategoryValid = !!subcategory;
-  const isContactTypeValid = !!contactType;
+  // Subcategory is optional: entity-service (validateCreateIncidentRequest),
+  // the portal backend (validateCreateIncidentBody) and the incident table
+  // (nullable subcategory_id) all accept an incident with none, so it's only
+  // sent when one was picked.
+  const isChannelValid = !!channel;
   const isImpactValid = !!impact;
   const isUrgencyValid = !!urgency;
   // Not part of the spec's own field list, but the backend hard-requires
@@ -218,8 +220,7 @@ export default function CreateIncidentPage(): JSX.Element {
   const canSubmit =
     isShortDescriptionValid &&
     isCategoryValid &&
-    isSubcategoryValid &&
-    isContactTypeValid &&
+    isChannelValid &&
     isImpactValid &&
     isUrgencyValid &&
     isCallerValid &&
@@ -231,8 +232,7 @@ export default function CreateIncidentPage(): JSX.Element {
       setTouched({
         shortDescription: true,
         category: true,
-        subcategory: true,
-        contactType: true,
+        channel: true,
         impact: true,
         urgency: true,
         callerId: true,
@@ -244,19 +244,18 @@ export default function CreateIncidentPage(): JSX.Element {
     const payload: BeCreateIncidentPayload = {
       subject: shortDescription.trim(),
       category: category as BeIncidentCategory,
-      subcategory: subcategory as BeIncidentSubcategory,
       serviceId,
-      contactType: contactType as BeIncidentContactType,
+      contactType: channel as BeIncidentContactType,
       impact: impact as BeIncidentImpact,
       urgency: urgency as BeIncidentUrgency,
       callerId,
     };
     // No dedicated "description" field on the backend — the closest
     // equivalent is the customer-visible additionalComments journal field.
+    if (subcategory) payload.subcategory = subcategory;
     if (description.trim()) payload.additionalComments = description.trim();
     if (serviceOfferingId) payload.serviceOfferingId = serviceOfferingId;
     if (configurationItemId) payload.configurationItemId = configurationItemId;
-    if (assignmentGroupId) payload.assignmentGroupId = assignmentGroupId;
     if (assignedEngineerId) payload.assignedEngineerId = assignedEngineerId;
     if (watchList.length > 0) payload.watchList = watchList;
     if (workNotes.trim()) payload.workNotes = workNotes.trim();
@@ -408,7 +407,6 @@ export default function CreateIncidentPage(): JSX.Element {
                 (v) => setSubcategory(v as BeIncidentSubcategory | ""),
                 subcategoryOptions,
                 {
-                  required: true,
                   disabled: !category,
                   helperText: category ? undefined : "Pick a category first.",
                 },
@@ -416,11 +414,11 @@ export default function CreateIncidentPage(): JSX.Element {
             </Box>
             <Box sx={{ flex: "1 1 220px" }}>
               {renderSelect(
-                "contactType",
-                "Contact type",
-                contactType,
-                (v) => setContactType(v as BeIncidentContactType | ""),
-                CONTACT_TYPE_OPTIONS,
+                "channel",
+                "Channel",
+                channel,
+                (v) => setChannel(v as BeIncidentContactType | ""),
+                CHANNEL_OPTIONS,
                 { required: true },
               )}
             </Box>
@@ -514,9 +512,8 @@ export default function CreateIncidentPage(): JSX.Element {
                   // A service offering only makes sense under its own
                   // service — drop it rather than leave a stale pairing.
                   setServiceOfferingId("");
-                  // Assignment group is derived from the service, not
-                  // independently pickable — see the read-only field below.
-                  setAssignmentGroupId(service?.supportGroup?.id ?? "");
+                  // Preview only: the backend sets the group from the
+                  // service — see the read-only field below.
                   setDerivedAssignmentGroup(service?.supportGroup ?? null);
                 }}
                 disabled={postIncident.isPending}
@@ -541,8 +538,8 @@ export default function CreateIncidentPage(): JSX.Element {
                 }}
                 helperText={
                   serviceId && !derivedAssignmentGroup
-                    ? "No support group set for this service in ServiceNow."
-                    : "Derived from the selected Service."
+                    ? "This service has no support group, so the incident will be unassigned."
+                    : "Set from the selected Service when the incident is created."
                 }
               />
             </Box>

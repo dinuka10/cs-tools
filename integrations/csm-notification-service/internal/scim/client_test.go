@@ -181,3 +181,83 @@ func TestEnsureExternalUser_RejectsEmptyEmail(t *testing.T) {
 		t.Error("upstream should not have been called for an empty email")
 	}
 }
+
+// MobileNumber searches the internal organization by userName for the phone
+// numbers only, and returns the one typed "mobile" -- the number the CSM
+// Portal profile stores.
+func TestMobileNumber_ReturnsTheMobileNumber(t *testing.T) {
+	var gotBody map[string]any
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/organizations/internal/users/search" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_ = json.NewEncoder(w).Encode(map[string]any{"Resources": []any{map[string]any{
+			"phoneNumbers": []any{
+				map[string]any{"type": "work", "value": "+94110000000"},
+				map[string]any{"type": "mobile", "value": " +94770000001 "},
+			},
+		}}})
+	}))
+	defer apiSrv.Close()
+	tokenSrv := newTokenServer(t)
+	defer tokenSrv.Close()
+
+	got, err := newTestClient(t, tokenSrv, apiSrv).MobileNumber(context.Background(), "jane@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "+94770000001" {
+		t.Errorf("MobileNumber = %q, want the mobile one, trimmed", got)
+	}
+	if gotBody["filter"] != "userName eq jane@example.com" {
+		t.Errorf("filter = %v", gotBody["filter"])
+	}
+	if attrs, _ := gotBody["attributes"].([]any); len(attrs) != 1 || attrs[0] != "phoneNumbers" {
+		t.Errorf("attributes = %v, want only phoneNumbers", gotBody["attributes"])
+	}
+}
+
+func TestMobileNumber_NoUserOrNoMobileIsEmpty(t *testing.T) {
+	for name, body := range map[string]any{
+		"no user":   map[string]any{"Resources": []any{}},
+		"no mobile": map[string]any{"Resources": []any{map[string]any{"phoneNumbers": []any{map[string]any{"type": "work", "value": "+94110000000"}}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(body)
+			}))
+			defer apiSrv.Close()
+			tokenSrv := newTokenServer(t)
+			defer tokenSrv.Close()
+			got, err := newTestClient(t, tokenSrv, apiSrv).MobileNumber(context.Background(), "jane@example.com")
+			if err != nil || got != "" {
+				t.Errorf("MobileNumber = %q, %v; want \"\", nil", got, err)
+			}
+		})
+	}
+}
+
+func TestMobileNumber_RejectsAFilterBreakingAddress(t *testing.T) {
+	c := NewClient(Config{BaseURL: "http://unused.invalid"})
+	if _, err := c.MobileNumber(context.Background(), `jane@example.com" or userName sw "`); err == nil {
+		t.Error("an address carrying a quote must not reach the filter")
+	}
+	if _, err := c.MobileNumber(context.Background(), "  "); err == nil {
+		t.Error("an empty address must be refused")
+	}
+}
+
+func TestMobileNumber_UpstreamErrorIsReturned(t *testing.T) {
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer apiSrv.Close()
+	tokenSrv := newTokenServer(t)
+	defer tokenSrv.Close()
+	_, err := newTestClient(t, tokenSrv, apiSrv).MobileNumber(context.Background(), "jane@example.com")
+	var apiErr *apierror.Error
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusForbidden {
+		t.Errorf("err = %v, want an *apierror.Error carrying 403", err)
+	}
+}

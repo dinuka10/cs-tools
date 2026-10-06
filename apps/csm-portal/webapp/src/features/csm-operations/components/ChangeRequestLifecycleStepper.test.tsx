@@ -89,4 +89,48 @@ describe("ChangeRequestLifecycleStepper", () => {
     expect(screen.queryByText(/current state:/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/diverted from the standard path/i)).not.toBeInTheDocument();
   });
+
+  it("highlights Customer Approval as the current step when the CR is in customer_approval", () => {
+    render(
+      <ChangeRequestLifecycleStepper
+        state="customer_approval"
+        customerApprovalRequired
+        customerReviewRequired={false}
+      />,
+    );
+    const current = document.querySelector('[aria-current="step"]');
+    expect(current).not.toBeNull();
+    expect(current).toHaveTextContent("Customer Approval");
+  });
+
+  it("leaves the optional customer steps off the line when their flags are false", () => {
+    render(
+      <ChangeRequestLifecycleStepper
+        state="scheduled"
+        customerApprovalRequired={false}
+        customerReviewRequired={false}
+      />,
+    );
+    expect(screen.getAllByRole("listitem")).toHaveLength(7);
+    expect(screen.queryByText("Customer Approval")).not.toBeInTheDocument();
+    expect(screen.queryByText("Customer Review")).not.toBeInTheDocument();
+  });
+
+  it("keeps each optional customer step only when its own flag is on", () => {
+    render(
+      <ChangeRequestLifecycleStepper
+        state="implement"
+        customerApprovalRequired
+        customerReviewRequired={false}
+      />,
+    );
+    expect(screen.getAllByRole("listitem")).toHaveLength(8);
+    expect(screen.getByText("Customer Approval")).toBeInTheDocument();
+    expect(screen.queryByText("Customer Review")).not.toBeInTheDocument();
+  });
+
+  it("keeps a customer step the CR is currently in even if its flag reads false", () => {
+    render(<ChangeRequestLifecycleStepper state="customer_review" customerReviewRequired={false} />);
+    expect(document.querySelector('[aria-current="step"]')).toHaveTextContent("Customer Review");
+  });
 });

@@ -247,7 +247,7 @@ func insertWorkItemExtension(
 		_, err := tx.Exec(ctx, `
 			INSERT INTO change_request (id, start_on, end_on, impact, state, priority, category,
 				risk, requested_by_user_id, approval, justification, change_request_type,
-				is_customer_approved, is_customer_reviewed)
+				is_customer_approval_required, is_customer_review_required)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 			ON CONFLICT (id) DO NOTHING`,
 			id, startOn, endOn, impact, state, priority, category, risk, requestedBy, approval,

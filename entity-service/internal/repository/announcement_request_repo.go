@@ -193,37 +193,46 @@ func (r *announcementRequestRepo) Get(ctx context.Context, id string) (domain.An
 
 // Search implements AnnouncementRequestRepository.
 func (r *announcementRequestRepo) Search(ctx context.Context, req domain.SearchAnnouncementRequestsRequest) ([]domain.AnnouncementRequest, int, error) {
-	// state and created_by are both optional filters; NULL::text on the
+	// state, states and created_by are all optional filters; NULL on the
 	// unused side of each OR makes an unset filter match every row without
-	// needing to build the WHERE clause dynamically. readyForScheduledPublish
-	// works the same way via NOT $3::boolean: when false the whole OR branch
-	// is unconditionally true (no extra restriction), when true it requires
-	// state = 'approved' and a scheduled_on that has already arrived — the
-	// one query operations/csm-scheduled-tasks' publish_scheduled_announcements
+	// needing to build the WHERE clause dynamically. states is a text[]
+	// (nil when the caller sent none -- pgx encodes a nil slice as NULL, so an
+	// empty list means "no state filter," never "match nothing"). The
+	// service layer rejects state and states together, so at most one of
+	// $1/$4 is ever set. readyForScheduledPublish works the same way via NOT
+	// $3::boolean: when false the whole OR branch is unconditionally true (no
+	// extra restriction), when true it requires state = 'approved' and a
+	// scheduled_on that has already arrived -- the one query
+	// operations/csm-scheduled-tasks' publish_scheduled_announcements
 	// sub-cron needs (the service layer validates this is never combined
-	// with an explicit State).
+	// with an explicit State or States).
 	const where = `WHERE ($1::text IS NULL OR state = $1)
 		AND ($2::text IS NULL OR created_by = $2)
-		AND (NOT $3::boolean OR (state = 'approved' AND scheduled_on IS NOT NULL AND scheduled_on <= NOW()))`
+		AND (NOT $3::boolean OR (state = 'approved' AND scheduled_on IS NOT NULL AND scheduled_on <= NOW()))
+		AND ($4::text[] IS NULL OR state = ANY($4::text[]))`
 	countQuery := `SELECT COUNT(*) FROM announcement_requests ` + where
 	dataQuery := `SELECT ` + announcementRequestColumns + ` FROM announcement_requests ` + where + `
 		ORDER BY created_on DESC, id
-		LIMIT $4 OFFSET $5`
+		LIMIT $5 OFFSET $6`
 
 	var state *string
 	if req.State != nil {
 		s := string(*req.State)
 		state = &s
 	}
+	var states []string
+	for _, st := range req.States {
+		states = append(states, string(st))
+	}
 
 	var total int
 	var requests []domain.AnnouncementRequest
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		return r.db.QueryRow(egCtx, countQuery, state, req.CreatedBy, req.ReadyForScheduledPublish).Scan(&total)
+		return r.db.QueryRow(egCtx, countQuery, state, req.CreatedBy, req.ReadyForScheduledPublish, states).Scan(&total)
 	})
 	eg.Go(func() error {
-		rows, err := r.db.Query(egCtx, dataQuery, state, req.CreatedBy, req.ReadyForScheduledPublish, req.Pagination.Limit, req.Pagination.Offset)
+		rows, err := r.db.Query(egCtx, dataQuery, state, req.CreatedBy, req.ReadyForScheduledPublish, states, req.Pagination.Limit, req.Pagination.Offset)
 		if err != nil {
 			return err
 		}

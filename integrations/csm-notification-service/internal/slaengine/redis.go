@@ -18,143 +18,274 @@ package slaengine
 
 import (
 	"context"
-	"errors"
 	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-// tierKeyPrefix namespaces this engine's cursor keys — one plain string key
-// per (caseID, clockType) pair, value = the highest tier (0/50/75/100) this
-// engine has already alerted for (or seeded as a baseline — see Engine.
-// processStatus in engine.go). Replaces the old wake-index ZSET design: with
-// no due date of our own to schedule against anymore (see client.go's
-// package doc comment for why), there's nothing to schedule — only a
-// per-clock "have we already alerted for this" cursor to remember between
-// polls. This cursor alone is only a hint for which tiers to check next —
-// see tierClaimKeyPrefix below for what actually guards a tier from being
-// alerted twice.
-const tierKeyPrefix = "sla:tier:"
+// wakeKey is the single Redis sorted-set key this engine uses as its
+// scheduling index: member = "<caseId>|<clockType>|<tier>", score = the Unix
+// timestamp that member becomes due at. One key for the whole engine (not
+// one per case) — the ZRANGE ... BYSCORE query below scans the whole set in
+// one round trip per tick regardless of how many clocks are registered.
+// Ported from the pre-poll design's own WakeIndex (see this package's own
+// CLAUDE.md section for the history) — ClockMeta/the alerted-tier cursor
+// below are new, replacing that design's entity-service-backed durable
+// clock row.
+const wakeKey = "sla:wake"
+
+// clockKeyPrefix namespaces one HASH per (caseID, clockType) pair, holding
+// everything this engine needs to know about that clock: the Chat card's
+// own display fields (set once at RegisterClocks, read back unchanged at
+// alert time — there is no live entity-service lookup to refresh them from
+// any more), the paused flag ApplyStateEffects toggles, and the
+// alertedTier cursor Tick/CompleteResponseClock/ApplyStateEffects advance.
+const clockKeyPrefix = "sla:clock:"
+
+// clockTTL bounds how long a clock's hash survives with no further write
+// touching it. This engine has no explicit "case closed for good, delete
+// everything" signal of its own (ApplyStateEffects' CLOSED branch still
+// writes a completion, which refreshes this same TTL) — a generous TTL,
+// refreshed on every touch, lets a long-finished case's hash expire on its
+// own rather than accumulating forever, the same reasoning the removed
+// poll design's own tierTTL gave for its cursor keys.
+const clockTTL = 90 * 24 * time.Hour
 
 // tierClaimKeyPrefix namespaces one key per (caseID, clockType, tier) —
 // claimed via ClaimTier's Redis SETNX before Engine.alertTier ever runs, so
 // that if this service is ever deployed with more than one replica, only
-// the replica that wins the SETNX race sends that tier's alert; a losing
-// replica's ClaimTier call simply returns claimed=false and moves on.
-// Mirrors the old sla_clocks design's own atomicity guarantee — there, the
-// same role was played by entity-service's `UPDATE ... WHERE ... IS NULL`
-// on a durable clock row — translated to Redis now that there's no such row
-// to claim against. The plain cursor above alone is NOT enough for this:
-// reading it and later writing it back are two separate round trips, and
-// two replicas can both read the same stale value in between.
+// the replica that wins the SETNX race sends that tier's alert. Ported
+// unchanged from the removed poll design's own TierStore — the reasoning
+// is identical: two replicas racing on the same due wake member must not
+// both alert.
 const tierClaimKeyPrefix = "sla:tier-claimed:"
 
-// emailClaimKeyPrefix namespaces one key per (caseID, clockType, tier) —
-// claimed via ClaimEmail's own Redis SETNX, independently of
-// tierClaimKeyPrefix above. Engine.alertTier attempts the breach emails
-// regardless of whether the Chat alert itself succeeded (a Chat outage must
-// not also suppress email — see that function's own doc comment), but a
-// Chat failure still causes processStatus to release the tier claim and
-// retry the whole tier on the next Tick; without a separate claim here,
-// that retry would resend an already-attempted email every time Chat kept
-// failing. Claimed once per tier regardless of the email send's own
-// outcome (mirrors sendBreachEmails' own best-effort, not-retried
-// contract) — only Chat failures are ever retried by this mechanism.
-const emailClaimKeyPrefix = "sla:email-claimed:"
+// ClockMeta is one (caseID, clockType) clock's full Redis-held state —
+// RegisterClocks writes CaseNumber..StartedAt once; Paused/AlertedTier are
+// mutated by ApplyStateEffects/CompleteResponseClock/Tick afterward.
+type ClockMeta struct {
+	CaseNumber string
+	WSO2CaseID string
+	CaseTitle  string
+	CaseType   string
+	Product    string
+	Team       string
+	Priority   string
+	// State is the case's own display-label status (e.g. "Work In
+	// Progress"), refreshed by ApplyStateEffects on every case.status_changed
+	// — "" until the first status change, since case.created carries no
+	// status field of its own (a brand-new case is always freshly Open).
+	State     string
+	StartedAt time.Time
+	Paused    bool
+	// AlertedTier is the highest tier (0/50/75/100) already alerted for, OR
+	// force-completed via CompleteResponseClock/ApplyStateEffects' CLOSED
+	// branch — Tick drops a due wake member outright once its own tier is
+	// at or below this value, the same "already handled, don't re-alert"
+	// cursor the removed poll design's own TierStore kept, just stored
+	// alongside the clock's own metadata instead of as a separate key.
+	AlertedTier int
+}
 
-// tierTTL bounds how long a clock's cursor survives with no further Tick
-// touching it — entity-service's GET /sla-status only ever returns
-// currently-active clocks, so a clock that completes/closes simply stops
-// appearing and this engine has no explicit "clock finished" signal to react
-// to. A generous TTL (refreshed on every Tick that still sees the clock —
-// see setTier's caller) lets a stale cursor for a long-finished case expire
-// on its own rather than accumulating in Redis forever; it comfortably
-// outlives any realistic case lifetime, so it never fires while a clock is
-// still genuinely active.
-const tierTTL = 90 * 24 * time.Hour
-
-// TierStore wraps the small set of Redis operations this engine needs —
-// first Redis dependency in this repo (see this package's own CLAUDE.md
-// section) — local for now (REDIS_ADDR), Azure Cache for Redis later via
-// the same protocol/client, only a connection-string/TLS change.
-type TierStore struct {
+// Store wraps every Redis operation this engine needs — first Redis
+// dependency in this repo (see this package's own CLAUDE.md section),
+// local for now (REDIS_ADDR), Azure Cache for Redis later via the same
+// protocol/client, only a connection-string/TLS change.
+type Store struct {
 	rdb *redis.Client
 }
 
-// NewTierStore constructs a TierStore. Connecting is lazy — go-redis dials
-// on first use, not here — so a wrong addr only surfaces as an error from
-// the first call below, matching every other lazy-connect client in this
-// repo (e.g. eventbus.NewProducer).
-func NewTierStore(rdb *redis.Client) *TierStore {
-	return &TierStore{rdb: rdb}
+// NewStore constructs a Store. Connecting is lazy — go-redis dials on first
+// use, not here — so a wrong addr only surfaces as an error from the first
+// call below, matching every other lazy-connect client in this repo (e.g.
+// eventbus.NewProducer).
+func NewStore(rdb *redis.Client) *Store {
+	return &Store{rdb: rdb}
 }
 
-func tierKey(caseID, clockType string) string {
-	return tierKeyPrefix + caseID + "|" + clockType
+func clockKey(caseID, clockType string) string {
+	return clockKeyPrefix + caseID + "|" + clockType
 }
 
 func tierClaimKey(caseID, clockType string, tier int) string {
 	return tierClaimKeyPrefix + caseID + "|" + clockType + "|" + strconv.Itoa(tier)
 }
 
-func emailClaimKey(caseID, clockType string, tier int) string {
-	return emailClaimKeyPrefix + caseID + "|" + clockType + "|" + strconv.Itoa(tier)
+// AddWake schedules member to become due at at.
+func (s *Store) AddWake(ctx context.Context, member string, at time.Time) error {
+	return s.rdb.ZAdd(ctx, wakeKey, redis.Z{Score: float64(at.Unix()), Member: member}).Err()
 }
 
-// GetTier returns the last tier recorded for (caseID, clockType), and
-// whether a cursor exists at all — found=false means this engine has never
-// seen this clock before (or its cursor expired), which Engine.processStatus
-// treats as "seed a baseline, don't alert" rather than "alert for
-// everything up to its current tier."
-func (s *TierStore) GetTier(ctx context.Context, caseID, clockType string) (tier int, found bool, err error) {
-	val, err := s.rdb.Get(ctx, tierKey(caseID, clockType)).Result()
-	if errors.Is(err, redis.Nil) {
-		return 0, false, nil
-	}
-	if err != nil {
-		return 0, false, err
-	}
-	tier, err = strconv.Atoi(val)
-	if err != nil {
-		return 0, false, err
-	}
-	return tier, true, nil
+// RemoveWake drops member from the index — Tick's processDueMember calls
+// this exactly once per member it examines, regardless of outcome (alerted,
+// already handled, paused, or malformed): see that function's own doc
+// comment for why a member must never be left to be re-examined on every
+// future tick forever once its due time has passed.
+func (s *Store) RemoveWake(ctx context.Context, member string) error {
+	return s.rdb.ZRem(ctx, wakeKey, member).Err()
 }
 
-// SetTier records tier as the last tier reached for (caseID, clockType),
-// refreshing tierTTL. Called both to seed/reseed a baseline (no alert sent)
-// and to record a tier this call just alerted for.
-func (s *TierStore) SetTier(ctx context.Context, caseID, clockType string, tier int) error {
-	return s.rdb.Set(ctx, tierKey(caseID, clockType), strconv.Itoa(tier), tierTTL).Err()
+// DueMembers returns every member whose score (epoch seconds) is <= now.
+func (s *Store) DueMembers(ctx context.Context, now time.Time) ([]string, error) {
+	return s.rdb.ZRangeArgs(ctx, redis.ZRangeArgs{
+		Key:     wakeKey,
+		Start:   0,
+		Stop:    now.Unix(),
+		ByScore: true,
+	}).Result()
+}
+
+// setClockScript always (re)writes the registration-time display fields
+// (safe to refresh on every call -- they're one-time facts from
+// case.created, never mutated by any later event), but only ever
+// INITIALIZES state/paused/alertedTier via HSETNX, never overwrites them.
+//
+// This matters because RegisterClocks -- and therefore SetClock -- is not
+// actually called exactly once per case: dispatch.handleCaseCreated's own
+// email/Chat reactions can fail and retry the whole record, and a
+// dead-lettered record gets a fresh retry pass on the DLQ consumer under
+// the exact same case.created payload (see recordBaseKey's own doc
+// comment in internal/dispatch) -- both redeliver the identical
+// case.created event to RegisterClocks again, potentially long after
+// ApplyStateEffects/CompleteResponseClock have already paused or
+// force-completed this clock in response to later events. A plain HSET of
+// every field on that replay would silently reset alertedTier back to 0
+// and paused back to false -- re-arming wake entries for a clock that was
+// already genuinely finished, and firing a false breach alert the next
+// time Tick finds one of them due.
+var setClockScript = redis.NewScript(`
+redis.call('HSET', KEYS[1],
+	'caseNumber', ARGV[1], 'wso2CaseId', ARGV[2], 'caseTitle', ARGV[3],
+	'caseType', ARGV[4], 'product', ARGV[5], 'team', ARGV[6], 'priority', ARGV[7],
+	'startedAt', ARGV[8])
+redis.call('HSETNX', KEYS[1], 'state', ARGV[9])
+redis.call('HSETNX', KEYS[1], 'paused', '0')
+redis.call('HSETNX', KEYS[1], 'alertedTier', '0')
+redis.call('EXPIRE', KEYS[1], ARGV[10])
+return 1
+`)
+
+// SetClock writes a clock's display-field set, initializing
+// state/paused/alertedTier only the first time this (caseID, clockType)
+// pair is ever seen -- see setClockScript's own doc comment for why a
+// later call (a retry/replay of the same case.created event) must never
+// reset them.
+func (s *Store) SetClock(ctx context.Context, caseID, clockType string, meta ClockMeta) error {
+	key := clockKey(caseID, clockType)
+	return setClockScript.Run(ctx, s.rdb, []string{key},
+		meta.CaseNumber, meta.WSO2CaseID, meta.CaseTitle, meta.CaseType,
+		meta.Product, meta.Team, meta.Priority, meta.StartedAt.Unix(),
+		meta.State, int(clockTTL.Seconds()),
+	).Err()
+}
+
+// GetClock reads one clock's full state back. found=false means this
+// engine has no record of this (caseID, clockType) pair at all — either it
+// was never registered (e.g. a case that already existed before this
+// feature deployed — see RegisterClocks' own doc comment on backfill), or
+// its hash expired.
+func (s *Store) GetClock(ctx context.Context, caseID, clockType string) (meta ClockMeta, found bool, err error) {
+	res, err := s.rdb.HGetAll(ctx, clockKey(caseID, clockType)).Result()
+	if err != nil {
+		return ClockMeta{}, false, err
+	}
+	if len(res) == 0 {
+		return ClockMeta{}, false, nil
+	}
+	meta = ClockMeta{
+		CaseNumber: res["caseNumber"],
+		WSO2CaseID: res["wso2CaseId"],
+		CaseTitle:  res["caseTitle"],
+		CaseType:   res["caseType"],
+		Product:    res["product"],
+		Team:       res["team"],
+		Priority:   res["priority"],
+		State:      res["state"],
+		Paused:     res["paused"] == "1",
+	}
+	if v, err := strconv.ParseInt(res["startedAt"], 10, 64); err == nil {
+		meta.StartedAt = time.Unix(v, 0)
+	}
+	if v, err := strconv.Atoi(res["alertedTier"]); err == nil {
+		meta.AlertedTier = v
+	}
+	return meta, true, nil
+}
+
+// SetPaused toggles one clock's paused flag — ApplyStateEffects' only write
+// for the AWAITING_INFO/SOLUTION_PROPOSED/resume branches. A no-op (HSET
+// creates a near-empty hash) against a clock this engine never registered —
+// harmless, since without a RegisterClocks call there is also no wake entry
+// for Tick to ever examine against it.
+func (s *Store) SetPaused(ctx context.Context, caseID, clockType string, paused bool) error {
+	key := clockKey(caseID, clockType)
+	if err := s.rdb.HSet(ctx, key, "paused", boolString(paused)).Err(); err != nil {
+		return err
+	}
+	return s.rdb.Expire(ctx, key, clockTTL).Err()
+}
+
+// SetState refreshes one clock's own display State field — called from
+// ApplyStateEffects on every case.status_changed, so a breach alert fired
+// later shows the case's current status, not a stale "" from registration.
+func (s *Store) SetState(ctx context.Context, caseID, clockType, state string) error {
+	key := clockKey(caseID, clockType)
+	if err := s.rdb.HSet(ctx, key, "state", state).Err(); err != nil {
+		return err
+	}
+	return s.rdb.Expire(ctx, key, clockTTL).Err()
+}
+
+// advanceAlertedTierScript atomically sets a clock hash's alertedTier field
+// to ARGV[1] only if it is currently absent or lower than ARGV[1] — never
+// moving it backward. Mirrors the removed poll design's own TierStore
+// advanceTierScript exactly, just against a hash field instead of a plain
+// string key — see that script's own doc comment (preserved in git
+// history) for the full concurrency reasoning: two callers (a Tick claim
+// and CompleteResponseClock/ApplyStateEffects' CLOSED branch, say) must
+// never let whichever writes second silently move the cursor backward.
+var advanceAlertedTierScript = redis.NewScript(`
+local current = redis.call('HGET', KEYS[1], 'alertedTier')
+local candidate = tonumber(ARGV[1])
+if (not current) or (candidate > tonumber(current)) then
+	redis.call('HSET', KEYS[1], 'alertedTier', ARGV[1])
+end
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1
+`)
+
+// AdvanceAlertedTier atomically records tier as the highest tier
+// alerted/completed for (caseID, clockType) — but only if the currently
+// stored value is absent or lower. Used both by Tick (right after a
+// successful alert) and by CompleteResponseClock/ApplyStateEffects' CLOSED
+// branch (passing 100 to force-complete every tier at once, matching the
+// removed pre-poll design's "mark all three tiers reached" semantics for an
+// early completion).
+func (s *Store) AdvanceAlertedTier(ctx context.Context, caseID, clockType string, tier int) error {
+	return advanceAlertedTierScript.Run(ctx, s.rdb, []string{clockKey(caseID, clockType)}, tier, int(clockTTL.Seconds())).Err()
 }
 
 // ClaimTier atomically claims (caseID, clockType, tier) via Redis SETNX —
 // claimed=true means this call is the one that just claimed it and should
 // go on to alert; claimed=false means some other call (a concurrent
-// replica, or an earlier attempt on this same replica) already holds the
-// claim, and this call must not alert again. See tierClaimKeyPrefix's own
-// doc comment for why this exists separately from the plain cursor above.
-func (s *TierStore) ClaimTier(ctx context.Context, caseID, clockType string, tier int) (claimed bool, err error) {
-	return s.rdb.SetNX(ctx, tierClaimKey(caseID, clockType, tier), 1, tierTTL).Result()
+// replica, or an earlier attempt) already holds the claim.
+func (s *Store) ClaimTier(ctx context.Context, caseID, clockType string, tier int) (claimed bool, err error) {
+	return s.rdb.SetNX(ctx, tierClaimKey(caseID, clockType, tier), 1, clockTTL).Result()
 }
 
 // ReleaseTier gives back a claim made by ClaimTier — called when a claimed
-// tier's alert fails to send (so a later tick, on this replica or another,
-// can retry it instead of losing it for good), and when a tier regression
-// (see Engine.processStatus) invalidates a claim from a now-superseded
-// cycle.
-func (s *TierStore) ReleaseTier(ctx context.Context, caseID, clockType string, tier int) error {
+// tier's alert fails to send (the Kafka publish specifically — see
+// Engine.alertTier's own doc comment for why a Chat-send failure doesn't
+// trigger this), so a later tick can retry it instead of losing it for
+// good.
+func (s *Store) ReleaseTier(ctx context.Context, caseID, clockType string, tier int) error {
 	return s.rdb.Del(ctx, tierClaimKey(caseID, clockType, tier)).Err()
 }
 
-// ClaimEmail atomically claims (caseID, clockType, tier) for the breach
-// email step via Redis SETNX — claimed=true means this call is the first
-// to attempt the email for this tier and should go on to send it;
-// claimed=false means a previous call (on this replica or another) already
-// attempted it, regardless of whether that attempt succeeded. See
-// emailClaimKeyPrefix's own doc comment for why this is a separate claim
-// from ClaimTier above, and why there is no corresponding ReleaseEmail.
-func (s *TierStore) ClaimEmail(ctx context.Context, caseID, clockType string, tier int) (claimed bool, err error) {
-	return s.rdb.SetNX(ctx, emailClaimKey(caseID, clockType, tier), 1, tierTTL).Result()
+func boolString(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }

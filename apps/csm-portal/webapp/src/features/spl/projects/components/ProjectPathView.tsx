@@ -35,7 +35,7 @@ export default function ProjectPathView({
         component="button"
         underline="hover"
         color="inherit"
-        onClick={() => navigate("/spl/cases")}
+        onClick={() => navigate("/cases")}
         sx={{ display: "flex", alignItems: "center", gap: 0.5 }}
       >
         <HomeIcon size={16} /> Home

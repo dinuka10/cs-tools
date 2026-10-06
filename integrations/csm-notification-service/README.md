@@ -84,6 +84,15 @@ Copy `.env.example` to `.env` and fill in the values:
 |---|---|
 | `GOOGLE_CHAT_SPACES` | JSON array of `{"audience","webhookUrl"}` objects, one per Google Chat space — the only Google Chat routing mechanism this service has. `audience` is either a real CRE team name (exact, case-sensitive match — see entity-service's `"group".name`) or one of the standing audiences `"Incident Monitor"`/`"Onboarding"`/`"Americas"`/`"Evaluation"`. `case.created`/`case.acknowledged`/`case.severity_changed` always route to the fixed `"Incident Monitor"` audience; SLA breach alerts resolve a real per-team/onboarding/time-of-day audience (see `internal/chataudience`). Optional — left unset or malformed, Google Chat alerts are unavailable but startup and every other endpoint work normally. An audience with no configured space is skipped (logged), not an error |
 
+### Frustration detection (`case.comment_added`)
+
+`dispatch.checkFrustration` sends a new, customer-authored case comment to the existing `ai-escalate-comment-detector` service for an OpenAI-backed frustration analysis, and — when it crosses that service's own configured threshold — posts a Chat alert through `GOOGLE_CHAT_SPACES` above, routed the same way an SLA breach alert is (team-first, falling back to `"Incident Monitor"`). Authenticates with the shared `OAUTH2_*` credentials above, not its own — only `ESCALATION_DETECTOR_BASE_URL`/`ESCALATION_DETECTOR_SCOPES` are specific to this client.
+
+| Variable | Description |
+|---|---|
+| `ESCALATION_DETECTOR_BASE_URL` | Base URL of the `ai-escalate-comment-detector` service (optional). Unset means a customer comment is never sent for analysis and no frustration Chat alert is ever sent — nothing else in this service is affected |
+| `ESCALATION_DETECTOR_SCOPES` | Comma-separated OAuth2 scopes for the escalation detector (optional) — authenticates with the shared `OAUTH2_CLIENT_ID`/`OAUTH2_CLIENT_SECRET`/`OAUTH2_TOKEN_URL` above, not its own credentials |
+
 ### SMS and call notification channels (Twilio)
 
 | Variable | Description |
@@ -104,7 +113,7 @@ Backs `internal/recipientlinks`'s per-recipient role lookup (`POST /users/search
 
 | Variable | Description |
 |---|---|
-| `OAUTH2_CLIENT_ID` | Shared OAuth2 client ID, used by the email channel and the customer entity service client (optional) |
+| `OAUTH2_CLIENT_ID` | Shared OAuth2 client ID, used by the email channel, the customer entity service client, and the escalation detector client (optional) |
 | `OAUTH2_CLIENT_SECRET` | Shared OAuth2 client secret (optional) |
 | `OAUTH2_TOKEN_URL` | Shared OAuth2 token endpoint (optional) |
 | `CUSTOMER_ENTITY_BASE_URL` | Base URL of this repo's entity-service (optional, see above) |
@@ -171,20 +180,20 @@ Required — a record that exhausts the main consumer's retries is published her
 
 ### SLA breach-alerting engine
 
-Optional, gated on `REDIS_URL` or `REDIS_ADDR` — unset (both) means `internal/slaengine` never polls. Not a Kafka consumer: on a plain ticker, it polls entity-service's `GET /sla-status` (backed by the real, ServiceNow-synced `sla` table, not a value this service computes itself), diffs each clock's live elapsed percentage against the last tier it alerted for (a small cursor per `(caseId, clockType)` kept in Redis), and — on a genuinely new 50%/75%/100% crossing since its last poll — publishes `sla.tier_reached` and sends a Google Chat breach alert directly (not routed through `internal/dispatch`). The first time this engine ever sees a given clock, it seeds the cursor at that clock's *current* tier without alerting — avoiding an alert flood from every SLA clock already in progress the moment this engine starts polling; only a tier crossed on a later poll is a genuine new crossing. Replaces an earlier design that registered a durable clock per case on a now-removed entity-service `sla_clocks` table (a stand-in built before the real `sla` table existed) and scheduled Redis wake-ups off a locally-computed due date — see entity-service's own `CLAUDE.md` ("SLA status") for the full history. Pausing/resuming a clock never needs a signal from this service either: ServiceNow's own SLA engine freezes `businessElapsedPercent` while paused, so a paused clock's tier simply doesn't advance until it resumes.
+Optional, gated on `REDIS_URL` or `REDIS_ADDR` — unset (both) means `internal/slaengine` never starts. Not a Kafka consumer of its own: `RegisterClocks`/`ApplyStateEffects`/`CompleteResponseClock` are called directly from three of `dispatch.Dispatcher`'s own handlers (`case.created`/`case.status_changed`/`case.comment_added`) on the existing main consumer — only the tick itself runs on its own ticker, scanning a Redis wake-index this engine computes and schedules entirely on its own (every clock's due dates, display fields, paused flag and alerted-tier cursor all live in Redis — see `internal/slaengine`'s own `CLAUDE.md` section). On a genuinely new 50%/75%/100% crossing it publishes `sla.tier_reached` and sends a Google Chat breach alert directly (not routed through `internal/dispatch`). Durations come from `GET /sla-duration-policy` — a small, static reference table, fetched once at startup, independent of the ServiceNow-synced `sla`/`sla_policy` tables an earlier design here polled in bulk every tick (that endpoint's own query turned out to be too slow at real data volumes — reliably timing out — which is what this redesign replaces). Pausing/resuming/completing a clock is driven entirely by the same three events, not a live lookup: `case.status_changed`'s `Awaiting Info`/`Solution Proposed`/`Closed` pause or complete `workaround`/`resolution`, and a qualifying support-engineer reply (`case.comment_added`'s own `isSupportEngineerResponse`, computed by entity-service) completes `response` early.
 
 `REDIS_URL` (a `rediss://:<password>@<host>:<port>` connection string, parsed with `redis.ParseURL`) is how a managed, TLS-only Redis is configured — Azure Managed Redis, Azure Cache for Redis — since the `rediss` scheme makes go-redis dial with TLS automatically; takes priority over `REDIS_ADDR`/`REDIS_PASSWORD` when set. `REDIS_ADDR`/`REDIS_PASSWORD` remain the plain, non-TLS pair for a local Redis.
 
 The client is a plain `redis.NewClient` — it only supports a non-clustered Redis (a real standalone instance, or a managed Redis under a non-clustered/"Enterprise" clustering policy, where the provider's own proxy hides the sharding). It does **not** support "OSS Cluster" policy, which needs a cluster-aware client to follow `MOVED`/`ASK` redirects. Confirm the target resource's clustering policy before pointing `REDIS_URL` at it.
 
-This engine's own narrow entity-service client talks to the same entity-service as `CUSTOMER_ENTITY_BASE_URL`/`CUSTOMER_ENTITY_SCOPES` (see [Customer entity service](#customer-entity-service) above) — not a different backend — so it reuses those same two variables, plus the shared `OAUTH2_*` credentials (all required once `REDIS_URL` or `REDIS_ADDR` is set), rather than a redundant `SLA_ENTITY_*` pair.
+This engine's own narrow entity-service client talks to the same entity-service as `CUSTOMER_ENTITY_BASE_URL`/`CUSTOMER_ENTITY_SCOPES` (see [Customer entity service](#customer-entity-service) above) — not a different backend — so it reuses those same two variables, plus the shared `OAUTH2_*` credentials (all required once `REDIS_URL` or `REDIS_ADDR` is set), rather than a redundant `SLA_ENTITY_*` pair. Unlike the design this replaced, this client is called exactly once, at startup, to fetch `GET /sla-duration-policy` — never on a recurring poll.
 
 | Variable | Description |
 |---|---|
 | `REDIS_URL` | `rediss://:<url-encoded-password>@<host>:<port>` connection string for a TLS Redis (Azure Managed Redis/Azure Cache for Redis). Percent-encode the password if it contains `+`, `/`, or `=`. Takes priority over `REDIS_ADDR`/`REDIS_PASSWORD` |
 | `REDIS_ADDR` | Redis address for a plain, non-TLS Redis, e.g. `localhost:6379`. Ignored when `REDIS_URL` is set. Unset (with `REDIS_URL` also unset) disables this whole engine |
 | `REDIS_PASSWORD` | Optional — empty for a local Redis with no auth. Ignored when `REDIS_URL` is set |
-| `SLA_TICK_INTERVAL` | How often this engine polls `GET /sla-status` and diffs tiers. Optional — defaults to `5m`. Most active SLA clocks don't change more than a few times a day, so a short interval mostly just adds load without meaningfully lowering alert latency |
+| `SLA_TICK_INTERVAL` | How often this engine scans its own Redis wake-index for a newly-due tier. Optional — defaults to `5m`. A shorter interval mostly just adds load on Redis for no real benefit, since most clocks have hours between tiers |
 
 ### Server
 
@@ -227,9 +236,9 @@ csm-notification-service/
 │   ├── dispatch/
 │   │   └── dispatch.go          # Dispatcher.Handle — envelope → validate → resolve links → group → template → EmailClient; handleProjectContactInvited (SCIM → invitation → step ledger)
 │   └── slaengine/
-│       ├── client.go            # EntityClient — narrow HTTP client for entity-service's GET /sla-status
-│       ├── redis.go             # TierStore — last-alerted-tier cursor per (caseId, clockType)
-│       └── engine.go            # Engine.Tick/RunTicker — poll, diff tiers, alert on new crossings
+│       ├── client.go            # EntityClient — fetches GET /sla-duration-policy once, at startup
+│       ├── redis.go             # Store — wake-index ZSET + per-clock metadata/paused/alerted-tier hash
+│       └── engine.go            # RegisterClocks/ApplyStateEffects/CompleteResponseClock + Tick/RunTicker
 ├── .env                         # Local config (git-ignored)
 └── go.mod
 ```
@@ -242,6 +251,66 @@ go run ./cmd/server/main.go
 ```
 
 The server auto-loads `.env` from the working directory at startup (silently ignored if absent).
+
+`cmd/server` needs a real Event Hub: `internal/eventbus` dials its broker with
+TLS and SASL/PLAIN unconditionally (correct for Azure Event Hub, impractical
+against a laptop broker), and `EVENT_HUB_BROKER`/`EVENT_HUB_CONNECTION_STRING`/
+`EVENT_HUB_TOPIC`/`EVENT_HUB_DLQ_TOPIC` are all `mustEnv`. Point them at the dev
+namespace to run the whole service; there is no local-broker mode.
+
+## Testing the incident call escalation
+
+### Testing a ladder against the local Team Schedule
+
+`scripts/csm-compose/trigger-sre-escalation.sh` runs the real engine against the
+local stack's rota and shows who each rung reaches. By default nothing leaves the
+machine: it runs on the `log` channel, which prints who each rung would reach
+and contacts nobody, so no Chat space, webhook or Twilio account is needed.
+
+```bash
+scripts/csm-compose/trigger-sre-escalation.sh                         # apollo (SRE), HIGH, logged
+scripts/csm-compose/trigger-sre-escalation.sh -p all -m 200ms         # every priority, fast
+scripts/csm-compose/trigger-sre-escalation.sh -t castor -p P0 -l both # a CRE P0: both ladders
+scripts/csm-compose/trigger-sre-escalation.sh -c 3 -o chat            # post to the space instead
+```
+
+An SRE team climbs the SRE ladder, the same clock for every priority, so
+`-p all` on one shows five identical plans; a CRE team's clock is set by the
+priority. A P0 on a CRE team climbs both ladders; `-l both` runs the CRE
+one and then the SRE one, so each can be read on its own (`-l sre` alone, on a
+CRE team below P0, schedules nothing -- that is the rule). `-o chat` needs
+`GOOGLE_CHAT_SPACES` (exported, or in the `.env` `ESCALATION_ENV_FILE` points
+at) and masks names on the cards; the default log shows real names, since it
+stays on the terminal. It needs entity-service, mock-oidc and Redis up, and runs
+the repo's gateway shim in front of entity-service for the run, because
+entity-service reads the caller from `x-jwt-assertion`, which only the Choreo
+gateway adds. The local seed rosters SRE engineers on L1 and L2 only, so L3
+reports NO_RECIPIENTS. `-h` lists every option.
+
+### Running the full service against it
+
+To exercise the Kafka hop and `cmd/server` itself, point the service at the dev
+Event Hub namespace with `REDIS_ADDR=localhost:6379` and an
+`INCIDENT_ESCALATION_ROSTER`, then create a real incident through
+entity-service's `POST /incidents` and raise its priority with a `PATCH`. That
+is the only path that covers the publisher, the topic and the consumer group
+together. Note `CUSTOMER_ENTITY_BASE_URL` is optional: without it the engine
+still runs a full ladder and logs its execution summary instead of writing it
+back to the incident.
+
+Also unset `INCIDENT_DEFAULT_CALL_TO` while testing, or every incident gets
+`dispatch`'s own single immediate call as well as the ladder — the service warns
+at startup when both are live.
+
+### Redis-backed store tests
+
+`internal/paging/store_test.go` covers the ladder store against a real
+Redis and skips when none is reachable, so `go test ./...` stays dependency-free:
+
+```bash
+docker run --rm -p 6379:6379 redis
+go test ./internal/paging/ -run TestStore -v
+```
 
 ## Commands
 

@@ -45,11 +45,14 @@ type TargetConfig = {
 
 const TARGET_CONFIG: Record<string, TargetConfig> = {
   assess: { color: "primary", icon: <Send size={16} /> },
-  scheduled: { color: "primary", icon: <CalendarClock size={16} /> },
+  // Only ever rendered from `customer_approval` ("Record customer approval").
+  scheduled: { color: "primary", icon: <UserCheck size={16} /> },
   implement: { color: "primary", icon: <Play size={16} /> },
   review: { color: "primary", icon: <CheckCircle size={16} /> },
   customer_review: { color: "primary", icon: <UserCheck size={16} /> },
   closed: { color: "primary", icon: <CheckCircle size={16} /> },
+  // Only ever rendered from `customer_approval` ("Re-schedule").
+  authorize: { color: "primary", icon: <CalendarClock size={16} /> },
   rollback: { color: "error", icon: <Undo2 size={16} /> },
   canceled: { color: "error", icon: <Ban size={16} /> },
 };
@@ -78,6 +81,7 @@ const DEFAULT_TARGET_CONFIG: TargetConfig = {
  */
 const FORWARD_ORDER: readonly string[] = [
   "assess",
+  // Reachable only from `customer_approval` (see `isOfferedTarget`).
   "scheduled",
   "implement",
   "review",
@@ -85,18 +89,28 @@ const FORWARD_ORDER: readonly string[] = [
   "closed",
 ];
 
+/**
+ * Actions shown as an outlined (secondary) button beside the primary one
+ * rather than inside the overflow menu: `authorize` is "Re-schedule", the
+ * non-destructive loop back from `customer_approval` (see `isOfferedTarget`).
+ */
+const SECONDARY_ORDER: readonly string[] = ["authorize"];
+
 /** Menu ordering: forward moves first, destructive off-ramps last. */
-const MENU_ORDER: readonly string[] = [...FORWARD_ORDER, "rollback", "canceled"];
+const MENU_ORDER: readonly string[] = [
+  ...FORWARD_ORDER,
+  ...SECONDARY_ORDER,
+  "rollback",
+  "canceled",
+];
 
 /**
  * States this bar never offers, no matter what `legalNextStates` contains.
  *
  * Do not delete this filter because "the list doesn't include them anyway".
- * `rollback`/`customer_approval`: neither state is human-enterable in the
- * backing system — of its 38 UI actions on the change-request table, none
- * sets either one. Both are reached only by automation — rollback is written
- * by the workflow that handles a rejected review, customer approval by the
- * approval process itself. Setting either by hand from here would leave a
+ * `customer_approval`: not human-enterable in the backing system — of its 38
+ * UI actions on the change-request table, none sets it. It is reached only by
+ * the approval process itself. Setting it by hand from here would leave a
  * record sitting in an approval state with no approver record behind it,
  * which is an audit hole rather than a shortcut.
  *
@@ -109,12 +123,53 @@ const MENU_ORDER: readonly string[] = [...FORWARD_ORDER, "rollback", "canceled"]
  * Offering it as a directly-clickable button/menu item from here would let
  * someone skip the actual approval process entirely and land the record in
  * Authorize with no approval behind it — the same audit hole as above, by a
- * different route.
+ * different route. The one exception is the same shape as `scheduled`: from
+ * `customer_approval` it means "Re-schedule" (the planned time changed, so the
+ * change goes back through internal approval -- more approval, not less), and
+ * the page collects the new planned window before sending it.
  *
- * The exclusion is deliberately unconditional so a future backend change that
- * starts returning any of these cannot silently reopen it.
+ * `scheduled` is the same shape as `authorize`: a CR is moved to Scheduled
+ * automatically the moment its approval is granted (CAB/ECAB, or Standard's
+ * Request Approval) -- or, when the CR requires customer approval, it first
+ * waits in `customer_approval`. There is no manual "Schedule" action anywhere,
+ * with exactly one exception: leaving `customer_approval`, where
+ * `scheduled` *is* the way the customer's approval is recorded
+ * ("Record customer approval", `PATCH {state:"scheduled"}`). So `scheduled` is
+ * filtered out unless the CR's current state is `customer_approval` -- see
+ * `isOfferedTarget`.
+ *
+ * `rollback` is the failed-review off-ramp of the process diagram: a human
+ * action ("Roll back"), but only from the two review states, `review` and
+ * `customer_review` (the backend offers and accepts it from nowhere else).
+ * It is a destructive, menu-only item that requires a stated reason. It used
+ * to be excluded here as "automation-only"; the backend now owns the manual
+ * transition. The carve-out is still keyed on the record's own state.
+ *
+ * The exclusions are deliberately unconditional (the `scheduled` and
+ * `rollback` carve-outs are keyed on the record's own state, never on what
+ * `legalNextStates` claims) so a future backend change that starts returning
+ * any of these cannot silently reopen them.
  */
-const NEVER_OFFERED_TARGETS: readonly string[] = ["rollback", "customer_approval", "authorize"];
+const NEVER_OFFERED_TARGETS: readonly string[] = ["customer_approval"];
+
+/** States a change request can be manually rolled back from. */
+const ROLLBACK_FROM_STATES: readonly string[] = ["review", "customer_review"];
+
+/**
+ * `scheduled` ("Record customer approval") and `authorize` ("Re-schedule") are
+ * manual actions only from `customer_approval`; `rollback` only from the two
+ * review states. Everywhere else they are not offered.
+ */
+function isOfferedTarget(target: string, currentState: string | null | undefined): boolean {
+  if (!target || target === currentState) return false;
+  if (target === "scheduled" || target === "authorize") {
+    return currentState === "customer_approval";
+  }
+  if (target === "rollback") {
+    return !!currentState && ROLLBACK_FROM_STATES.includes(currentState);
+  }
+  return !NEVER_OFFERED_TARGETS.includes(target);
+}
 
 /** Sort key for a target: curated order first, uncurated states after. */
 function menuRank(target: string): number {
@@ -132,7 +187,7 @@ function menuRank(target: string): number {
  * target: the same situation (legal transition, unmet prerequisite) can
  * apply to any target.
  *
- * `assess` requires `assignedTeam` — by explicit product decision, confirmed
+ * `assess` ("Request Approval") requires `assignedTeam` — by explicit product decision, confirmed
  * compulsory: the assigned team's own members are what populate the Assess
  * stage's approvers the moment the transition lands (see
  * `PatchChangeRequest`'s own doc comment in `change_request_repo.go`), so
@@ -150,7 +205,7 @@ const TARGET_BLOCKED_REASON: Record<
   (cr: BeChangeRequestDetail) => string | null
 > = {
   assess: (cr) =>
-    cr.assignedTeam ? null : "Set an assigned team before moving to Assess",
+    cr.assignedTeam ? null : "Set an assigned team before requesting approval",
 };
 
 interface ChangeRequestActionBarProps {
@@ -176,7 +231,8 @@ interface ChangeRequestActionBarProps {
  * caller may not transition).
  *
  * Exactly one target — the first forward move present, by `FORWARD_ORDER` —
- * gets a primary button; everything else sits behind a "Change state"
+ * gets a primary button; "Re-schedule" (only from `customer_approval`) is an
+ * outlined button beside it; everything else sits behind a "Change state"
  * overflow menu. The header this sits in already carries Back, Clone and
  * Edit, so a row of eight buttons would bury the one action the engineer
  * actually wants.
@@ -193,15 +249,14 @@ export default function ChangeRequestActionBar({
   // `DEFAULT_TARGET_CONFIG` alike.
   const targets = Array.from(
     new Set(
-      (cr.legalNextStates ?? []).filter(
-        (s) => !!s && s !== cr.state && !NEVER_OFFERED_TARGETS.includes(s),
-      ),
+      (cr.legalNextStates ?? []).filter((s) => isOfferedTarget(s, cr.state)),
     ),
   ).sort((a, b) => menuRank(a) - menuRank(b));
   if (targets.length === 0) return null;
 
   const primaryTarget = targets.find((t) => FORWARD_ORDER.includes(t));
-  const menuTargets = targets.filter((t) => t !== primaryTarget);
+  const secondaryTargets = targets.filter((t) => SECONDARY_ORDER.includes(t));
+  const menuTargets = targets.filter((t) => t !== primaryTarget && !SECONDARY_ORDER.includes(t));
 
   const dispatch = (target: string): void => {
     setStateMenuAnchor(null);
@@ -216,7 +271,7 @@ export default function ChangeRequestActionBar({
 
   const renderPrimary = (target: string): JSX.Element => {
     const { color, icon } = configFor(target);
-    const label = changeRequestTransitionLabel(target);
+    const label = changeRequestTransitionLabel(target, cr.state);
     const reason = blockedReason(target);
     if (reason) {
       return (
@@ -262,6 +317,23 @@ export default function ChangeRequestActionBar({
   return (
     <Box sx={{ display: "flex", gap: 1, flexShrink: 0 }}>
       {primaryTarget && renderPrimary(primaryTarget)}
+      {secondaryTargets.map((target) => {
+        const { color, icon } = configFor(target);
+        return (
+          <Button
+            key={target}
+            size="small"
+            variant="outlined"
+            color={color}
+            startIcon={icon}
+            disabled={isPending}
+            onClick={() => dispatch(target)}
+            sx={{ flexShrink: 0 }}
+          >
+            {changeRequestTransitionLabel(target, cr.state)}
+          </Button>
+        );
+      })}
       {menuTargets.length > 0 && (
         <>
           <Button
@@ -289,7 +361,7 @@ export default function ChangeRequestActionBar({
           >
             {menuTargets.map((target) => {
               const { color, icon } = configFor(target);
-              const label = changeRequestTransitionLabel(target);
+              const label = changeRequestTransitionLabel(target, cr.state);
               const reason = blockedReason(target);
               const destructive = isDestructiveChangeRequestTransition(target);
               return (

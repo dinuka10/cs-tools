@@ -28,27 +28,37 @@ import type {
 } from "@features/csm-announcements/types/announcementRequests";
 
 /**
- * Backs the registry page's "Pending" tab — `POST /announcement-requests/search`
- * filtered to the not-yet-published states, so `published` requests (already
- * visible as real cases in the "Announcements" tab) don't show twice. Passing
- * `state` narrows to one specific state instead (e.g. a future "my drafts"
- * view); omit it to show every state.
+ * Backs the registry page's "Requests" tab -- `POST /announcement-requests/search`
+ * narrowed to the given states (any-of, merged into one paginated list). An
+ * empty list means every state.
+ *
+ * Exactly one state is sent as the older single `state` field rather than a
+ * one-element `states` list: both mean the same thing to the service, but
+ * entity-service rejects unknown request fields outright, so this keeps the
+ * default single-state view working even if the webapp is ever rolled out
+ * ahead of an entity-service that doesn't know `states` yet. Only a genuine
+ * multi-state selection depends on the newer field.
  */
 export function useSearchAnnouncementRequests(
-  state: AnnouncementRequestState | undefined,
+  states: AnnouncementRequestState[],
   page: number,
   pageSize: number,
 ): UseQueryResult<SearchAnnouncementRequestsResponse, Error> {
   const api = useBackendApi();
   const offset = page * pageSize;
+  // Selection order is irrelevant to the result, so sort + dedupe for a
+  // stable cache key and request body: re-toggling the same set of states in
+  // a different order must hit the same cache entry, not refetch.
+  const normalizedStates = [...new Set(states)].sort();
 
   return useQuery<SearchAnnouncementRequestsResponse, Error>({
-    queryKey: [ApiQueryKeys.ANNOUNCEMENT_REQUESTS_SEARCH, state ?? "", page, pageSize],
+    queryKey: [ApiQueryKeys.ANNOUNCEMENT_REQUESTS_SEARCH, normalizedStates.join(","), page, pageSize],
     queryFn: (): Promise<SearchAnnouncementRequestsResponse> =>
       api.post<SearchAnnouncementRequestsPayload, SearchAnnouncementRequestsResponse>(
         "/announcement-requests/search",
         {
-          ...(state && { state }),
+          ...(normalizedStates.length === 1 && { state: normalizedStates[0] }),
+          ...(normalizedStates.length > 1 && { states: normalizedStates }),
           pagination: { offset, limit: pageSize },
         },
       ),

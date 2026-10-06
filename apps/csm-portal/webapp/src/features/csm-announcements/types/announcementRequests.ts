@@ -129,6 +129,8 @@ export interface ScheduleAnnouncementRequestPayload {
 
 export interface SearchAnnouncementRequestsPayload {
   state?: AnnouncementRequestState;
+  /** Any-of match across several states, as one merged paginated list. Mutually exclusive with `state`. */
+  states?: AnnouncementRequestState[];
   createdBy?: string;
   pagination: { offset: number; limit: number };
 }

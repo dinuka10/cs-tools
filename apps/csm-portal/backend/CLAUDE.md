@@ -37,15 +37,19 @@ Go HTTP server (`net/http`, Go 1.26+) that acts as a backend-for-frontend (BFF) 
 Admin-only (`PermAdmin`, see "Access control" above) — the CSM portal's Add User UI is the one
 caller. `UsersHandler.CreateUser` (`internal/handler/users.go`) validates `roles` against
 `Directory.IsValidRole` (the same startup-resolved `CSM_USER_ROLES` allow-list `POST /roles/search`
-serves) before forwarding the request body unchanged to the entity service's own `POST /users` —
-entity-service deliberately does not validate role names itself (see that repo's own `domain.UserRole`
-doc comment), so this is the one place that does. `roles` is optional; the Add User form's "User type"
-selector is the one caller-facing use of it today — it sends exactly one of `["internal"]`/`["external"]`,
-since entity-service derives `user_type` from role membership rather than a plain settable column (see
-that repo's own `recompute_user_type` trigger, migration 0011). There is still no Asgardeo-backed way
-to browse/assign a fuller role set at account-creation time, so nothing beyond that one required choice
-is exposed here. "External" is currently disabled in that selector and rejected server-side if sent
-anyway — see the constraint below.
+serves) before forwarding a rebuilt body (see `buildEntityCreateUserBody`) carrying just
+`firstName`/`lastName`/`email`/`roles` to the entity service's own `POST /users` — entity-service
+deliberately does not validate role names itself (see that repo's own `domain.UserRole` doc comment),
+so this is the one place that does. `roles` is optional; the Add User form's "User type" selector is
+the one caller-facing use of it — it sends exactly one of `["internal"]`/`["external"]`, since
+entity-service derives `user_type` from role membership rather than a plain settable column (see that
+repo's own `recompute_user_type` trigger, migration 0011). "External" is currently disabled in that
+selector and rejected server-side if sent anyway — see the constraint below.
+
+A separate, unrelated field on the same request, `grantRoles`, is the Asgardeo-backed way to also put
+the new user into one or more portal-permission roles (`cs_engineer`, `escalator`, ...) at creation
+time — see "Granting portal roles on user creation" below for the full mechanism. It is validated and
+acted on independently of `roles`/`CSM_USER_ROLES` and never reaches entity-service at all.
 
 **Constraint: an internal-type user must have a `@wso2.com` email.** Found live: the Add User form sent
 no `roles` at all, so every user it created resolved to `user_type = NOT_AVAILABLE` (the trigger's
@@ -80,23 +84,77 @@ syncable mirror that is not guaranteed to agree with Asgardeo's real membership 
 `scim.Client.GetRole` with a configured Asgardeo role id and returns that role's real `users` list
 (`{id, email}` per member), authoritative rather than a potentially-stale mirror.
 
-**`ASGARDEO_ROLE_IDS`** (`internal/directory.ParseAsgardeoRoleIDs`) is a comma-separated
-`roleKey|asgardeoRoleId` list, e.g. `timecard_approver|0bbeea4f-5ada-49ba-8f19-90ae6a116daa` — a
-general role-key → Asgardeo-role-id mapping, not a single-purpose env var, so a second SCIM-backed
-role lookup later is a config row plus a small handler, not a redesign. Parsed once at startup
-(`cmd/server/main.go`, right after `loadDirectory()`) into a plain `map[string]string`; deliberately
-**not** folded into `directory.Directory` itself, since that type's own charter (team registry +
-assignable-role allow-list) is a different, narrower concept than "which roles have a SCIM-backed
-membership lookup wired up" — this is Asgardeo role *ids* for a specific feature, not organisation
-vocabulary every caller needs. No default and no required keys: an unconfigured `timecard_approver`
-entry means `timecardApproverRoleID == ""` in `main.go`, and `GetTimeCardApprovers` itself returns 404
-in that case. **The route is registered unconditionally**, deliberately unlike this file's other
-optionally-wired features (`ENGINEERING_ENTITY_BASE_URL`, the `CSM_MIGRATION_*` flags), which skip
-registration entirely when off: `GET /users/time-card-approvers` collides with the wildcard
-`GET /users/{id}` route, so leaving it unregistered would have the request fall through to `GetUser`,
-which rejects the literal segment `"time-card-approvers"` as an invalid UUID with 400 — a confusing
-status for "this feature isn't configured." Registering it unconditionally and 404ing from inside the
-handler gives a clean, correct status either way.
+**`ASGARDEO_ROLE_IDS`** (`internal/directory.ParseRoleIDs`) is a JSON object string, e.g.
+`{"example-timecard-approver-role":"11111111-1111-1111-1111-111111111111"}` — a general
+real-role-name → role-id mapping, not a single-purpose env var, so a second SCIM-backed role lookup
+later is a config row plus a small handler, not a redesign. **Keyed by the real role name exactly as
+it appears on the token's `roles` claim** (the same strings `AUTH_<ROLE>_ROLES` already lists), not an
+invented portal-role key — `AUTH_<ROLE>_ROLES` can list more than one real name granting the same
+portal permission, and only a real name identifies a specific role an id can actually belong to.
+JSON rather than this package's usual flat `key|value,key|value` form specifically because the key
+here is an opaque, deployment-specific role name that may itself contain punctuation (e.g.
+`example.namespaced-role`) — delimiter-splitting that reliably would need its own escaping, which JSON
+already provides. Parsed once at startup (`cmd/server/main.go`, right after `loadDirectory()`) into a
+plain `map[string]string`; deliberately **not** folded into `directory.Directory` itself, since that
+type's own charter (team registry + assignable-role allow-list) is a different, narrower concept than
+"which roles have a SCIM-backed lookup wired up" — this is role *ids* for a specific feature, not
+organisation vocabulary every caller needs.
+
+`handler.ResolveGrantableRoles(accessCfg, roleIDsByName)` (`internal/handler/grantable_roles.go`) is
+what bridges this real-name-keyed map back to the portal-role vocabulary (`cs_engineer`, `escalator`,
+...): for each portal role, it checks `AccessConfig`'s own configured real name(s) against this map and
+keeps the portal role only if at least one resolves to a known id — the stable `[]handler.GrantableRole{Key,
+RoleID}` list every caller downstream actually works with. No default and no required keys: a real name
+with no entry here just means that role has no SCIM-backed feature wired up in this deployment —
+`timecardApproverRoleIDs` in `main.go` is derived from this same resolved list
+(`handler.RoleIDsForKey(grantableRoles, "timecard_approver")`), not a second, parallel lookup into the
+raw map. It is a slice, not a single id: `AUTH_TIMECARD_APPROVER_ROLES` can list more than one real role
+name, each resolved to its own id, and an approver holding any one of them must still show up — unlike
+granting (`RoleIDForKey`, singular, used by `CreateUser`), which only ever needs one specific role to add
+a new user to, reading membership must not silently miss someone who only holds the second configured
+role. `GetTimeCardApprovers` queries `scim.Client.GetRole` once per configured id and merges the results,
+deduplicated by member id. **`GET /users/time-card-approvers` is registered unconditionally**, deliberately
+unlike this file's other optionally-wired features (`ENGINEERING_ENTITY_BASE_URL`, the `CSM_MIGRATION_*`
+flags), which skip registration entirely when off: it collides with the wildcard `GET /users/{id}` route, so
+leaving it unregistered would have the request fall through to `GetUser`, which rejects the literal
+segment `"time-card-approvers"` as an invalid UUID with 400 — a confusing status for "this feature isn't
+configured." Registering it unconditionally and 404ing from inside the handler (when
+`timecardApproverRoleIDs` is empty) gives a clean, correct status either way.
+
+## Granting portal roles on user creation (`grantRoles`, `GET /roles/grantable`)
+
+`POST /users`' own `roles` field only ever controls entity-service's `user_type` (internal/external) —
+it has no connection to the Asgardeo-backed portal permissions `AUTH_<ROLE>_ROLES` grants
+(`cs_engineer`, `escalator`, ...). Before this, there was no way for the Add User flow to also put a new
+user into one of those roles; an admin had to do it by hand, outside the portal. `createUserRequest`'s
+separate `grantRoles` field (portal role keys, e.g. `["cs_engineer"]`) closes that gap:
+`CreateUser` resolves each key against `UsersHandler.grantableRoles` (set once at startup via
+`WithGrantableRoles`, the same `[]handler.GrantableRole` `ResolveGrantableRoles` produces) up front —
+before anything is created, so an unknown key is a clean 400 — then, once the entity-service user
+exists, calls `scim.Client.AddRoleMembers(ctx, roleID, []string{req.Email})` once per resolved role.
+
+**`grantRoles` never reaches entity-service.** `createUserRequest` is still parsed in full (so
+`grantRoles` can be validated), but the body actually forwarded to entity-service is rebuilt from
+scratch (`buildEntityCreateUserBody`) carrying only `firstName`/`lastName`/`email`/`roles` —
+entity-service's own decoder rejects unknown fields, so the raw request body (which does carry
+`grantRoles`) can't be forwarded unchanged the way most of this handler's other POST/PATCH bodies are.
+Same "rebuild from what was actually validated" precedent `CreateCaseComment`'s own work_note rebuild
+follows in `cases.go`.
+
+**The SCIM grant is best-effort, after the fact.** By the time `AddRoleMembers` runs, the platform user
+already exists — a SCIM failure (an unreachable SCIM service, a role the configured credentials can't
+write to) is logged and does **not** fail the create response, the same posture `ensureUserProvisioned`
+(`cases.go`) takes for the mirror-image direction of this same mechanism (provisioning a platform user
+on demand for a worknote/escalation author who already holds the Asgardeo role but has no platform row
+yet). A failed grant here leaves the user created but without the intended role — recoverable by hand,
+unlike a failed *create*, which leaves nothing to recover.
+
+**`GET /roles/grantable`** (`handler.GrantableRolesHandler`, admin-only — the same `PermAdmin` gate
+`POST /users` itself sits behind) reports just the resolved portal role keys, never the real role
+name/id behind them, so the webapp's Add User dialog can render a checkbox per grantable role without
+ever learning anything about the identity provider's own vocabulary. The webapp maps each key to a
+display label itself (`grantableRoleLabels.ts`) — this backend has no notion of a human-readable role
+name at all.
 
 **A SCIM 401/403 is never passed through to the caller as 401/403.** A failure fetching the role (e.g.
 this backend's own OAuth2 app lacking a roles-read scope on `SCIM_SCOPES` — see the "Operational
@@ -106,6 +164,40 @@ usual 401/403 pass-through would otherwise tell an ordinary `viewer` "you don't 
 is really a deployment misconfiguration. `GetTimeCardApprovers` checks for those two codes specifically
 and reports a sanitized 502 instead; every other SCIM failure status still goes through the normal
 `mapUpstreamErrorGeneric` mapping.
+
+## Provisioning a "user" row on demand (`ensureUserProvisioned`)
+
+A `worknote_creator`- or `escalator`-only caller reaches `POST /cases/{id}/comments`
+(the `!hasFullWrite` branch) or `POST /cases/{id}/escalations` purely on the strength
+of an Asgardeo role grant — unlike the admin-only "Add User" flow above, neither
+`AUTH_WORKNOTE_CREATOR_ROLES` nor `AUTH_ESCALATOR_ROLES` provisions a `"user"` row
+anywhere. Without one, entity-service's own identity resolution for the write
+(`emailFromJWT` → `GetUserByEmail`) fails it outright — a real gap for a caller whose
+only path onto the portal is one of these two narrow roles, since neither is routed
+through the entity-service-backed Salesforce membership ingest or the admin `POST
+/users` flow.
+
+`ensureUserProvisioned` (`internal/handler/ensure_user.go`) closes this: called
+immediately before the entity-service write in both `CreateCaseComment`'s
+worknote-only branch and `CreateCaseEscalation`, it calls `GetUserMe` first and, only
+on a `404` (no row at all — any other failure is logged and treated as best-effort,
+same posture as `caseIsClosed`'s own fail-open guard elsewhere in `cases.go`), creates
+one via `POST /users` using `FirstName`/`LastName`/`Email` straight off the caller's
+own validated token (`middleware.UserInfo`, which now also decodes `given_name`/
+`family_name` — see that struct's own doc comment) and `roles: ["internal"]`. Both
+work-note creation and escalation are internal-staff-only actions by construction
+(their own `AUTH_<ROLE>_ROLES` grants are organisation-internal role names), so
+`"internal"` is never a guess the way `CreateUser`'s admin-facing "User type" selector
+has to make.
+
+**`CreateCaseComment` skips calling this entirely for a caller who already holds full
+`PermWrite`** (`cs_engineer` or `admin`, via the same `hasFullWrite` the
+`PermCreateWorkNote`-narrowing check above already computes) — assumed already
+provisioned, so the overwhelmingly common path (a CS engineer's own work notes/replies)
+pays no extra `GetUserMe` round trip. `CreateCaseEscalation` has no equivalent skip:
+`cs_engineer` never holds `PermEscalate` at all (see `NewAccessGuard`'s own doc
+comment), so every caller who reaches that handler is, by construction, exactly the
+audience this exists for.
 
 ## Security Center access (PermViewSecurityCenter)
 
@@ -175,6 +267,99 @@ just submitted that exact content, so echoing it back leaks nothing new to them.
 This is the server-side half of a two-part fix — `apps/csm-portal/webapp`'s own `denyRawBase64`
 mitigation (added first, still in place) only ever hid the image *after* the bytes had already
 reached the browser; this is what stops them being sent at all to a caller who shouldn't see them.
+
+## Change request create/patch validation (`internal/handler/change_requests.go`)
+
+`POST /change-requests` and `PATCH /change-requests/{id}` forward their JSON body
+to the entity service as-is (no field allow-list), with two checks on top:
+
+* `POST` requires `type` of `standard`, `normal` or `emergency` (`validateChangeRequestCreateType`).
+* Both accept the creation form's two checkboxes, **`customerApprovalRequired`**
+  and **`customerReviewRequired`**, and refuse (400, "… must be a boolean (true
+  or false)") any value that is not a JSON boolean, `null` included
+  (`validateChangeRequestCustomerGateFlags`). Which transitions they enable, and
+  until when they are editable, is the entity service's call — see its CLAUDE.md,
+  "Customer Approval / Customer Review checkboxes". `PATCH` and `POST` echo the entity service's 400 message (`mapUpstreamError`), so its
+  refusals ("customerApprovalRequired can no longer be changed …", "customer
+  review is required …") reach the form verbatim (`POST` does the same, see below).
+* Both shape-check the customer-scope and journal fields
+  (`validateChangeRequestScopeFields`): `projectId` a UUID string; `deploymentIds`,
+  `deploymentProductIds` arrays of UUID strings (at most 100, `null` is not an
+  array); `category`, `comment`, `workNote` strings; on PATCH `comment`/`workNote`
+  not blank. **`customerGroupId` and `environmentIds` are no longer accepted** —
+  any value, `null` included, is refused at the BFF (no upstream call) with the
+  entity service's own 400 text: `customerGroupId is no longer accepted: the
+  customer group is derived from the customer project's registered contacts` /
+  `environmentIds is no longer supported: deployments carry the environment`.
+  Whether the deployments belong to the project, the deployment products match
+  (they are read-only/derived) and the edit window (only before the change reaches
+  `implement`) are the entity service's call — see its CLAUDE.md, "Customer
+  project, deployments and deployment products".
+* **`POST` now echoes the entity service's 400/409 message too** (`mapUpstreamError`,
+  like `PATCH`): the form has to show "deploymentIds contains a deployment that does
+  not belong to the selected project: …". 5xx and unmapped statuses still map to the
+  generic "Failed to create change request." — upstream internals are never echoed.
+* `POST /change-requests/link-options` (`PermViewOperations`) is the form's lookup:
+  `{projectId, deploymentIds?}` → `{deployments:[{id,name,type}],
+  deploymentProducts, customerContacts:[{id,name,email?}]}`. `projectId` is required
+  (400 "projectId is required"). Project search for the picker is the existing
+  `POST /projects/search`; the Customer Group is not searched or picked — it is the
+  project's registered contacts, returned here as `customerContacts` (read-only).
+  The body and the entity response are passed through untouched.
+* The detail response carries `customerApprovalRequired`/`customerReviewRequired`
+  and `legalNextStates` untouched; the webapp renders `legalNextStates` as-is. It also
+  carries `project`, `deployments`, `deploymentProducts`, `customerContacts` (the
+  derived, read-only Customer Group) and `category`.
+* **Customer Group approvals.** The change's customer group (the project's registered
+  contacts) answers Customer Approval / Customer Review through the approvals
+  (`POST /change-requests/{id}/approvals/decision`), with the stages "Customer
+  Approval" / "Customer Review" in `GET .../approvals` (see the entity service's
+  CLAUDE.md, "Customer Group"). While such a stage is live `legalNextStates` for
+  those states is just `["canceled"]` and a manual `{state: "scheduled"}` /
+  `{state: "closed"}` PATCH is a 400 whose message is echoed verbatim. A
+  non-contact's decision is a 403 whose reason is shown (`mapApprovalDecisionError`
+  already surfaces any 403 reason: `only members of the customer group (the
+  registered contacts of this change request's project) can approve or reject …`).
+  The decision route is `PermWrite` (cs_engineer / admin): registered customer
+  contacts cannot reach it through this BFF. A rejected Customer Approval cancels the change, a
+  rejected Customer Review moves it to `rollback`. No BFF code change was needed;
+  `TestCustomerGroupApprovalMessages` pins both messages.
+* **A stale approval is a 409.** A decision on a stage whose state the change has left
+  (a Review approver once the change is in Customer Review / Closed -- the entity
+  service cancels such rows when the change moves on, and refuses a decision on one it
+  missed; see its CLAUDE.md, "An approval is only actionable in its stage's state") comes
+  back as a **409** `this approval is no longer pending: the change request is in
+  Closed, but the Review stage can only be decided while it is in Review`.
+  `mapApprovalDecisionError` passes the entity service's message through for a **409
+  as well as a 403** on the decision endpoint (a 409 with no readable `message`
+  envelope stays the generic 409); every other endpoint keeps the generic mapping.
+  `TestDecideChangeRequestApproval` pins both ("a 409 carrying the entity service's
+  reason shows it", "... without a readable reason stays generic"). `canDecide` is
+  `false` on such a row, so the portal does not offer the buttons in the first place.
+
+## Opening an approval stage's assignment group (`GET /groups/{id}`)
+
+`GET /change-requests/{id}/approvals` now carries `assignmentGroup: {id, name}` on
+each stage (`null` for Customer Approval / Customer Review, whose approvers are the
+project's registered contacts rather than a group); the response is still passed
+through untouched. `GET /groups/{id}` (`GroupHandler.GetGroup`, `PermView` -- the same
+level as `POST /groups/search` and `POST /users/search`, which already expose staff
+names and emails) forwards to the entity service's `GET /groups/{id}` and returns its
+`{id, name, description, email, manager, members: [{id, name, email, userType, role}],
+total}` untouched.
+
+* `id` is a **group** id (the `assignmentGroup.id` from the approvals response), not a
+  team id -- `POST /groups/search` and `GET /teams/{id}/members` are the team registry.
+  It must be a UUID (400 `ErrMsgInvalidUUID` otherwise, no upstream call).
+* **Internal staff only.** The BFF does not widen it: entity-service refuses an
+  external caller with 403 and the BFF returns that as 403 (`mapUpstreamErrorGeneric`);
+  an unknown group is 404, and a group with no members is a 200 with `members: []`.
+* PostgreSQL data source only (entity-service does not register the route otherwise).
+* Declared in `openapi.yaml` (`/groups/{id}`, `GroupDetail`, and
+  `ChangeRequestApprovalGroup` on `ChangeRequestApproval`), so
+  `TestEveryRegisteredRouteIsInOpenAPI` does not list it. Tests: `TestGetGroup`,
+  `TestGetChangeRequestApprovals_PassesAssignmentGroupThrough` (`groups_test.go`) and
+  `TestGetGroupSendsGetToGroupsID` (`internal/entity/customer_client_test.go`).
 
 ## Health endpoints
 

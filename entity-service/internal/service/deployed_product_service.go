@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -161,6 +162,10 @@ func (s *deployedProductService) CreateDeployedProduct(ctx context.Context, req 
 // generator for it, the exact same unresolved problem
 // CreateDeploymentFromServiceNow already solves for deployment.number.
 func (s *deployedProductService) createDeployedProductSNFirst(ctx context.Context, req domain.CreateDeployedProductRequest) (domain.CreateDeployedProductResponse, error) {
+	if err := validateDeployedProductCategory(req.Category); err != nil {
+		return domain.CreateDeployedProductResponse{}, err
+	}
+
 	creator, ok := s.snMirror.(deployedProductSNCreator)
 	if !ok {
 		// Cannot happen with the real constructor (routes.go always passes a
@@ -272,19 +277,50 @@ func validateUpdateDeployedProductRequest(req domain.UpdateDeployedProductReques
 			return err
 		}
 	}
+	if err := validateDeployedProductCategory(req.Category); err != nil {
+		return err
+	}
 
-	hasDetailFields := req.Cores != nil || req.TPS != nil || len(req.Description) > 0 || req.Updates != nil
+	hasDetailFields := req.Cores != nil || req.TPS != nil || len(req.Description) > 0 || req.Updates != nil || req.Category != nil
 	if !hasDetailFields && req.Active == nil {
-		return &apierror.ValidationError{Msg: "at least one of cores, tps, or description must be provided, or active must be set to false"}
+		return &apierror.ValidationError{Msg: "at least one of cores, tps, description, or category must be provided, or active must be set to false"}
 	}
 	if req.Active != nil && *req.Active {
 		return &apierror.ValidationError{Msg: "active can only be set to false"}
 	}
 	if req.Active != nil && hasDetailFields {
-		return &apierror.ValidationError{Msg: "cores, tps, and description must not be provided when deactivating"}
+		return &apierror.ValidationError{Msg: "cores, tps, description, and category must not be provided when deactivating"}
 	}
 	if err := validateProductUpdates(req.Updates); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validDeployedProductCategory is the lower-case vocabulary
+// SearchDeployedProductsRequest.ProductCategories already accepts, matching
+// deployed_product_category_enum (PDP/MS/PS/CL/PC) case-folded. Shared by
+// create and update so a caller can never write a category value no filter
+// in this codebase would ever match.
+var validDeployedProductCategory = map[string]bool{
+	"pdp": true,
+	"ms":  true,
+	"ps":  true,
+	"cl":  true,
+	"pc":  true,
+}
+
+// validateDeployedProductCategory rejects an unrecognized category before it
+// ever reaches ServiceNow (create is SN-first -- see
+// createDeployedProductSNFirst's own doc comment on why a failed SN call
+// here would be worse than catching it first) or the database (which would
+// otherwise reject it as a raw, caller-unfriendly enum-cast error).
+func validateDeployedProductCategory(category *string) error {
+	if category == nil {
+		return nil
+	}
+	if !validDeployedProductCategory[strings.ToLower(*category)] {
+		return &apierror.ValidationError{Msg: "category must be one of pdp, ms, ps, cl, pc"}
 	}
 	return nil
 }

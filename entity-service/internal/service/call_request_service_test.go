@@ -30,15 +30,22 @@ import (
 // unconfigured methods panic if called -- same convention as
 // stubProblemRepo (problem_service_test.go).
 type stubCallRequestRepo struct {
-	createCallRequest     func(ctx context.Context, req domain.CreateCallRequestRequest, callerID, callerEmail string) (domain.CreateCallRequestResponse, error)
-	updateCallRequest     func(ctx context.Context, req domain.UpdateCallRequestRequest, assigneeID *string, callerEmail string) (domain.UpdateCallRequestResponse, error)
-	setCallRequestSNSysID func(ctx context.Context, id, snSysID string) error
-	getCallRequestSNSysID func(ctx context.Context, id string) (*string, error)
+	createCallRequest               func(ctx context.Context, req domain.CreateCallRequestRequest, callerID, callerEmail string) (domain.CreateCallRequestResponse, error)
+	createCallRequestFromServiceNow func(ctx context.Context, req domain.CreateCallRequestRequest, id, createdBy string, createdOn time.Time, callerID string) (domain.CreateCallRequestResponse, error)
+	updateCallRequest               func(ctx context.Context, req domain.UpdateCallRequestRequest, assigneeID *string, callerEmail string) (domain.UpdateCallRequestResponse, error)
+	setCallRequestSNSysID           func(ctx context.Context, id, snSysID string) error
+	getCallRequestSNSysID           func(ctx context.Context, id string) (*string, error)
 }
 
 func (s *stubCallRequestRepo) CreateCallRequest(ctx context.Context, req domain.CreateCallRequestRequest, callerID, callerEmail string) (domain.CreateCallRequestResponse, error) {
 	if s.createCallRequest != nil {
 		return s.createCallRequest(ctx, req, callerID, callerEmail)
+	}
+	panic("not implemented")
+}
+func (s *stubCallRequestRepo) CreateCallRequestFromServiceNow(ctx context.Context, req domain.CreateCallRequestRequest, id, createdBy string, createdOn time.Time, callerID string) (domain.CreateCallRequestResponse, error) {
+	if s.createCallRequestFromServiceNow != nil {
+		return s.createCallRequestFromServiceNow(ctx, req, id, createdBy, createdOn, callerID)
 	}
 	panic("not implemented")
 }
@@ -68,102 +75,107 @@ func (s *stubCallRequestRepo) GetCallRequestSNSysID(ctx context.Context, id stri
 }
 
 // stubMirrorCallRequestService embeds CallRequestService (nil) and overrides
-// only CreateCallRequest -- same convention as stubMirrorProblemService.
+// UpdateCallRequest plus the narrow callRequestSNCreator method
+// createCallRequestSNFirst type-asserts against -- same convention as
+// stubMirrorDeploymentService (deployment_service_test.go). CreateCallRequest
+// itself is deliberately NOT overridden: createCallRequestSNFirst calls
+// createCallRequestSNFirstDetailsFn instead, never the public
+// CreateCallRequest, so leaving it unset (embedded CallRequestService is nil)
+// doubles as an assertion that it's never reached.
 type stubMirrorCallRequestService struct {
 	CallRequestService
-	createCallRequest func(ctx context.Context, req domain.CreateCallRequestRequest) (domain.CreateCallRequestResponse, error)
-	updateCallRequest func(ctx context.Context, req domain.UpdateCallRequestRequest) (domain.UpdateCallRequestResponse, error)
+	createCallRequestSNFirstDetailsFn func(ctx context.Context, req domain.CreateCallRequestRequest) (id, createdBy string, createdOn time.Time, err error)
+	updateCallRequest                 func(ctx context.Context, req domain.UpdateCallRequestRequest) (domain.UpdateCallRequestResponse, error)
 }
 
-func (s *stubMirrorCallRequestService) CreateCallRequest(ctx context.Context, req domain.CreateCallRequestRequest) (domain.CreateCallRequestResponse, error) {
-	return s.createCallRequest(ctx, req)
+func (s *stubMirrorCallRequestService) createCallRequestSNFirstDetails(ctx context.Context, req domain.CreateCallRequestRequest) (id, createdBy string, createdOn time.Time, err error) {
+	if s.createCallRequestSNFirstDetailsFn == nil {
+		panic("stubMirrorCallRequestService: createCallRequestSNFirstDetailsFn not set")
+	}
+	return s.createCallRequestSNFirstDetailsFn(ctx, req)
 }
 
 func (s *stubMirrorCallRequestService) UpdateCallRequest(ctx context.Context, req domain.UpdateCallRequestRequest) (domain.UpdateCallRequestResponse, error) {
 	return s.updateCallRequest(ctx, req)
 }
 
-// TestCallRequestService_CreateCallRequest_MirrorsToServiceNow covers the
-// writeback wiring: on a successful Postgres create, the mirror's
-// CreateCallRequest is dispatched asynchronously and does not block or
-// affect the response, and a mirror failure is recorded to
-// sn_writeback_failures rather than failing the call.
-func TestCallRequestService_CreateCallRequest_MirrorsToServiceNow(t *testing.T) {
+// TestCallRequestService_CreateCallRequest_SNFailureLeavesPostgresUntouched
+// covers the SN-first path's safety property: if ServiceNow never accepts the
+// call request, s.repo.CreateCallRequestFromServiceNow must never be called
+// at all (stubCallRequestRepo panics if it's invoked without being
+// configured, which doubles as the assertion) -- same convention as
+// TestDeploymentService_CreateDeployment_SNFailureLeavesPostgresUntouched.
+func TestCallRequestService_CreateCallRequest_SNFailureLeavesPostgresUntouched(t *testing.T) {
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.CreateCallRequestRequest{CaseID: testUUID, Reason: "r", UTCTimes: []string{"2026-10-01T10:00:00Z"}, DurationMinutes: 30}
 
-	called := make(chan domain.CreateCallRequestRequest, 1)
 	mirror := &stubMirrorCallRequestService{
-		createCallRequest: func(_ context.Context, mirrorReq domain.CreateCallRequestRequest) (domain.CreateCallRequestResponse, error) {
-			called <- mirrorReq
-			return domain.CreateCallRequestResponse{}, nil
+		createCallRequestSNFirstDetailsFn: func(context.Context, domain.CreateCallRequestRequest) (string, string, time.Time, error) {
+			return "", "", time.Time{}, errors.New("sn downstream unreachable")
 		},
 	}
-	repo := &stubCallRequestRepo{
-		createCallRequest: func(_ context.Context, req domain.CreateCallRequestRequest, _, _ string) (domain.CreateCallRequestResponse, error) {
-			var resp domain.CreateCallRequestResponse
-			resp.CallRequest.ID = testUUID
-			return resp, nil
-		},
-	}
-	failures := &recordingSNWritebackFailures{}
-	dispatcher := NewSNWritebackDispatcher(failures)
+	repo := &stubCallRequestRepo{}
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
 	svc := NewCallRequestServiceWithSNWriteback(repo, stubUserRepo{
 		getUserByEmail: func(context.Context, string) (domain.User, error) {
 			return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil
 		},
 	}, dispatcher, mirror)
 
-	if _, err := svc.CreateCallRequest(ctx, req); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	select {
-	case got := <-called:
-		if got.CaseID != req.CaseID || got.Reason != req.Reason {
-			t.Errorf("mirror got %+v, want caseId/reason to match %+v", got, req)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("mirror.CreateCallRequest was never called")
-	}
-	if got := failures.count(); got != 0 {
-		t.Errorf("expected 0 sn_writeback_failures records for a successful mirror, got %d", got)
+	if _, err := svc.CreateCallRequest(ctx, req); err == nil {
+		t.Fatal("expected an error when ServiceNow never accepts the call request")
 	}
 }
 
-// TestCallRequestService_CreateCallRequest_MirrorFailureRecordsWritebackFailure
-// covers the failure half: Postgres already succeeded, so the call must
-// still report success, but the mirror error lands in sn_writeback_failures
-// for manual backfill.
-func TestCallRequestService_CreateCallRequest_MirrorFailureRecordsWritebackFailure(t *testing.T) {
+// TestCallRequestService_CreateCallRequest_SNSuccessCreatesPostgresRowWithMatchingIdentity
+// covers the SN-first path's happy case: the Postgres insert must use
+// EXACTLY the id/createdBy/createdOn ServiceNow returned, plus the resolved
+// caller's own id/email -- not anything generated locally.
+func TestCallRequestService_CreateCallRequest_SNSuccessCreatesPostgresRowWithMatchingIdentity(t *testing.T) {
+	const (
+		snID        = "33333333-3333-3333-3333-333333333333"
+		snCreatedBy = "jane.doe@example.com"
+	)
+	createdOn := time.Date(2026, 9, 25, 12, 0, 0, 0, time.UTC)
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
 	req := domain.CreateCallRequestRequest{CaseID: testUUID, Reason: "r", UTCTimes: []string{"2026-10-01T10:00:00Z"}, DurationMinutes: 30}
 
 	mirror := &stubMirrorCallRequestService{
-		createCallRequest: func(context.Context, domain.CreateCallRequestRequest) (domain.CreateCallRequestResponse, error) {
-			return domain.CreateCallRequestResponse{}, errors.New("sn downstream unreachable")
+		createCallRequestSNFirstDetailsFn: func(context.Context, domain.CreateCallRequestRequest) (string, string, time.Time, error) {
+			return snID, snCreatedBy, createdOn, nil
 		},
 	}
+
+	var gotID, gotCreatedBy, gotCallerID string
+	var gotCreatedOn time.Time
 	repo := &stubCallRequestRepo{
-		createCallRequest: func(context.Context, domain.CreateCallRequestRequest, string, string) (domain.CreateCallRequestResponse, error) {
+		createCallRequestFromServiceNow: func(_ context.Context, _ domain.CreateCallRequestRequest, id, createdBy string, createdOnArg time.Time, callerID string) (domain.CreateCallRequestResponse, error) {
+			gotID, gotCreatedBy, gotCreatedOn, gotCallerID = id, createdBy, createdOnArg, callerID
 			var resp domain.CreateCallRequestResponse
-			resp.CallRequest.ID = testUUID
+			resp.CallRequest.ID = id
+			resp.CallRequest.CreatedBy = createdBy
 			return resp, nil
 		},
 	}
-	failures := &recordingSNWritebackFailures{}
-	dispatcher := NewSNWritebackDispatcher(failures)
+	dispatcher := NewSNWritebackDispatcher(&recordingSNWritebackFailures{})
 	svc := NewCallRequestServiceWithSNWriteback(repo, stubUserRepo{
 		getUserByEmail: func(context.Context, string) (domain.User, error) {
 			return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil
 		},
 	}, dispatcher, mirror)
 
-	if _, err := svc.CreateCallRequest(ctx, req); err != nil {
-		t.Fatalf("expected the Postgres-side success to be reported despite the mirror failure, got %v", err)
+	resp, err := svc.CreateCallRequest(ctx, req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 
-	waitFor(t, func() bool { return failures.count() == 1 })
+	if gotID != snID || gotCreatedBy != snCreatedBy || !gotCreatedOn.Equal(createdOn) || gotCallerID != testUUID {
+		t.Errorf("CreateCallRequestFromServiceNow got (%q, %q, %v, %q), want (%q, %q, %v, %q)",
+			gotID, gotCreatedBy, gotCreatedOn, gotCallerID, snID, snCreatedBy, createdOn, testUUID)
+	}
+	if resp.CallRequest.ID != snID {
+		t.Errorf("response call request id = %q, want %q (the ServiceNow-assigned id)", resp.CallRequest.ID, snID)
+	}
 }
 
 const testUUID = "99999999-0000-4000-8000-000000000001"
@@ -307,60 +319,6 @@ func TestCallRequestService_UpdateRejectsCancellationReason(t *testing.T) {
 // play at once.
 const testSNSysID2 = "88888888-0000-4000-8000-000000000002"
 
-// TestCallRequestService_CreateCallRequest_MirrorSuccessPersistsSNSysID
-// covers the id-mapping half of the CREATE mirror: on success, the
-// ServiceNow-returned id (converted to its raw sys_id form) is persisted
-// back onto the Postgres row via SetCallRequestSNSysID.
-func TestCallRequestService_CreateCallRequest_MirrorSuccessPersistsSNSysID(t *testing.T) {
-	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
-	req := domain.CreateCallRequestRequest{CaseID: testUUID, Reason: "r", UTCTimes: []string{"2026-10-01T10:00:00Z"}, DurationMinutes: 30}
-
-	mirror := &stubMirrorCallRequestService{
-		createCallRequest: func(context.Context, domain.CreateCallRequestRequest) (domain.CreateCallRequestResponse, error) {
-			var resp domain.CreateCallRequestResponse
-			resp.CallRequest.ID = testSNSysID2 // the ServiceNow-side id, sysidToUUID-converted
-			return resp, nil
-		},
-	}
-	type setCall struct{ id, snSysID string }
-	setCalls := make(chan setCall, 1)
-	repo := &stubCallRequestRepo{
-		createCallRequest: func(context.Context, domain.CreateCallRequestRequest, string, string) (domain.CreateCallRequestResponse, error) {
-			var resp domain.CreateCallRequestResponse
-			resp.CallRequest.ID = testUUID // the Postgres-side id
-			return resp, nil
-		},
-		setCallRequestSNSysID: func(_ context.Context, id, snSysID string) error {
-			setCalls <- setCall{id: id, snSysID: snSysID}
-			return nil
-		},
-	}
-	failures := &recordingSNWritebackFailures{}
-	dispatcher := NewSNWritebackDispatcher(failures)
-	svc := NewCallRequestServiceWithSNWriteback(repo, stubUserRepo{
-		getUserByEmail: func(context.Context, string) (domain.User, error) {
-			return domain.User{ID: testUUID, Email: "jane.doe@example.com"}, nil
-		},
-	}, dispatcher, mirror)
-
-	if _, err := svc.CreateCallRequest(ctx, req); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	select {
-	case got := <-setCalls:
-		if got.id != testUUID {
-			t.Errorf("SetCallRequestSNSysID id = %q, want %q (the Postgres row id)", got.id, testUUID)
-		}
-		wantSysID := uuidToSysid(testSNSysID2)
-		if got.snSysID != wantSysID {
-			t.Errorf("SetCallRequestSNSysID snSysID = %q, want %q", got.snSysID, wantSysID)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("SetCallRequestSNSysID was never called")
-	}
-}
-
 // TestCallRequestService_UpdateCallRequest_MirrorsWithStoredSNSysID covers
 // the UPDATE mirror's happy path: when a ServiceNow sys_id is already
 // stored for this call request, the mirror fires against it (converted back
@@ -410,27 +368,28 @@ func TestCallRequestService_UpdateCallRequest_MirrorsWithStoredSNSysID(t *testin
 	}
 }
 
-// TestCallRequestService_UpdateCallRequest_SkipsMirrorWhenNoSNSysIDStored
-// covers the pre-migration-row case: a NULL sn_sys_id (the CREATE mirror
-// never ran, hasn't finished, or failed) must make the UPDATE mirror skip
-// silently -- no mirror call, no sn_writeback_failures record, no error to
-// the caller.
-func TestCallRequestService_UpdateCallRequest_SkipsMirrorWhenNoSNSysIDStored(t *testing.T) {
+// TestCallRequestService_UpdateCallRequest_DerivesSysIDWhenNoneStored covers
+// the new-style row case (CreateCallRequest is now ServiceNow-first -- see
+// callRequestService's own doc comment): a NULL sn_sys_id column no longer
+// means "skip, no mapping yet" -- it means "this row's id already IS the real
+// sys_id" -- so the mirror must fire with mirrorReq.ID derived via
+// sysidToUUID(uuidToSysid(req.ID)), i.e. req.ID unchanged.
+func TestCallRequestService_UpdateCallRequest_DerivesSysIDWhenNoneStored(t *testing.T) {
 	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
-	req := domain.UpdateCallRequestRequest{ID: testUUID, State: domain.CallRequestStateScheduled, MeetingDate: str("2026-10-01T10:00:00Z"), DurationMinutes: num(30)}
+	req := domain.UpdateCallRequestRequest{ID: testUUID, CaseID: testSNSysID2, State: domain.CallRequestStateScheduled, MeetingDate: str("2026-10-01T10:00:00Z"), DurationMinutes: num(30)}
 
 	repo := &stubCallRequestRepo{
 		updateCallRequest: func(context.Context, domain.UpdateCallRequestRequest, *string, string) (domain.UpdateCallRequestResponse, error) {
 			return domain.UpdateCallRequestResponse{}, nil
 		},
 		getCallRequestSNSysID: func(context.Context, string) (*string, error) {
-			return nil, nil // no mapping stored yet
+			return nil, nil // no mapping stored -- a row CreateCallRequest created SN-first
 		},
 	}
-	mirrorCalled := make(chan struct{}, 1)
+	called := make(chan domain.UpdateCallRequestRequest, 1)
 	mirror := &stubMirrorCallRequestService{
-		updateCallRequest: func(context.Context, domain.UpdateCallRequestRequest) (domain.UpdateCallRequestResponse, error) {
-			mirrorCalled <- struct{}{}
+		updateCallRequest: func(_ context.Context, mirrorReq domain.UpdateCallRequestRequest) (domain.UpdateCallRequestResponse, error) {
+			called <- mirrorReq
 			return domain.UpdateCallRequestResponse{}, nil
 		},
 	}
@@ -443,12 +402,17 @@ func TestCallRequestService_UpdateCallRequest_SkipsMirrorWhenNoSNSysIDStored(t *
 	}
 
 	select {
-	case <-mirrorCalled:
-		t.Fatal("mirror.UpdateCallRequest was called despite no ServiceNow mapping being stored")
-	case <-time.After(300 * time.Millisecond):
-		// expected: no mirror call
+	case got := <-called:
+		if got.ID != testUUID {
+			t.Errorf("mirror UpdateCallRequest ID = %q, want %q (derived via uuidToSysid(req.ID) round-tripped back through sysidToUUID)", got.ID, testUUID)
+		}
+		if got.CaseID != "" {
+			t.Errorf("mirror UpdateCallRequest CaseID = %q, want empty (avoid GET-before-write verify)", got.CaseID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.UpdateCallRequest was never called")
 	}
 	if got := failures.count(); got != 0 {
-		t.Errorf("expected 0 sn_writeback_failures records for a deliberate skip, got %d", got)
+		t.Errorf("expected 0 sn_writeback_failures records for a successful mirror, got %d", got)
 	}
 }

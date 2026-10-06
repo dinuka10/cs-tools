@@ -15,55 +15,65 @@
 # under the License.
 
 [poll]
-# Backstop cadence; a ping may reach a standby, so this also bounds worst-case pickup latency.
+# Every replica runs its own poller with no leader election; SELECT ... FOR UPDATE SKIP LOCKED keeps replicas
+# from claiming the same alert, so these settings are per replica. Run more replicas to raise throughput.
+#
+# Backstop cadence; POST /alertz normally wakes the poller sooner.
 interval = "10s"
-# Fingerprint-sharded workers per cycle; same-fingerprint alerts stay serialized to one worker.
+# Fingerprint-sharded fold workers per replica; each holds one data connection while folding, and the main pool is sized to this plus 16.
 concurrency = 128
-# Parallel alert-row reads at the start of each cycle.
-read_concurrency = 64
-# Max alert ids processed per cycle; bounds memory under large bursts.
-max_window = 2000
-# How long a missing alert id may stay missing before this service skips it (loudly logged).
-# Measured per id from when the current leader first saw it missing; every missing id in the
-# window ages at once, so a whole gap is skipped together after one gap_timeout.
-gap_timeout = "10m"
+# Seed rows per claim; siblings sharing a seed's fingerprint can add as many again, and 2 x max_batch alerts can be in flight.
+max_batch = 500
+# How long a claimed but unfinished alert is held before any replica may reclaim it (recovers a crashed replica's work).
+claim_ttl = "2m"
 
-[lease]
-# Elects a single active poller across replicas so containers never send duplicate notifications.
-ttl = "15s"
-# How often the leader renews its lease; must be well under ttl.
-renew_interval = "5s"
-
-[cassandra]
-# Bounds Cassandra's startup connection retry so a transient blip doesn't crash-loop the pod.
+[postgres]
+# Bounds the startup connection retry so a transient blip doesn't crash-loop the pod.
 connect_max_attempts = 5
 connect_base_delay = "2s"
-# Per-connection and per-query timeouts against Cosmos DB for Apache Cassandra.
+# Per-connection and per-query timeouts against Azure Flexible Server PostgreSQL.
 connect_timeout = "10s"
-query_timeout = "10s"
+query_timeout = "5s"
 
 [notify]
-# Bounds retries per downstream target (CSM, Chat webhooks); base delay doubles each attempt.
+# Retries per Chat webhook call; base delay doubles each attempt.
 max_attempts = 3
 retry_base_delay = "200ms"
+# Timeout for each CSM and Chat HTTP call.
 http_timeout = "10s"
-# How often the poller retries incidents whose CSM/Chat notification still hasn't succeeded.
-retry_sweep_interval = "30s"
-# Bounds how many failed CreateIncident attempts before an incident is marked permanently failed.
+# Longest the delivery loop waits when no fold triggers it; bounds CSM/Chat retry latency.
+retry_sweep_interval = "15s"
+# Failed CreateIncident attempts before an incident is given up on.
 max_csm_attempts = 20
-# How long a resolved service-label -> CMDB-service-id mapping is reused before a fresh lookup.
-service_cache_ttl = "15m"
-# Throttles how often a confirmed incident's status is re-checked against CSM during a storm.
-state_check_interval = "1m"
-# Wait before the first RetrySweep-driven CSM retry after a failed attempt.
+# How long a resolved service-label to CMDB-service-id mapping is reused.
+service_cache_ttl = "1h"
+# Least time between CSM status checks for one incident; checks only happen after new alerts arrive.
+state_check_interval = "2m"
+# Wait before the first CSM create retry, also used before retrying a failed note push or Chat post.
 csm_retry_base_delay = "30s"
-# Multiplier growing the wait between successive CSM retries during a prolonged outage.
-csm_retry_multiplier = 3
-# Caps how long the exponential CSM retry wait can grow to.
-csm_retry_max_delay = "1h"
-# Threads every Chat fallback message for the same alert fingerprint into one Google Chat thread, instead of a new top-level message each time the incident recurs.
+# Multiplier growing the wait between successive CSM create retries during an outage.
+csm_retry_multiplier = 2
+# Caps the CSM create retry wait, so a recovered CSM gets the backlog within this long.
+csm_retry_max_delay = "15m"
+# How long CSM gets to confirm a new incident before it is posted to the Chat fallback; "0s" posts on the first CSM failure.
+chat_fallback_delay = "25s"
+# Each incident's Chat fallback card gets its own thread, and Duplicate/OK alerts become one digest reply per delivery pass.
 chat_threading_enabled = true
+# Incidents each replica delivers to CSM/Chat in parallel; each holds one lock connection for its CSM/Chat calls.
+delivery_concurrency = 64
 
 [server]
 # Bounds how long SIGTERM/SIGINT waits for in-flight work before forcing exit.
-shutdown_grace = "15s"
+shutdown_grace = "25s"
+
+[engine]
+# Alerts with the same fingerprint fold into one incident for this long after its first alert (measured on alerts.created_at); the next alert after that opens a new incident.
+dedup_window = "5m"
+
+[retention]
+# How often one replica purges expired rows.
+interval = "1h"
+# How long processed alert rows, and raw webhook bodies in raw_alerts, are kept.
+alerts = "168h"
+# How long an incident with nothing left to deliver is kept after its last alert.
+incidents = "720h"

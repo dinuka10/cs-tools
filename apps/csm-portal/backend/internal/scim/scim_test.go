@@ -18,9 +18,11 @@ package scim
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/wso2-open-operations/cs-tools/apps/csm-portal/backend/internal/apierror"
@@ -111,6 +113,67 @@ func TestClient_GetRole(t *testing.T) {
 		defer srv.Close()
 
 		_, err := testClient(srv).GetRole(context.Background(), "unknown-id")
+		apiErr, ok := err.(*apierror.Error)
+		if !ok {
+			t.Fatalf("err = %v (%T), want *apierror.Error", err, err)
+		}
+		if apiErr.StatusCode != http.StatusNotFound {
+			t.Errorf("StatusCode = %d, want 404", apiErr.StatusCode)
+		}
+	})
+}
+
+func TestClient_AddRoleMembers(t *testing.T) {
+	t.Run("POSTs the internal org's role-members path with the given emails", func(t *testing.T) {
+		var gotMethod, gotPath string
+		var gotBody scimAddRoleMembersRequest
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath = r.Method, r.URL.Path
+			_ = json.NewDecoder(r.Body).Decode(&gotBody)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"addedUsers":["jane.doe@wso2.com"],"failedUsers":[],"addedGroups":[],"failedGroups":[]}`))
+		}))
+		defer srv.Close()
+
+		err := testClient(srv).AddRoleMembers(context.Background(), "11111111-1111-1111-1111-111111111111", []string{"jane.doe@wso2.com"})
+		if err != nil {
+			t.Fatalf("AddRoleMembers: %v", err)
+		}
+		if gotMethod != http.MethodPost {
+			t.Errorf("method = %q, want POST", gotMethod)
+		}
+		if gotPath != "/organizations/internal/roles/11111111-1111-1111-1111-111111111111/users" {
+			t.Errorf("path = %q", gotPath)
+		}
+		if len(gotBody.Emails) != 1 || gotBody.Emails[0] != "jane.doe@wso2.com" {
+			t.Errorf("request body emails = %+v", gotBody.Emails)
+		}
+	})
+
+	t.Run("an email the SCIM service couldn't resolve is reported as an error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"addedUsers":[],"failedUsers":["unknown@wso2.com"],"addedGroups":[],"failedGroups":[]}`))
+		}))
+		defer srv.Close()
+
+		err := testClient(srv).AddRoleMembers(context.Background(), "r-1", []string{"unknown@wso2.com"})
+		if err == nil {
+			t.Fatal("expected an error for a failed email, got nil")
+		}
+		if !strings.Contains(err.Error(), "unknown@wso2.com") {
+			t.Errorf("error %q does not name the failed email", err)
+		}
+	})
+
+	t.Run("propagates a 404 as apierror.Error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"role not found"}`))
+		}))
+		defer srv.Close()
+
+		err := testClient(srv).AddRoleMembers(context.Background(), "unknown-id", []string{"jane.doe@wso2.com"})
 		apiErr, ok := err.(*apierror.Error)
 		if !ok {
 			t.Fatalf("err = %v (%T), want *apierror.Error", err, err)

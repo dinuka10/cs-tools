@@ -33,6 +33,18 @@ type escalationService struct {
 	userRepo repository.UserRepository
 	caseRepo repository.CaseRepository
 	access   AccessService
+	// snWriteback/snMirror back CreateEscalation's best-effort, asynchronous
+	// ServiceNow mirror write under DATA_SOURCE=postgres-servicenow-dual-write
+	// -- both nil in every other mode. Set only via
+	// NewEscalationServiceWithSNWriteback. Unlike call_request/deployment,
+	// there is no id-mapping concern afterward: each escalate/de-escalate is
+	// its own new, read-only-after-creation row (no later "update this
+	// escalation by id" operation exists anywhere in this codebase), so the
+	// mirror is dispatched the same simple way
+	// deploymentService.UpdateDeployment's mirror is, just applied to a
+	// CREATE instead of an UPDATE.
+	snWriteback *SNWritebackDispatcher
+	snMirror    EscalationService
 }
 
 // NewEscalationService constructs an EscalationService backed by Postgres.
@@ -45,6 +57,15 @@ type escalationService struct {
 // nothing upstream checking the caller may act on it at all).
 func NewEscalationService(repo repository.EscalationRepository, userRepo repository.UserRepository, caseRepo repository.CaseRepository, access AccessService) EscalationService {
 	return &escalationService{repo: repo, userRepo: userRepo, caseRepo: caseRepo, access: access}
+}
+
+// NewEscalationServiceWithSNWriteback is NewEscalationService plus the wiring
+// DATA_SOURCE=postgres-servicenow-dual-write needs: CreateEscalation
+// dispatches a best-effort, asynchronous ServiceNow mirror write onto mirror
+// after the Postgres write commits -- see escalationService's own
+// snWriteback/snMirror doc comment.
+func NewEscalationServiceWithSNWriteback(repo repository.EscalationRepository, userRepo repository.UserRepository, caseRepo repository.CaseRepository, access AccessService, dispatcher *SNWritebackDispatcher, mirror EscalationService) EscalationService {
+	return &escalationService{repo: repo, userRepo: userRepo, caseRepo: caseRepo, access: access, snWriteback: dispatcher, snMirror: mirror}
 }
 
 // SearchEscalations implements EscalationService.
@@ -174,6 +195,21 @@ func (s *escalationService) CreateEscalation(ctx context.Context, req domain.Cre
 	escalation, err := s.repo.CreateEscalation(ctx, req.CaseID, action, req.Reason, actor.Email)
 	if err != nil {
 		return domain.CreateEscalationResponse{}, err
+	}
+
+	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
+	// only (snWriteback/snMirror are both nil otherwise -- see
+	// escalationService's own doc comment). Postgres has already committed by
+	// this point. req is forwarded verbatim: snEscalationService.CreateEscalation
+	// does its own CaseID-to-sys_id conversion and action/reason normalization,
+	// so no translation is needed here.
+	if s.snWriteback != nil {
+		s.snWriteback.Dispatch(ctx, "escalation", escalation.ID, "create", req,
+			func(writeCtx context.Context) error {
+				_, err := s.snMirror.CreateEscalation(writeCtx, req)
+				return err
+			},
+		)
 	}
 
 	verb := "escalated"

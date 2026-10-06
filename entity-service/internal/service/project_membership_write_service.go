@@ -84,6 +84,9 @@ type MembershipWriteDeps struct {
 	Invitations InvitationValidator
 	// Admins says whether a customer caller is an account admin; nil refuses every customer.
 	Admins repository.AccountAdminRepository
+	// UserCache may be nil (Redis unconfigured). Otherwise every committed
+	// write drops the affected user's cached profile.
+	UserCache UserCacheInvalidator
 }
 
 type projectMembershipWriteService struct {
@@ -294,6 +297,7 @@ func (s *projectMembershipWriteService) Invite(ctx context.Context, projectID st
 	if err != nil {
 		return domain.ProjectMembership{}, s.handleWriteError(ctx, membershipOpInvite, projectID, email, written, err)
 	}
+	invalidateUser(ctx, s.deps.UserCache, res.UserID, email)
 
 	membership := domain.ProjectMembership{
 		ProjectID:        res.ProjectID,
@@ -479,6 +483,7 @@ func (s *projectMembershipWriteService) UpdateRoles(ctx context.Context, project
 	if err != nil {
 		return domain.ProjectMembership{}, s.handleWriteError(ctx, membershipOpUpdateRoles, projectID, normalized, written, err)
 	}
+	invalidateUser(ctx, s.deps.UserCache, res.UserID, normalized)
 	return domain.ProjectMembership{
 		ProjectID:        res.ProjectID,
 		ProjectContactID: res.ProjectContactID,
@@ -502,7 +507,7 @@ func (s *projectMembershipWriteService) Deactivate(ctx context.Context, projectI
 	}
 
 	var written salesforceWriteRecord
-	_, err = s.deps.Memberships.UpsertWithin(ctx, projectID, normalized, func(ctx context.Context, wc repository.MembershipWriteContext) (domain.SalesforceMembershipUpsert, domain.UpsertOnboardingStepRequest, error) {
+	res, err := s.deps.Memberships.UpsertWithin(ctx, projectID, normalized, func(ctx context.Context, wc repository.MembershipWriteContext) (domain.SalesforceMembershipUpsert, domain.UpsertOnboardingStepRequest, error) {
 		if wc.Existing == nil {
 			return domain.SalesforceMembershipUpsert{}, domain.UpsertOnboardingStepRequest{},
 				&apierror.NotFoundError{Msg: "contact not found on this project"}
@@ -532,6 +537,7 @@ func (s *projectMembershipWriteService) Deactivate(ctx context.Context, projectI
 	if err != nil {
 		return s.handleWriteError(ctx, membershipOpDeactivate, projectID, normalized, written, err)
 	}
+	invalidateUser(ctx, s.deps.UserCache, res.UserID, normalized)
 	return nil
 }
 

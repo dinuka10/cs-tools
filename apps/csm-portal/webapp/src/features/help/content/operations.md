@@ -48,26 +48,32 @@ versa) and stay on this device/browser.
 
 The detail page shows:
 
-- An **overview** card: project, type, linked case, deployment, deployed
-  product, assigned engineer/team, duration, planned start/end, and audit
-  fields.
+- An **overview** card: Customer Project, type, linked case, deployment,
+  deployed product, the selected deployments and their deployment products,
+  the Customer Group, category, assigned engineer/team, duration, planned
+  start/end, and audit fields.
 - Tabs for **Approval**, **Plan**, **Comments**, and **Attachments**.
-  - **Approval** shows the customer-approval/review flags plus a full
-    approval-stage breakdown (e.g. Assess, Authorize, Customer Approval) with
-    each individual approver's status. These flags are read-only in this
-    portal — see below.
+  - **Approval** shows whether the change requires customer approval and
+    customer review, what the customer has confirmed, and a full
+    approval-stage breakdown (Peer Approval, CAB / ECAB Approval, Customer
+    Approval, Customer Review) with each individual approver's status. The
+    Assignment group of each stage is a link: it opens a dialog listing the
+    group's members. What the customer has confirmed is read-only — it is
+    recorded by the approval itself.
   - **Plan** shows the change-review packet: description, justification,
     impact description, rollback plan, test plan, service outage notes, the
     communication plan, the implementation plan, and the affected
     services/components text and rollback duration. Below that, an **SRE
     details** card shows further fields the backing system tracks:
-    priority, category, requested by, customer group, change request type,
-    likelihood, whether the Implementation Plan is visible to customers,
-    when the customer last updated it, work start/end, a git reference (if
-    any), and any linked environments, deployment products, deployments, or
-    labels. Most of these are read-only with no edit control anywhere yet —
-    they're shown for context. "Implementation Plan visible to customers"
-    is the exception: it's editable from Create/Edit (see below).
+    priority, requested by, change request type, likelihood, whether the
+    Implementation Plan is visible to customers, when the customer last
+    updated it, work start/end, a git reference (if any), and any labels. Most
+    of these are read-only with no edit control anywhere yet — they're shown
+    for context. "Implementation Plan visible to customers" is the exception:
+    it's editable from Create/Edit (see below).
+    The **Customer Group** is not picked: it is the change request's customer
+    project's registered contacts (read-only), the people asked at Customer
+    Approval / Customer Review.
   - Planned start and end times you enter when creating or editing a change
     are in your own time zone (the one on your profile, or your browser's if
     none is set) and are stored as UTC, so they mean the same instant to
@@ -83,16 +89,18 @@ From the detail page a CS engineer can:
 - **Approve or reject** a pending approval stage, if the engineer is listed
   as an approver on it: the Approve/Reject buttons only appear on that
   engineer's own pending approval.
-- **Edit** the planned window, assignment group, assigned engineer, requested
-  by, customer group, rollback duration, whether the Implementation Plan is
-  visible to customers, and the implementation/rollback/test/
-  affected-services/affected-components plans, or **Clone** the change request
-  into a new one pre-filled with this one's values (useful for promoting the same
-  change through another environment). The customer-approved/reviewed flags
-  aren't editable here — they reflect an automation-only stage of the
-  change's lifecycle and have no manual UI action in the backing system
-  either. Category is also not editable — the backing change-request form
-  has no real category control either, so this portal doesn't invent one.
+- **Edit** the Customer Project, deployments, category, planned window,
+  assignment group, assigned engineer, requested by, rollback duration,
+  whether the Implementation Plan is visible to customers, the Customer
+  Approval / Customer Review checkboxes (until the step they control has
+  passed), and the implementation/rollback/test/affected-services/
+  affected-components plans, or **Clone** the change request into a new one
+  pre-filled with this one's values (useful for promoting the same change
+  through another environment). The Customer Project, deployments and
+  deployment products can only be changed until implementation starts; the
+  deployment products follow from the chosen deployments and are not picked.
+  What the customer has confirmed isn't editable here — it is recorded by the
+  customer's approval itself.
 - Add comments (public or internal) and upload/download attachments. A comment's own author,
   or an admin, can edit or delete it from the **⋮** menu on that comment — deleting is a soft,
   audited removal (an admin can still read the original text; nobody else can).
@@ -109,7 +117,7 @@ device/browser.
 
 A **Create incident** button (or a case's own **Create incident from case…**
 action) opens a form for Caller, Service, and a classification (category,
-subcategory, contact type, impact, urgency — Priority is computed live from
+subcategory (optional), channel, impact, urgency — Priority is computed live from
 impact × urgency and not itself editable). **Assignment group** is not a
 manual pick here: it's shown read-only, auto-filled from the selected
 Service's ServiceNow support group, and blank with a hint if that service
@@ -121,7 +129,7 @@ The detail page shows:
   created by, and last updated.
 - Tabs for **Activities**, **Details**, **Related**, **Watchers**, and
   **Attachments**.
-  - **Details** covers classification (category, subcategory, contact type,
+  - **Details** covers classification (category, subcategory, channel,
     impact, urgency) and service/configuration-item information.
   - **Related** shows linked records (parent incident, change request,
     problem, and any linked service requests), plus a "caused by" reference

@@ -18,44 +18,188 @@ import { type Locator, type Page, expect } from "@playwright/test";
 
 /**
  * Page object for `/operations/change-requests/:id`
- * (`CsmChangeRequestDetailPage.tsx`). "Move to Assess" is only rendered when
+ * (`CsmChangeRequestDetailPage.tsx`). "Request Approval" is only rendered when
  * the CR's `legalNextStates` includes `"assess"` (data-driven, via
  * `ChangeRequestActionBar`'s own `legalNextStates` filtering); it will be
- * absent for a CR already past that stage. New -> Assess is a plain, direct
- * state PATCH (`{state: "assess"}`) like every other forward transition in
- * this bar — it used to be modeled as a special "approval request" action
- * (`{requestApproval: true}`, labeled "Request approval"), which was
- * backwards relative to the real ServiceNow process; that's fixed now, but
- * the label/method names below were kept in sync with the source rather than
- * left pointing at the old wording.
+ * absent for a CR already past that stage. It is a plain, direct state PATCH
+ * (`{state: "assess"}`) that starts the CR's approval flow (Peer -> CAB for
+ * Normal, ECAB for Emergency, straight to Scheduled for Standard).
+ * There is deliberately no "Schedule" button: a CR is moved to Scheduled
+ * automatically by its CAB/ECAB approval (or, when it requires customer
+ * approval, by "Record customer approval" from the Customer Approval step) --
+ * see `scheduleButton()`, which exists only so specs can assert its absence.
  */
 export class ChangeRequestDetailPage {
-  constructor(private readonly page: Page) {}
+  constructor(readonly page: Page) {}
 
   /**
    * A freshly-created CR isn't always retrievable the instant we navigate to
    * it — the real DEV-SN backend can lag between the create write and the
    * record becoming readable. Retry the navigation (full reload) until the
-   * stable "Back to change requests" button actually renders, rather than
-   * failing on the first attempt.
+   * page has genuinely loaded the record, rather than failing on the first
+   * attempt. The lifecycle stepper (always rendered once a CR resolves,
+   * regardless of its number/state) is the readiness signal — there is no
+   * "Back to change requests" control on this page (it opens as a tab
+   * alongside the dashboard, like a case does; confirmed absent anywhere in
+   * CsmChangeRequestDetailPage.tsx — an earlier version of this page object
+   * waited on one that never existed in the current tab-strip UI, which
+   * silently turned every `goto()` call into a 45s timeout).
    */
   async goto(id: string): Promise<void> {
     await expect(async () => {
       await this.page.goto(`/operations/change-requests/${id}`);
-      await expect(this.backButton()).toBeVisible({ timeout: 3_000 });
+      await expect(this.lifecycleStepper()).toBeVisible({ timeout: 3_000 });
     }).toPass({ timeout: 45_000, intervals: [1_000, 2_000, 3_000, 5_000] });
   }
 
-  backButton(): Locator {
-    return this.page.getByRole("button", { name: "Back to change requests" });
+  lifecycleStepper(): Locator {
+    return this.page.getByRole("list", { name: "Change request lifecycle" });
   }
 
-  moveToAssessButton(): Locator {
-    return this.page.getByRole("button", { name: "Move to Assess" });
+  requestApprovalButton(): Locator {
+    return this.page.getByRole("button", { name: "Request Approval" });
   }
 
-  async moveToAssess(): Promise<void> {
-    await this.moveToAssessButton().click();
+  async requestApproval(): Promise<void> {
+    await this.requestApprovalButton().click();
+  }
+
+  /** Never expected to be visible: Scheduled is reached by approval, not by a
+   * manual action. Matches a button or a menu entry containing "Schedule". */
+  scheduleButton(): Locator {
+    return this.page
+      .getByRole("button", { name: /^schedule/i })
+      .or(this.page.getByRole("menuitem", { name: /^schedule/i }));
+  }
+
+  /** The lifecycle stepper's current step (`aria-current="step"`). */
+  currentStep(): Locator {
+    return this.lifecycleStepper().locator('[aria-current="step"]');
+  }
+
+  /** Header note while a stage is waiting, e.g. "Awaiting CAB Approval",
+   * "Awaiting customer approval" or "Awaiting customer review". */
+  blockingReason(): Locator {
+    return this.page.getByText(/^Awaiting .+ (Approval|review)$/i);
+  }
+
+  /** "Record customer approval" -- the only place `scheduled` is a manual action. */
+  recordCustomerApprovalButton(): Locator {
+    return this.page.getByRole("button", { name: "Record customer approval" });
+  }
+
+  async recordCustomerApproval(): Promise<void> {
+    await this.recordCustomerApprovalButton().click();
+  }
+
+  /** Review's forward move when the CR requires customer review. */
+  sendForCustomerReviewButton(): Locator {
+    return this.page.getByRole("button", { name: "Send for customer review" });
+  }
+
+  /** The primary "Close" button (as opposed to the overflow menu entry). */
+  closeButton(): Locator {
+    return this.page.getByRole("button", { name: "Close", exact: true });
+  }
+
+  /** Read-only Yes/No on the Approval tab beside a label such as
+   * "Customer approval required" / "Customer review required". */
+  flagValue(label: string): Locator {
+    return this.page
+      .getByText(label, { exact: true })
+      .locator("xpath=..")
+      .getByText(/^(Yes|No)$/);
+  }
+
+  /** The lifecycle stepper's step labels, in order. */
+  stepLabels(): Locator {
+    return this.lifecycleStepper().getByRole("listitem");
+  }
+
+  /** The Customer Approval / Customer Review checkboxes in the edit dialog. */
+  editCustomerApprovalCheckbox(): Locator {
+    return this.editDialog().getByRole("checkbox", { name: "Customer Approval" });
+  }
+
+  editCustomerReviewCheckbox(): Locator {
+    return this.editDialog().getByRole("checkbox", { name: "Customer Review" });
+  }
+
+  /** Explanatory notice shown to the CR's creator in the Approvals card. */
+  creatorApprovalNotice(): Locator {
+    return this.page.getByRole("alert").filter({ hasText: /you created this change request/i });
+  }
+
+  /** The Overview cell labelled `label` (e.g. "Customer Project", "Deployments"). */
+  overviewCell(label: string): Locator {
+    return this.page.getByText(label, { exact: true }).locator("xpath=..");
+  }
+
+  /** The chips an Overview cell shows (Deployments / Deployment products / Customer group). */
+  overviewChips(label: string): Locator {
+    return this.overviewCell(label).locator(".MuiChip-label");
+  }
+
+  /** The Clone button in the page header. */
+  cloneButton(): Locator {
+    return this.page.getByRole("button", { name: /clone/i });
+  }
+
+  /** The "Stage" cell of the approvals table row for a named approver
+   * ("Peer Approval" | "CAB Approval" | "ECAB Approval"). */
+  approverStage(approverName: string): Locator {
+    return this.approverRow(approverName).getByRole("cell").first();
+  }
+
+  /** The overflow ("Change state") menu trigger, which holds Cancel change. */
+  changeStateButton(): Locator {
+    return this.page.getByRole("button", { name: "Change state" });
+  }
+
+  cancelChangeMenuItem(): Locator {
+    return this.page.getByRole("menuitem", { name: "Cancel change" });
+  }
+
+  /** "Roll back" -- the failed-review off-ramp; a destructive overflow-menu entry. */
+  rollbackMenuItem(): Locator {
+    return this.page.getByRole("menuitem", { name: "Roll back" });
+  }
+
+  /** The reason dialog the destructive transitions (Roll back, Cancel change) open. */
+  reasonDialog(): Locator {
+    return this.page.getByRole("dialog");
+  }
+
+  /** "Re-schedule" -- the outlined button beside the primary action in Customer Approval. */
+  rescheduleButton(): Locator {
+    return this.page.getByRole("button", { name: "Re-schedule", exact: true });
+  }
+
+  /** The Re-schedule dialog (its heading is "Re-schedule this change?"). */
+  rescheduleDialog(): Locator {
+    return this.page.getByRole("dialog").filter({ has: this.page.getByRole("heading", { name: "Re-schedule this change?" }) });
+  }
+
+  /** The dialog's submit button (the bar's own "Re-schedule" is behind the modal). */
+  rescheduleSubmit(): Locator {
+    return this.rescheduleDialog().getByRole("button", { name: "Re-schedule", exact: true });
+  }
+
+  /**
+   * Types a wall-clock value (in the signed-in user's time zone, as the picker
+   * shows it) into one of the Re-schedule dialog's MUI date-time pickers
+   * ("Planned start" | "Planned end"): focuses the Month section, then types `MMDDYYYYhhmm` + AM/PM, which the field auto-advances through.
+   */
+  async fillRescheduleWindow(label: "Planned start" | "Planned end", value: { month: number; day: number; year: number; hour12: number; minute: number; pm: boolean }): Promise<void> {
+    const two = (n: number): string => String(n).padStart(2, "0");
+    const group = this.rescheduleDialog().getByRole("group", { name: new RegExp(`^${label}`) });
+    // Focus the first section (Month) explicitly: a click on the group's centre
+    // would land on the Year section and shift every typed digit.
+    await group.getByRole("spinbutton", { name: "Month" }).click();
+    await this.page.keyboard.type(
+      `${two(value.month)}${two(value.day)}${value.year}${two(value.hour12)}${two(value.minute)}${value.pm ? "PM" : "AM"}`,
+      { delay: 30 },
+    );
   }
 
   editButton(): Locator {
@@ -87,6 +231,40 @@ export class ChangeRequestDetailPage {
   // "Customer approved"/"Customer reviewed" are deliberately not editable
   // controls in this dialog — see EditChangeRequestDialog.tsx's doc comment.
 
+  /** Scope fields inside the edit dialog (same labels as the create form). */
+  editProjectField(): Locator {
+    return this.editDialog().getByRole("combobox", { name: "Customer Project" });
+  }
+
+  editDeploymentsField(): Locator {
+    return this.editDialog().getByRole("combobox", { name: "Deployments" });
+  }
+
+  /** The read-only Customer Group (the project's registered contacts) inside the edit dialog. */
+  editCustomerGroupField(): Locator {
+    return this.editDialog().getByLabel("Customer Group");
+  }
+
+  editDeploymentProductsField(): Locator {
+    return this.editDialog().getByLabel("Deployment products");
+  }
+
+  editCategoryField(): Locator {
+    return this.editDialog().getByRole("combobox", { name: "Category" });
+  }
+
+  /** The chips inside one of the edit dialog's multi-selects / read-only products field. */
+  editChipsOf(field: Locator): Locator {
+    return field.locator("xpath=ancestor::div[contains(@class,'MuiInputBase-root')][1]").locator(".MuiChip-label");
+  }
+
+  /** Opens an edit-dialog multi-select, toggles the named options, closes it. */
+  async editToggleOptions(field: Locator, names: string[]): Promise<void> {
+    await field.click();
+    for (const name of names) await this.page.getByRole("option", { name, exact: true }).click();
+    await field.press("Escape");
+  }
+
   saveButton(): Locator {
     return this.editDialog().getByRole("button", { name: /^(Save|Saving…)$/ });
   }
@@ -96,36 +274,57 @@ export class ChangeRequestDetailPage {
   }
 
   // ── Approvals ────────────────────────────────────────────────────────────
+  //
+  // ChangeRequestApprovals.tsx renders one flat table (Stage/State/Approver/
+  // Assignment group/Comments/Created/Approved on/Actions) with every
+  // approver from every stage shown together — not the collapsible
+  // per-stage accordion cards an earlier UI revision used (see that
+  // component's own history in entity-service's CLAUDE.md, "Change
+  // requests" section: "a full UI redesign ... now renders as one flat
+  // table"). Scope by table row, not an accordion class.
 
-  /** Expands an approval-stage accordion by its displayed stage label (e.g.
-   * "Assess", "Authorize", "Customer Approval" — see
-   * `ChangeRequestApprovals.tsx`; a repeated stage gets a "(N of M)" suffix
-   * appended). */
-  async expandApprovalStage(stageLabel: string): Promise<void> {
-    await this.page
-      .locator(".MuiAccordionSummary-root", { hasText: stageLabel })
-      .click();
+  /** The approvals table row for a named approver (e.g. "Jane Doe"). The
+   * same person can sit on more than one stage (Peer Approval and CAB
+   * Approval both list the seeded users), so pass `stage` ("Peer Approval" |
+   * "CAB Approval" | "ECAB Approval") to pick one stage's row. */
+  approverRow(approverName: string, stage?: string): Locator {
+    const rows = this.page.getByRole("row", { name: approverName });
+    return stage ? rows.filter({ has: this.page.getByRole("cell", { name: stage, exact: true }) }) : rows;
+  }
+
+  /** That approver's status chip text ("Requested" | "Approved" |
+   * "Rejected" | "Cancelled" | ...). */
+  approverStatus(approverName: string, stage?: string): Locator {
+    return this.approverRow(approverName, stage).locator(".MuiChip-label");
+  }
+
+  /** The Assignment group of an approver's row: a link-button that opens the
+   * group (its members), or the project's registered contacts for a customer
+   * stage. Pass `stage` to pick one stage's row. */
+  groupLink(approverName: string, groupName: string, stage?: string): Locator {
+    return this.approverRow(approverName, stage).getByRole("button", { name: `View members of ${groupName}`, exact: true });
+  }
+
+  /** The group dialog the Assignment group link opens, titled with the group's name. */
+  groupDialog(title: string): Locator {
+    return this.page.getByRole("dialog", { name: title, exact: true });
   }
 
   /** Approve/Reject buttons only render for the signed-in user's own
    * pending ("REQUESTED") approval row — scope by the approver's own display
-   * name if more than one row is expanded at once. */
-  approveButton(approverName?: string): Locator {
-    const scope = approverName
-      ? this.page.locator(".MuiAccordionDetails-root", { hasText: approverName })
-      : this.page;
+   * name when more than one row is on the page at once. */
+  approveButton(approverName?: string, stage?: string): Locator {
+    const scope = approverName ? this.approverRow(approverName, stage) : this.page;
     return scope.getByRole("button", { name: "Approve" });
   }
 
-  rejectButton(approverName?: string): Locator {
-    const scope = approverName
-      ? this.page.locator(".MuiAccordionDetails-root", { hasText: approverName })
-      : this.page;
+  rejectButton(approverName?: string, stage?: string): Locator {
+    const scope = approverName ? this.approverRow(approverName, stage) : this.page;
     return scope.getByRole("button", { name: "Reject" });
   }
 
-  async approve(approverName?: string): Promise<void> {
-    await this.approveButton(approverName).click();
+  async approve(approverName?: string, stage?: string): Promise<void> {
+    await this.approveButton(approverName, stage).click();
   }
 
   async reject(approverName?: string): Promise<void> {

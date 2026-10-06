@@ -241,11 +241,17 @@ describe("SettingsUserManagement", () => {
       expect(screen.queryByText("person01@acme.com")).not.toBeInTheDocument();
     });
 
-    it("hides the pagination control when every contact fits on one page", () => {
+    it("keeps the rows-per-page selector visible (but the next-page button disabled) when every contact fits on one page", () => {
       contactsState.data = manyContacts(10);
       render(<SettingsUserManagement projectId="p-1" />);
 
-      expect(screen.queryByRole("button", { name: /next page/i })).not.toBeInTheDocument();
+      // ListPagination used to return null entirely once everything fit on
+      // one page, which also hid its rows-per-page selector with no way to
+      // change it back -- the same bug reported for the Announcements page.
+      // The control must stay visible; only the next-page button should be
+      // disabled rather than removed.
+      expect(screen.getByLabelText(/rows per page/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /next page/i })).toBeDisabled();
     });
 
     it("searches the whole list and goes back to the first page", () => {

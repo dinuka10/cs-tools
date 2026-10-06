@@ -32,6 +32,8 @@ import (
 // and records what was sent.
 type OutageCommunicationRepository interface {
 	PendingOutages(ctx context.Context, limit int) ([]domain.OutageForCommunication, error)
+	// TryLockSweep: see OutageNotificationRepository.TryLockSweep.
+	TryLockSweep(ctx context.Context) (release func(), ok bool, err error)
 	Record(ctx context.Context, req domain.RecordOutageCommunicationRequest) error
 	LogForOutage(ctx context.Context, number string) ([]domain.OutageCommunicationLogEntry, error)
 }
@@ -67,16 +69,16 @@ func NewOutageCommunicationRepository(db *pgxpool.Pool) OutageCommunicationRepos
 // outage alone would read another flow's traffic as ours; the type filter
 // is not optional.
 //
-// *** TWO FIELDS THE EMAIL RENDERS ARE NOT MIRRORED AT ALL. *** ServiceNow's
-// body prints "Impact:" and "Current Status:", which come from cmdb_ci_outage's
-// impact and state. NEITHER EXISTS on the Postgres `outage` table, under that
-// name or any other -- checked against the live schema, not assumed.
+// ServiceNow's body prints "Impact:" and "Current Status:" from
+// cmdb_ci_outage's impact and state. Migration 0116 added both columns and
+// digiops-cs mirrors them by name, so they are read straight across. Never
+// fill them from a nearby column: an earlier revision mapped Impact to
+// `o.message`, a plausible-looking wrong value in every email.
 //
-// They are therefore left empty rather than filled from a nearby column. An
-// earlier revision of this query mapped Impact to `o.message`, which is the
-// outage's own message and a different field entirely: it would have rendered
-// a plausible-looking wrong value in every email, which is worse than a blank.
-// Add them to the digiops-cs mapping if the blanks matter.
+// Duration falls back to end - begin. The column is ServiceNow's "Outage
+// Calculations" output, so an outage closed before the outage API wrote it
+// still has NULL there, and the resolution email would print a blank
+// "Outage Duration:" for exactly the outages it is about.
 //
 // `opted_in` is outage.outage_communication, which csm-sync-service does not
 // mirror yet. Until it does, this query fails with undefined_column and the
@@ -95,7 +97,9 @@ SELECT o.id::text,
        -- what a raw Postgres interval prints and is not something anyone
        -- wants in an email. Formatting belongs in the service layer where
        -- it is testable, so the repository hands over a number.
-       COALESCE(EXTRACT(EPOCH FROM o.duration)::bigint, 0),
+       COALESCE(EXTRACT(EPOCH FROM COALESCE(o.duration, o.end_on - o.start_on))::bigint, 0),
+       COALESCE(o.impact, ''),
+       COALESCE(o.state, ''),
        COALESCE(o.outage_communication, FALSE),
        EXISTS (SELECT 1 FROM outage_communication_log l
                 WHERE l.outage_number = o.number
@@ -117,6 +121,11 @@ SELECT o.id::text,
    )
  ORDER BY o.start_on, o.id
  LIMIT $1`
+
+// TryLockSweep takes the outage-communication sweep lock.
+func (r *outageCommunicationRepo) TryLockSweep(ctx context.Context) (func(), bool, error) {
+	return tryAdvisoryLock(ctx, r.db, outageCommunicationSweepLockKey)
+}
 
 func (r *outageCommunicationRepo) PendingOutages(ctx context.Context, limit int) ([]domain.OutageForCommunication, error) {
 	rows, err := r.db.Query(ctx, pendingOutageCommunicationsSQL, limit)
@@ -141,7 +150,7 @@ func (r *outageCommunicationRepo) PendingOutages(ctx context.Context, limit int)
 		var o domain.OutageForCommunication
 		if err := rows.Scan(
 			&o.OutageID, &o.Number, &o.Type, &o.ShortDescription,
-			&o.StartOn, &o.EndOn, &o.DurationSeconds,
+			&o.StartOn, &o.EndOn, &o.DurationSeconds, &o.Impact, &o.State,
 			&o.OptedIn, &o.AlreadyDeclared, &o.AlreadyResolved, &o.DeclaredSubject,
 		); err != nil {
 			return nil, fmt.Errorf("scanning outage pending communication: %w", err)

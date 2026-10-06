@@ -64,7 +64,7 @@ func TestFallbackGoogleChatCard_ThreadKeyFollowsThreadedFlag(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected a thread field when threaded=true, got %#v", threaded)
 	}
-	if got, want := thread["threadKey"], inc.Fingerprint; got != want {
+	if got, want := thread["threadKey"], chatThreadKey(inc); got != want {
 		t.Fatalf("threadKey = %v, want %v", got, want)
 	}
 
@@ -123,9 +123,9 @@ func TestNotifyChat_ThreadReplyOptionFollowsThreadingFlag(t *testing.T) {
 
 func TestAnnotationGoogleChatCard_RendersBoldedNoteWithoutHeader(t *testing.T) {
 	inc := model.Incident{Fingerprint: "fp-abc123", IncidentNumber: "PENDING-fp-abc1", Service: "svc", Severity: 1}
-	note := model.BuildChatAnnotationText("Duplicate", "cpu", "vendor")
+	note := model.BuildChatDigest(1, 0, "cpu", "vendor")
 
-	card := annotationGoogleChatCard(inc, "Duplicate", note, true)
+	card := annotationGoogleChatCard(inc, note, true)
 	raw, err := json.Marshal(card)
 	if err != nil {
 		t.Fatalf("marshal card: %v", err)
@@ -145,12 +145,12 @@ func TestAnnotationGoogleChatCard_RendersBoldedNoteWithoutHeader(t *testing.T) {
 		t.Fatalf("expected no Alert: line in the chat annotation body, got %s", body)
 	}
 	thread, ok := card["thread"].(map[string]any)
-	if !ok || thread["threadKey"] != inc.Fingerprint {
-		t.Fatalf("expected thread.threadKey = %q when threaded=true, got %#v", inc.Fingerprint, card["thread"])
+	if !ok || thread["threadKey"] != chatThreadKey(inc) {
+		t.Fatalf("expected thread.threadKey = %q when threaded=true, got %#v", chatThreadKey(inc), card["thread"])
 	}
 
-	okNote := model.BuildChatAnnotationText("OK", "cpu", "vendor")
-	okCard := annotationGoogleChatCard(inc, "OK", okNote, false)
+	okNote := model.BuildChatDigest(0, 1, "cpu", "vendor")
+	okCard := annotationGoogleChatCard(inc, okNote, false)
 	if !strings.Contains(okNote, "<b>OK alert received.</b>") {
 		t.Fatalf("expected the card to visibly label the OK/resolved kind in bold, got %s", okNote)
 	}
@@ -178,7 +178,7 @@ func TestNotifyChatAnnotation_PostsThreadedCard(t *testing.T) {
 	}
 	inc := model.Incident{Fingerprint: "fp-xyz", IncidentNumber: "PENDING-fp-xyz", Service: "svc"}
 	note := model.BuildWorkNote("OK", "ALT2", "cpu", "vendor")
-	if ok := n.NotifyChatAnnotation(context.Background(), inc, "OK", note); !ok {
+	if ok := n.NotifyChatAnnotation(context.Background(), inc, note); !ok {
 		t.Fatalf("NotifyChatAnnotation() = false, want true")
 	}
 
@@ -187,7 +187,22 @@ func TestNotifyChatAnnotation_PostsThreadedCard(t *testing.T) {
 		t.Fatalf("unmarshal posted body: %v", err)
 	}
 	thread, ok := posted["thread"].(map[string]any)
-	if !ok || thread["threadKey"] != inc.Fingerprint {
-		t.Fatalf("expected posted card's thread.threadKey = %q, got %#v", inc.Fingerprint, posted["thread"])
+	if !ok || thread["threadKey"] != chatThreadKey(inc) {
+		t.Fatalf("expected posted card's thread.threadKey = %q, got %#v", chatThreadKey(inc), posted["thread"])
+	}
+}
+
+func TestChatThreadKey_NewIncidentGetsNewThread(t *testing.T) {
+	first := model.Incident{Fingerprint: "abc", FirstSeen: time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)}
+	sameIncident := first
+	sameIncident.FirstSeen = first.FirstSeen.Add(time.Microsecond)
+	next := first
+	next.FirstSeen = first.FirstSeen.Add(5 * time.Minute)
+
+	if chatThreadKey(first) != chatThreadKey(sameIncident) {
+		t.Fatalf("thread key must survive Postgres microsecond rounding of first_seen")
+	}
+	if chatThreadKey(first) == chatThreadKey(next) {
+		t.Fatalf("a new incident after the dedup window must get its own thread, both got %q", chatThreadKey(first))
 	}
 }

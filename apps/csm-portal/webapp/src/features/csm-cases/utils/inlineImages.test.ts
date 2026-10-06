@@ -18,6 +18,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractIixAttachmentIds,
   extractInlineImageRefId,
+  isInlineImageRefSrc,
   isRawBase64ImageSrc,
   replaceInlineImageSrcs,
   sysidToUuid,
@@ -175,5 +176,79 @@ describe("sysidToUuid", () => {
 
   it("returns an already-differently-shaped id unchanged", () => {
     expect(sysidToUuid("not-a-sysid")).toBe("not-a-sysid");
+  });
+});
+
+// Content migrated from the legacy data source carries inline images as a
+// bare attachment id (`<img src="/<uuid>">`), with no `.iix` suffix.
+describe("bare attachment-id srcs (migrated content)", () => {
+  const UUID = "0f15cbcc-c36b-8310-af2f-404599013196";
+  const HEX = UUID.replace(/-/g, "");
+  const DATA = "data:image/png;base64,AAAA";
+
+  it.each([
+    ["hyphenated uuid with leading slash", `/${UUID}`],
+    ["hyphenated uuid without leading slash", UUID],
+    ["uppercase hyphenated uuid", `/${UUID.toUpperCase()}`],
+    ["32-hex id with leading slash", `/${HEX}`],
+    ["32-hex id without leading slash", HEX],
+    ["hyphenated uuid with .iix", `/${UUID}.iix`],
+    ["surrounding whitespace", `  /${UUID} `],
+  ])("treats %s as an attachment reference and resolves it", (_n, src) => {
+    expect(isInlineImageRefSrc(src)).toBe(true);
+    expect(extractInlineImageRefId(src)).toBe(HEX);
+    expect(extractIixAttachmentIds(`<img src="${src}">`)).toEqual([HEX]);
+    const out = replaceInlineImageSrcs(
+      `<p><img src="${src}"><br></p>`,
+      new Map([[HEX, DATA]]),
+    );
+    expect(out).toContain(`src="${DATA}"`);
+  });
+
+  it("hands the hook an id that sysidToUuid turns back into the canonical uuid", () => {
+    expect(sysidToUuid(extractInlineImageRefId(`/${UUID}`))).toBe(UUID);
+    expect(sysidToUuid(UUID)).toBe(UUID);
+  });
+
+  it("keeps .iix references working", () => {
+    expect(extractIixAttachmentIds(`<img src="/${HEX}.iix">`)).toEqual([HEX]);
+  });
+
+  it.each([
+    ["https URL", `https://example.com/${UUID}`],
+    ["path prefix", `/some/path/${UUID}`],
+    ["query string", `/${UUID}?x=1`],
+    ["other extension", `/${UUID}.png`],
+    ["short id", "/0f15cbcc"],
+    ["data URI", "data:image/png;base64,AAAA"],
+    ["double slash", `//${UUID}`],
+  ])("leaves %s untouched", (_n, src) => {
+    expect(isInlineImageRefSrc(src)).toBe(false);
+    const html = `<img src="${src}">`;
+    expect(extractIixAttachmentIds(html)).toEqual([]);
+    expect(replaceInlineImageSrcs(html, new Map())).toBe(html);
+  });
+
+  it("dedupes a bare id against the .iix form of the same attachment", () => {
+    const other = "fedcba9876543210fedcba9876543210";
+    const html = `<img src="/${UUID}"><img src="/${HEX}.iix"><img src="${other}.iix"><img src="${UUID}">`;
+    expect(extractIixAttachmentIds(html)).toEqual([HEX, other]);
+  });
+
+  it("shows the permission placeholder for a denied bare id", () => {
+    const out = replaceInlineImageSrcs(
+      `<img src="/${UUID}">`,
+      new Map(),
+      new Set([HEX]),
+    );
+    expect(out).not.toContain("<img");
+    expect(out).toContain('data-unresolved-reason="permission"');
+  });
+
+  it("shows the unavailable placeholder for an unresolved bare id", () => {
+    const out = replaceInlineImageSrcs(`<img src="/${UUID}">`, new Map());
+    expect(out).not.toContain("<img");
+    expect(out).toContain('data-unresolved-reason="error"');
+    expect(out).toContain("Image unavailable");
   });
 });

@@ -2402,6 +2402,11 @@ components:
         serviceId:
           type: string
           format: uuid
+          description: >-
+            The incident's assignment group is set from this service's support
+            group; there is no assignmentGroupId on create. A service with no
+            support group creates the incident unassigned. Reassign afterwards
+            with PATCH.
         serviceOfferingId:
           type: string
           format: uuid
@@ -2429,9 +2434,13 @@ components:
         urgency:
           type: string
           enum: [HIGH, MEDIUM, LOW]
-        assignmentGroupId:
+        correlationId:
           type: string
-          format: uuid
+          nullable: true
+          description: Optional caller-supplied external-system key, stored on ServiceNow's
+            correlation_id field. Look it up via SearchIncidentsRequest filters.correlationId
+            to find an incident this caller already created, without depending on
+            free-text search over subject or workNotes.
         assignedEngineerId:
           type: string
           format: uuid
@@ -2542,6 +2551,12 @@ components:
             number:
               type: string
               description: Exact match against the incident's human-readable number (e.g. "INC0010001").
+            correlationId:
+              type: string
+              description: >-
+                Exact match against the incident's correlation_id. Finds the
+                incident a caller created with CreateIncidentRequest.correlationId
+                without a free-text searchQuery scan.
             filters:
               type: array
               items:

@@ -87,23 +87,50 @@ describe("describeAuditEntry", () => {
     };
   }
 
-  it("describes a single field change as 'Label: old → new'", () => {
+  it("describes a single field change as 'Label: old → new', through the curated state label", () => {
     const entry = auditEntry({
-      changes: [{ field: "state", fieldLabel: "State", previousValue: "New", newValue: "Work in Progress" }],
+      changes: [{ field: "state", fieldLabel: "State", previousValue: "open", newValue: "work_in_progress" }],
     });
-    expect(describeAuditEntry(entry)).toBe("State: New → Work in Progress");
+    expect(describeAuditEntry(entry)).toBe("State: Open → Work in progress");
   });
 
   it("joins multiple field changes from the same transaction with a semicolon", () => {
     const entry = auditEntry({
       changes: [
-        { field: "state", fieldLabel: "State", previousValue: "New", newValue: "Work in Progress" },
+        { field: "state", fieldLabel: "State", previousValue: "open", newValue: "work_in_progress" },
         { field: "assignee", fieldLabel: "Assignee", previousValue: undefined, newValue: "Jane Doe" },
       ],
     });
     expect(describeAuditEntry(entry)).toBe(
-      "State: New → Work in Progress; Assignee: Jane Doe",
+      "State: Open → Work in progress; Assignee: Jane Doe",
     );
+  });
+
+  it("humanizes a raw, all-caps state value the same as an already-lowercase one", () => {
+    const entry = auditEntry({
+      changes: [
+        { field: "state", fieldLabel: "State", previousValue: "SOLUTION_PROPOSED", newValue: "CLOSED" },
+      ],
+    });
+    expect(describeAuditEntry(entry)).toBe("State: Solution proposed → Closed");
+  });
+
+  it("maps a severity field change through the curated severity label, both for an already-human value and a raw P-notation one", () => {
+    const entry = auditEntry({
+      changes: [
+        { field: "severity", fieldLabel: "Severity", previousValue: "Critical", newValue: "P2" },
+      ],
+    });
+    expect(describeAuditEntry(entry)).toBe("Severity: Critical → High");
+  });
+
+  it("maps a bare S0-S4 severity code too, which severityFromBe alone does not recognize", () => {
+    const entry = auditEntry({
+      changes: [
+        { field: "severity", fieldLabel: "Severity", previousValue: "S0", newValue: "s2" },
+      ],
+    });
+    expect(describeAuditEntry(entry)).toBe("Severity: Catastrophic → High");
   });
 
   it("renders 'cleared' when a field's new value is absent", () => {

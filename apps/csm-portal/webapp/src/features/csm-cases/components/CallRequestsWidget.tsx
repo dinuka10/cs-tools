@@ -80,6 +80,9 @@ interface CallRequestsWidgetProps {
   /** True when the parent case is closed — call requests stay visible but
    * become read-only: no new requests, no updates to existing ones. */
   isClosed?: boolean;
+  /** True when the caller has no write access: requests stay visible, but
+   * creating or updating one is disabled (the backend would 403 it). */
+  readOnly?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +96,7 @@ export function CallRequestsWidget({
   autoOpenCreate,
   onAutoOpenCreateHandled,
   isClosed,
+  readOnly,
 }: CallRequestsWidgetProps): JSX.Element {
   // State filter — empty string means "all". Filtering happens server-side
   // via `filters.states` on the search request.
@@ -111,13 +115,13 @@ export function CallRequestsWidget({
 
   useEffect(() => {
     if (autoOpenCreate) {
-      if (!isClosed && !stateBlockReason) {
+      if (!isClosed && !readOnly && !stateBlockReason) {
         // eslint-disable-next-line react-hooks/set-state-in-effect -- syncs the dialog open to an external one-shot trigger from the case action bar
         setCreateOpen(true);
       }
       onAutoOpenCreateHandled?.();
     }
-  }, [autoOpenCreate, isClosed, stateBlockReason, onAutoOpenCreateHandled]);
+  }, [autoOpenCreate, isClosed, readOnly, stateBlockReason, onAutoOpenCreateHandled]);
 
   // Dialog targets — only one dialog is ever open at a time, driven by which
   // action was clicked on a row.
@@ -328,7 +332,9 @@ export function CallRequestsWidget({
               title={
                 isClosed
                   ? "This case is closed — it's read-only."
-                  : (stateBlockReason ?? "")
+                  : readOnly
+                    ? "You don't have permission to create call requests."
+                    : (stateBlockReason ?? "")
               }
             >
               <span>
@@ -337,7 +343,7 @@ export function CallRequestsWidget({
                   variant="contained"
                   startIcon={<Plus size={14} />}
                   onClick={() => setCreateOpen(true)}
-                  disabled={isClosed || !!stateBlockReason}
+                  disabled={isClosed || readOnly || !!stateBlockReason}
                   sx={{ textTransform: "none" }}
                 >
                   Create call request
@@ -396,6 +402,7 @@ export function CallRequestsWidget({
             requests={requests}
             onAction={handleAction}
             isClosed={isClosed}
+            readOnly={readOnly}
           />
         )}
       </Card>

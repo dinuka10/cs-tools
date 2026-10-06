@@ -660,3 +660,95 @@ describe("CsmIncidentDetailPage — reports its own draft state to the tab strip
     expect(screen.queryByText("Close this case tab?")).not.toBeInTheDocument();
   });
 });
+
+describe("CsmIncidentDetailPage — Channel through the incident lifecycle", () => {
+  const ME_ID = "00000000-0000-0000-0000-00000000000c";
+  const RESOLUTION = {
+    resolutionCode: "SOLVED_PERMANENTLY",
+    resolutionNotes: "Rolled back the bad gateway config.",
+  } as const;
+  // Same record at each lifecycle stage, as GET /incidents/{id} returns it
+  // after the previous transition: Channel (wire field `contactType`) set at
+  // create time, no subcategory.
+  const atStage = (state: BeIncidentDetail["state"]): BeIncidentDetail => ({
+    ...BASE_INCIDENT,
+    state,
+    category: "SERVICE_INTERRUPTION",
+    subcategory: null,
+    contactType: "PHONE",
+    assignedTo: state === "NEW" ? null : { id: ME_ID, name: "Jane Doe" },
+  });
+
+  /** The Details tab's Channel cell: its label and the value beside it. */
+  const expectChannelShown = (stage: string): void => {
+    goToTab(/details/i);
+    expect(screen.queryByText(/contact type/i), stage).not.toBeInTheDocument();
+    const label = screen.getByText("Channel");
+    expect(label.parentElement, stage).toHaveTextContent(/^Channel\s*PHONE$/);
+  };
+
+  const transition = (menuItem: RegExp): void => {
+    fireEvent.click(screen.getByRole("button", { name: /change state/i }));
+    fireEvent.click(screen.getByRole("menuitem", { name: menuItem }));
+  };
+
+  const submitResolutionDialog = (submit: RegExp): void => {
+    fireEvent.mouseDown(
+      document
+        .getElementById("incident-resolution-code-label")!
+        .parentElement!.querySelector('[role="combobox"]')!,
+    );
+    fireEvent.click(within(screen.getByRole("listbox")).getByText(/^solved \(permanently\)$/i));
+    fireEvent.change(screen.getByLabelText(/resolution notes/i), {
+      target: { value: RESOLUTION.resolutionNotes },
+    });
+    fireEvent.click(screen.getByRole("button", { name: submit }));
+  };
+
+  const lastPatch = (): Record<string, unknown> => {
+    const calls = patchMutateMock.mock.calls;
+    expect(calls.length).toBeGreaterThan(0);
+    return (calls[calls.length - 1][0] as { patch: Record<string, unknown> }).patch;
+  };
+
+  it("labels the field Channel and keeps its value at every stage, New -> In Progress -> Resolved -> Closed", () => {
+    // New: start work (claims the unassigned incident).
+    mockQueryResult({ data: atStage("NEW") });
+    const newStage = renderPage();
+    expectChannelShown("NEW");
+    transition(/in progress/i);
+    expect(lastPatch()).toEqual({ state: "IN_PROGRESS", assignedEngineerId: ME_ID });
+    newStage.unmount();
+
+    // In Progress: resolve through the resolution dialog.
+    mockQueryResult({ data: atStage("IN_PROGRESS") });
+    const inProgress = renderPage();
+    expectChannelShown("IN_PROGRESS");
+    transition(/resolved/i);
+    submitResolutionDialog(/^move to resolved$/i);
+    expect(lastPatch()).toEqual({ state: "RESOLVED", ...RESOLUTION });
+    inProgress.unmount();
+
+    // Resolved: close, which also goes through the resolution dialog.
+    mockQueryResult({ data: atStage("RESOLVED") });
+    const resolved = renderPage();
+    expectChannelShown("RESOLVED");
+    transition(/closed/i);
+    submitResolutionDialog(/^move to closed$/i);
+    expect(lastPatch()).toMatchObject({ state: "CLOSED" });
+    resolved.unmount();
+
+    // Closed: terminal, and Channel is still shown.
+    mockQueryResult({ data: atStage("CLOSED") });
+    renderPage();
+    expectChannelShown("CLOSED");
+    expect(screen.queryByRole("button", { name: /change state/i })).not.toBeInTheDocument();
+
+    // No transition re-sent (or cleared) the channel or the subcategory.
+    expect(patchMutateMock).toHaveBeenCalledTimes(3);
+    for (const [{ patch }] of patchMutateMock.mock.calls as Array<[{ patch: Record<string, unknown> }]>) {
+      expect(patch).not.toHaveProperty("contactType");
+      expect(patch).not.toHaveProperty("subcategory");
+    }
+  });
+});

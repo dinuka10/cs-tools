@@ -89,6 +89,17 @@ to see the onboarding owner (or "Unassigned" if none is set yet); it's just a po
 the project's own **Onboarding Owner** field (see Customers → Projects) and disappears once
 onboarding moves past "in progress."
 
+Two banners can also appear just below that header, and they stay on screen for as long as
+the condition holds (they can't be dismissed). A **Managed Cloud** banner shows when the
+case's project is a Managed Cloud project: it reminds you not to ask the customer for logs,
+configuration files, deployment artefacts or other deployment-related information, to check
+with the WSO2 MS team instead, and not to move the case to Awaiting info while you wait on
+them. A **Customer onboarding in progress** banner shows when the project's onboarding is in
+progress: it asks you to confirm you have the account context, to check first with the
+onboarding owner (or "Unassigned" if none is set) and, if they aren't available, to review
+the customer's solution context before responding. A project can trigger both at once.
+Neither banner shows on announcements.
+
 **Escalation** shows the case's current level (EL0 "not escalated" through EL5 "CEO") as a
 badge, with a read-only history of every past escalate/de-escalate step below it — who made
 each change, when, and their stated reason. **Escalate** and **De-escalate** buttons sit next

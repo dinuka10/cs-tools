@@ -105,6 +105,14 @@ func NewCustomerEntityClient(cfg CustomerEntityConfig) *CustomerEntityClient {
 	}
 }
 
+// maxEntityErrBody caps how much of an entity-service error body is kept on
+// apierror.Error.Body. The handler layer parses that excerpt as the
+// {"code","message"} envelope to show the caller the real reason
+// (upstreamErrorMessageStrict), so it must hold a whole envelope: at 256
+// bytes a long validation message was cut mid-string, failed to parse, and
+// reached the portal as the generic "Invalid request payload." instead.
+const maxEntityErrBody = 4096
+
 // do executes an authenticated HTTP request against the entity service and
 // returns the raw JSON response body. The caller owns the returned slice.
 func (c *CustomerEntityClient) do(ctx context.Context, method, path string, body []byte) ([]byte, error) {
@@ -139,10 +147,9 @@ func (c *CustomerEntityClient) do(ctx context.Context, method, path string, body
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		const maxErrBody = 256
 		excerpt := respBody
-		if len(excerpt) > maxErrBody {
-			excerpt = excerpt[:maxErrBody]
+		if len(excerpt) > maxEntityErrBody {
+			excerpt = excerpt[:maxEntityErrBody]
 		}
 		return nil, &apierror.Error{StatusCode: resp.StatusCode, Body: string(excerpt)}
 	}
@@ -177,10 +184,9 @@ func (c *CustomerEntityClient) doBinary(ctx context.Context, path string) (body 
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		const maxErrBody = 256
 		excerpt := respBody
-		if len(excerpt) > maxErrBody {
-			excerpt = excerpt[:maxErrBody]
+		if len(excerpt) > maxEntityErrBody {
+			excerpt = excerpt[:maxEntityErrBody]
 		}
 		return nil, "", &apierror.Error{StatusCode: resp.StatusCode, Body: string(excerpt)}
 	}

@@ -67,7 +67,7 @@ func TestServeOutageCommunicationHarness(t *testing.T) {
 	const harnessClientID = "outage-comm-harness"
 	accessSvc := service.NewAccessService(
 		repository.NewAccessRepository(pool),
-		map[string]bool{harnessClientID: true},
+		service.AccessClientConfig{M2MClientIDs: map[string]bool{harnessClientID: true}},
 	)
 
 	h := handler.NewOutageCommunicationHandler(

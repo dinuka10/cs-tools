@@ -50,8 +50,9 @@ type SalesforceContactRepository interface {
 	// the membership DELETED path does) so a later RESTORED is not skipped as
 	// a duplicate. Nothing is hard-deleted: project_contact and
 	// onboarding_step reference these rows. found is false when no row
-	// carried the id; the ledger is written either way.
-	DeactivateBySfID(ctx context.Context, contactSfID string, state domain.UpsertSalesforceIngestStateRequest) (found bool, err error)
+	// carried the id; the ledger is written either way. affected lists the
+	// "user" rows that were deactivated (sf_id is not unique there).
+	DeactivateBySfID(ctx context.Context, contactSfID string, state domain.UpsertSalesforceIngestStateRequest) (found bool, affected []domain.AffectedUser, err error)
 }
 
 type salesforceContactRepo struct {
@@ -194,28 +195,42 @@ func deactivateMovedAccountContacts(ctx context.Context, tx querier, contactSfID
 	return tag.RowsAffected(), nil
 }
 
-func (r *salesforceContactRepo) DeactivateBySfID(ctx context.Context, contactSfID string, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
+func (r *salesforceContactRepo) DeactivateBySfID(ctx context.Context, contactSfID string, state domain.UpsertSalesforceIngestStateRequest) (bool, []domain.AffectedUser, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("deactivate contact: begin tx: %w", err)
+		return false, nil, fmt.Errorf("deactivate contact: begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := lockSalesforceContact(ctx, tx, contactSfID); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	actor := domain.SalesforceSyncActor
 	acTag, err := tx.Exec(ctx, `
 		UPDATE account_contact SET is_active = FALSE, updated_on = NOW(), updated_by = $2 WHERE sf_id = $1`,
 		contactSfID, actor)
 	if err != nil {
-		return false, fmt.Errorf("deactivate contact: account_contact: %w", err)
+		return false, nil, fmt.Errorf("deactivate contact: account_contact: %w", err)
 	}
-	userTag, err := tx.Exec(ctx, `
-		UPDATE "user" SET is_active = FALSE, updated_on = NOW(), updated_by = $2 WHERE sf_id = $1`,
+	rows, err := tx.Query(ctx, `
+		UPDATE "user" SET is_active = FALSE, updated_on = NOW(), updated_by = $2 WHERE sf_id = $1
+		RETURNING id::text, COALESCE(email, '')`,
 		contactSfID, actor)
 	if err != nil {
-		return false, fmt.Errorf("deactivate contact: user: %w", err)
+		return false, nil, fmt.Errorf("deactivate contact: user: %w", err)
+	}
+	var affected []domain.AffectedUser
+	for rows.Next() {
+		var u domain.AffectedUser
+		if err := rows.Scan(&u.ID, &u.Email); err != nil {
+			rows.Close()
+			return false, nil, fmt.Errorf("deactivate contact: user: scan: %w", err)
+		}
+		affected = append(affected, u)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, nil, fmt.Errorf("deactivate contact: user: %w", err)
 	}
 
 	// Salesforce has no LastModifiedDate to offer for a deleted record, so
@@ -224,7 +239,7 @@ func (r *salesforceContactRepo) DeactivateBySfID(ctx context.Context, contactSfI
 	// RESTORED. A contact never ingested before gets a row stamped now.
 	prior, err := getSalesforceIngestState(ctx, tx, domain.SalesforceIngestEntityContact, contactSfID)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if prior != nil {
 		state.EventModifiedOn = prior.EventModifiedOn
@@ -232,11 +247,11 @@ func (r *salesforceContactRepo) DeactivateBySfID(ctx context.Context, contactSfI
 		state.EventModifiedOn = time.Now().UTC()
 	}
 	if _, err := upsertSalesforceIngestState(ctx, tx, state); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("deactivate contact: commit: %w", err)
+		return false, nil, fmt.Errorf("deactivate contact: commit: %w", err)
 	}
-	return acTag.RowsAffected() > 0 || userTag.RowsAffected() > 0, nil
+	return acTag.RowsAffected() > 0 || len(affected) > 0, affected, nil
 }

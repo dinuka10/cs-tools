@@ -318,6 +318,18 @@ export default function OutageDetailPage(): JSX.Element {
               <Typography variant="body2">—</Typography>
             )}
           </MetaCell>
+          <MetaCell label="Internal stakeholder emails">
+            <Typography variant="body2">{outage.notifyInternalStakeholders ? "On" : "Off"}</Typography>
+          </MetaCell>
+          <MetaCell label="Outage communication emails">
+            <Typography variant="body2">{outage.outageCommunication ? "On" : "Off"}</Typography>
+          </MetaCell>
+          <MetaCell label="Impact">
+            <Typography variant="body2">{outage.impact || "—"}</Typography>
+          </MetaCell>
+          <MetaCell label="Current status">
+            <Typography variant="body2">{outage.state || "—"}</Typography>
+          </MetaCell>
           <MetaCell label="Created">
             <Typography variant="body2">{formatDateTime(outage.createdOn)} · {outage.createdBy || "—"}</Typography>
           </MetaCell>

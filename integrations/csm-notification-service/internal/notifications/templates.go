@@ -17,6 +17,7 @@
 package notifications
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/base64"
 	"fmt"
@@ -277,6 +278,76 @@ func isSafeLinkHref(href string) bool {
 type openTag struct {
 	name string
 	out  string
+
+	// cell marks a table cell (td/th); cellStart is the output offset just
+	// past its open tag, so the cell's close can trim the content written
+	// since — see closeTopTag in sanitizeRichText.
+	cell      bool
+	cellStart int
+}
+
+// The fixed tags sanitizeRichText emits for a table. The source's own table
+// attributes and inline styles are never carried over (same as every other
+// tag here) — these hardcoded strings are the whole output, so there is
+// nothing attacker-supplied in them. Borders, padding and the header
+// background are spelled out inline per cell, not in a <style> block: mail
+// clients (Gmail especially) drop or ignore a fragment-level stylesheet, and
+// Outlook only honors padding/borders set on the cell itself.
+const (
+	emailTableOpen = `<table cellspacing="0" cellpadding="0" style="border-collapse:collapse;margin:8px 0;">`
+	emailTHOpen    = `<th align="left" valign="top" style="border:1px solid #d4d4d8;padding:6px 10px;background-color:#f4f4f5;">`
+	emailTDOpen    = `<td valign="top" style="border:1px solid #d4d4d8;padding:6px 10px;">`
+
+	// The look of the editor's own code/quote blocks (see its stylesheet in
+	// apps/csm-portal/webapp/src/components/rich-text-editor/Editor.tsx),
+	// translated to what mail clients honor: inline styles, px units (Outlook
+	// ignores rem), a font stack rather than "monospace" alone (which some
+	// clients render a size too small).
+	emailCodeOpen  = `<code style="font-family:Consolas,Menlo,'Courier New',monospace;font-size:0.9em;background-color:#f4f4f5;padding:1px 4px;border-radius:3px;">`
+	emailPreOpen   = `<pre style="margin:8px 0;padding:8px 16px;font-family:Consolas,Menlo,'Courier New',monospace;font-size:13px;line-height:1.5;background-color:#f4f4f5;border:1px solid #d4d4d8;border-radius:6px;white-space:pre-wrap;">`
+	emailQuoteOpen = `<blockquote style="margin:8px 0;padding:4px 12px;border-left:3px solid #d4d4d8;color:#52525b;">`
+)
+
+// emailHeadingSizes is the font size each heading level renders at. The body
+// text is 14px, so every level is bold and steps down toward it.
+var emailHeadingSizes = map[string]string{
+	"h1": "26px", "h2": "22px", "h3": "19px", "h4": "17px", "h5": "15px", "h6": "14px",
+}
+
+// textAlignRe finds a non-default text-align in a block's style attribute.
+// left/start is the default, so only the three values that change the layout
+// are worth carrying over — and only the keyword, never the raw style string.
+var textAlignRe = regexp.MustCompile(`(?i)(?:^|;)\s*text-align\s*:\s*(center|right|justify)\s*(?:;|$)`)
+
+// blockAttrs consumes every attribute of the current block tag (see
+// drainAttrs) and returns its alignment — "center", "right" or "justify" — or
+// "" when it has none. The returned value is always one of those three fixed
+// lowercase words, never source text.
+func blockAttrs(z *xhtml.Tokenizer, hasAttr bool) string {
+	align := ""
+	for hasAttr {
+		var key, val []byte
+		key, val, hasAttr = z.TagAttr()
+		if string(key) == "style" {
+			if m := textAlignRe.FindSubmatch(val); m != nil {
+				align = strings.ToLower(string(m[1]))
+			}
+		}
+	}
+	return align
+}
+
+// voidElements are the HTML elements that never have a close tag. The
+// tokenizer reports them as plain start tags, so without an explicit case a
+// <col>/<hr>/... would be pushed on sanitizeRichText's stack and never
+// popped — leaving it on top, where every later close tag (</table> after a
+// <colgroup><col>, the editors' own table output) fails the top-of-stack
+// match and is dropped. br and img are handled before the stack entirely
+// (they emit output), so they are not listed here.
+var voidElements = map[string]bool{
+	"area": true, "base": true, "col": true, "embed": true, "hr": true,
+	"input": true, "link": true, "meta": true, "param": true, "source": true,
+	"track": true, "wbr": true,
 }
 
 // drainAttrs consumes every attribute of the current tag token without
@@ -314,16 +385,31 @@ func drainAttrs(z *xhtml.Tokenizer, hasAttr bool) {
 //
 // Allow-list, deliberately narrow — widen it only for a tag/attribute this
 // pipeline actually needs to render, never speculatively:
-//   - p, div, h1..h6: no output on open; their close renders as "<br>" —
-//     real HTML email clients render nested block tags inconsistently, so
-//     this stays intentionally flat rather than attempting real block
-//     layout
+//   - p, div: no output on open; their close renders as "<br>" — real HTML
+//     email clients render nested block tags inconsistently, so this stays
+//     intentionally flat rather than attempting real block layout. The one
+//     exception is a center/right/justify text-align, which needs a real
+//     block to carry it (see blockAttrs)
+//   - h1..h6: a real heading tag with a fixed size/weight/margin
+//     (emailHeadingSizes), plus the same text-align keyword — without this a
+//     "Impact"/"Solution" heading arrives as an ordinary line of text
+//   - blockquote, pre, code: fixed-style block/inline tags
+//     (emailQuoteOpen/emailPreOpen/emailCodeOpen) mirroring the editor's own
+//     look; without them a code block loses its monospace and spacing
 //   - br: "<br>", handled directly as a void element (see the tokenizer
 //     dispatch below for why this can't go through the generic open/close
 //     stack the way p/div does)
 //   - ul, ol, li: real <ul>/<ol>/<li> tags, so an inserted bullet/numbered
 //     list actually renders as one instead of flattening to plain lines
-//   - b, strong, i, em, u: preserved as themselves
+//   - b, strong, i, em, u, s: preserved as themselves (s is strikethrough)
+//   - table, tr, th, td: real table tags with fixed inline styling
+//     (emailTableOpen/emailTHOpen/emailTDOpen) — the source's own
+//     attributes and styles are dropped like everywhere else. A product/
+//     version matrix flattened into one value per line is unreadable, and
+//     the announcement flow's editors produce exactly that. thead/tbody/
+//     tfoot/caption/colgroup are dropped (their rows and text still render);
+//     each cell's own leading/trailing paragraph breaks are trimmed so a
+//     row doesn't grow an empty line
 //   - a: only when href resolves to a safeLinkSchemes scheme — every other
 //     attribute is dropped, and an unsafe/unparseable href drops the tag
 //     but keeps the link's own visible text
@@ -331,7 +417,8 @@ func drainAttrs(z *xhtml.Tokenizer, hasAttr bool) {
 //     comment for why http(s) is never allowed. alt is preserved if
 //     present; src itself is never kept as a data: URI — see InlineImage
 //
-// Every other tag (span, font, table, script, ...) is dropped, keeping its
+// Anything the editor can't produce and the pipeline doesn't need — span
+// styling (font size, colors), font, script, ... — is dropped, keeping its
 // inner text as plain (escaped) content — the same "no allow-list to get
 // wrong" reasoning this function's stripped-down predecessor
 // (plainTextFromHTML) always had for anything not explicitly listed above.
@@ -339,6 +426,10 @@ func drainAttrs(z *xhtml.Tokenizer, hasAttr bool) {
 // — the tokenizer hands it back as an ordinary text token, which is
 // HTML-escaped like any other text, so it can only ever render as inert,
 // visible text, never execute.
+//
+// HTML void elements (col, hr, ...) never touch the stack — see voidElements.
+// Tags still open when the input ends are closed in reverse order, so an
+// unclosed <table> can't swallow the rest of the template.
 //
 // A close tag is only honored when it matches the stack's own top entry —
 // deliberately conservative: adversarial/malformed markup (a stray
@@ -365,13 +456,38 @@ func trimBoundaryBreaks(s string) string {
 
 func sanitizeRichText(s string, budget *inlineImageBudget) (string, []InlineImage) {
 	z := xhtml.NewTokenizer(strings.NewReader(s))
-	var b strings.Builder
+	var b bytes.Buffer
 	var stack []openTag
 	var images []InlineImage
+
+	// closeTopTag pops the stack's top entry and writes its close. A table
+	// cell first drops the line breaks its own paragraphs left at either
+	// edge (every <p> closes as "<br>", so a cell like <td><p>13</p></td>
+	// would otherwise render with an empty line under the value). Only the
+	// cell's own content is copied, so this stays linear however many cells
+	// the table has.
+	closeTopTag := func() {
+		top := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if top.cell {
+			cell := trimBoundaryBreaks(string(b.Bytes()[top.cellStart:]))
+			b.Truncate(top.cellStart)
+			b.WriteString(cell)
+		}
+		b.WriteString(top.out)
+	}
 
 	for {
 		switch z.Next() {
 		case xhtml.ErrorToken:
+			// Close whatever the source left open (an unclosed <table>, <b>,
+			// <a>, ...). Every open tag this function emitted must get its
+			// close, or it would swallow the rest of the email template the
+			// fragment is embedded in — the footer's "Add Comment"/"View
+			// Case" links would end up inside the unclosed table.
+			for len(stack) > 0 {
+				closeTopTag()
+			}
 			return trimBoundaryBreaks(b.String()), images
 
 		case xhtml.TextToken:
@@ -385,6 +501,11 @@ func sanitizeRichText(s string, budget *inlineImageBudget) (string, []InlineImag
 			// source, self-closing slash or not — handling them here,
 			// before the stack push below, is what keeps the stack in
 			// sync with the tokenizer's own actual nesting depth.
+			if voidElements[tag] {
+				drainAttrs(z, hasAttr)
+				continue
+			}
+
 			switch tag {
 			case "br":
 				drainAttrs(z, hasAttr)
@@ -427,9 +548,36 @@ func sanitizeRichText(s string, budget *inlineImageBudget) (string, []InlineImag
 			}
 
 			switch tag {
-			case "p", "div", "h1", "h2", "h3", "h4", "h5", "h6":
+			case "p", "div":
+				if align := blockAttrs(z, hasAttr); align != "" {
+					// An aligned paragraph needs a real block to carry the
+					// alignment; its trailing <br> inside the block adds no
+					// extra line, so spacing matches an unaligned one.
+					b.WriteString(`<div style="text-align:` + align + `;">`)
+					stack = append(stack, openTag{name: tag, out: "<br></div>"})
+				} else {
+					stack = append(stack, openTag{name: tag, out: "<br>"})
+				}
+			case "h1", "h2", "h3", "h4", "h5", "h6":
+				align := blockAttrs(z, hasAttr)
+				open := `<` + tag + ` style="margin:12px 0 4px;font-size:` + emailHeadingSizes[tag] + `;font-weight:600;line-height:1.3;`
+				if align != "" {
+					open += "text-align:" + align + ";"
+				}
+				b.WriteString(open + `">`)
+				stack = append(stack, openTag{name: tag, out: "</" + tag + ">"})
+			case "blockquote":
 				drainAttrs(z, hasAttr)
-				stack = append(stack, openTag{name: tag, out: "<br>"})
+				b.WriteString(emailQuoteOpen)
+				stack = append(stack, openTag{name: tag, out: "</blockquote>"})
+			case "pre":
+				drainAttrs(z, hasAttr)
+				b.WriteString(emailPreOpen)
+				stack = append(stack, openTag{name: tag, out: "</pre>"})
+			case "code":
+				drainAttrs(z, hasAttr)
+				b.WriteString(emailCodeOpen)
+				stack = append(stack, openTag{name: tag, out: "</code>"})
 			case "li":
 				drainAttrs(z, hasAttr)
 				b.WriteString("<li>")
@@ -442,10 +590,26 @@ func sanitizeRichText(s string, budget *inlineImageBudget) (string, []InlineImag
 				drainAttrs(z, hasAttr)
 				b.WriteString("<ol>")
 				stack = append(stack, openTag{name: tag, out: "</ol>"})
-			case "b", "strong", "i", "em", "u":
+			case "b", "strong", "i", "em", "u", "s":
 				drainAttrs(z, hasAttr)
 				b.WriteString("<" + tag + ">")
 				stack = append(stack, openTag{name: tag, out: "</" + tag + ">"})
+			case "table":
+				drainAttrs(z, hasAttr)
+				b.WriteString(emailTableOpen)
+				stack = append(stack, openTag{name: tag, out: "</table>"})
+			case "tr":
+				drainAttrs(z, hasAttr)
+				b.WriteString("<tr>")
+				stack = append(stack, openTag{name: tag, out: "</tr>"})
+			case "th", "td":
+				drainAttrs(z, hasAttr)
+				open := emailTDOpen
+				if tag == "th" {
+					open = emailTHOpen
+				}
+				b.WriteString(open)
+				stack = append(stack, openTag{name: tag, out: "</" + tag + ">", cell: true, cellStart: b.Len()})
 			case "a":
 				var href string
 				for hasAttr {
@@ -469,9 +633,7 @@ func sanitizeRichText(s string, budget *inlineImageBudget) (string, []InlineImag
 		case xhtml.EndTagToken:
 			name, _ := z.TagName()
 			if len(stack) > 0 && stack[len(stack)-1].name == string(name) {
-				out := stack[len(stack)-1].out
-				stack = stack[:len(stack)-1]
-				b.WriteString(out)
+				closeTopTag()
 			}
 		}
 	}

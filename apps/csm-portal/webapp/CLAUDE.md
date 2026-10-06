@@ -41,9 +41,8 @@ gating on top of a real server-side gate, by explicit choice rather than by the 
 default. If a future admin-only action is added, default to the show-and-reject norm unless there's a
 specific reason (as here) to also hide it.
 
-`AddUserDialog.tsx` deliberately has no general role picker — there is still no Asgardeo-backed way
-to browse/assign a fuller role set at account-creation time. It does have one narrower, required
-control: **"User type" (Internal/External)**. entity-service's `user_type` has no plain settable
+`AddUserDialog.tsx` has two independent role-shaped controls that must not be confused with each
+other. One narrower, required control: **"User type" (Internal/External)**. entity-service's `user_type` has no plain settable
 column — it's derived by a DB trigger from role membership (`recompute_user_type`, migration 0011) —
 so this selector works by sending exactly one of `roles: ["internal"]`/`["external"]` on submit, not a
 `type` field on the wire; `external` (not `customer`/`partner`/...) is the role every
@@ -66,6 +65,21 @@ entity-service and `apps/csm-portal/backend` reject creating an external-type us
 this form sends, so there is currently only one real, selectable choice in this dropdown. This is
 meant to come out once external-type creation is ready; see entity-service's own `CLAUDE.md` for the
 full reasoning.
+
+The second, independent control is **"Portal roles"** — a checkbox per role `GET /roles/grantable`
+reports, rendered only when that list is non-empty (`useGetGrantableRoles`, fetched only while the
+dialog is open). Selected keys go out as `grantRoles` on submit, a completely separate field from
+`roles` above: `roles` only ever shapes entity-service's `user_type`, `grantRoles` only ever grants
+Asgardeo-backed portal permissions (`cs_engineer`, `escalator`, ...) via SCIM, once the user already
+exists — see `apps/csm-portal/backend`'s own `CLAUDE.md`, "Granting portal roles on user creation", for
+the full backend mechanism. This frontend never learns the real identity-provider role name/id behind
+a key; `grantableRoleLabels.ts` maps each key to its own display label (falling back to a title-cased
+version of the raw key for one this map hasn't been updated for yet, rather than hiding it). Protected
+the same way the rest of this dialog already is: **admin-only on both ends** — `GET /roles/grantable`
+and `POST /users` share the identical `PermAdmin` gate on the backend, and on this frontend the section
+only ever renders inside `AddUserDialog`, which `CsmUsersPage.tsx`'s own `canCreateUser` check already
+keeps out of a non-admin's reach entirely (see the "Add User" exception at the top of this section) —
+no second, redundant permission check was added inside the dialog itself.
 
 ## Code organization
 
@@ -188,6 +202,51 @@ Reported live: native print truncated a case to one page/dropped most comments, 
   - **A comment's `bodyHtml` must go through `commentContent.ts`'s cleanup pipeline before `stripHtmlTags`, not straight through it** — all three report generators call `preprocessCommentBodyHtml` (unwraps `[code]` wrapper tags / renders bot Markdown, then strips the backend sync layer's own "Customer comment added" label) and filter the comment list through `hasDisplayableContent` first. Skipping this (as the PDF export originally did) reproduces a real, previously-fixed bug one level up: `CsmCaseCommentBubble.tsx` already runs every on-screen comment through this exact pipeline (and already hides a comment `hasDisplayableContent` says has nothing left to show) for the same reason — some backend-synced entries carry no real message at all, just that literal label — reported live as the PDF report showing whole rows of "Customer comment added" as if that were the actual comment text, instead of either the real message or (for a label-only sync entry) not being listed at all. `preprocessCommentBodyHtml` (`@features/csm-cases/utils/commentContent`) is the shared extraction of that bubble's own preprocessing memo, kept in one place so a future fix to the pipeline (a new label variant, a new `[code]`-wrapper quirk) only has to happen once and reaches every consumer — the bubble, and any current or future non-bubble renderer of comment content (PDF export today).
   - **Every string drawn into the PDF routes through `toPdfSafeText` first** (inside `writeWrapped`/`writeReportHeader`/the table helpers — no call site needs to remember this itself). jsPDF's standard "helvetica" font only supports the WinAnsi/Latin-1 character set; a display name (or any other free text) carrying an emoji, flag/regional-indicator sequence, or a zero-width/invisible character from its source system renders as visibly garbled, widely-spaced gibberish instead of failing loudly — reported live as a name ending in stray characters like "$æ". `toPdfSafeText` iterates by Unicode code point (`Array.from`, not raw UTF-16 indexing, so a surrogate-pair emoji is consumed as one unit rather than leaving an orphaned half behind), maps common "smart" punctuation (curly quotes, em/en dash, ellipsis, nbsp) to its plain-ASCII equivalent, and drops everything else outside 0x20-0xFF. Any new PDF report generator must draw text through this kit's helpers (not raw `doc.text`/an autoTable `body` built without it) to get this for free.
   - `jspdf`/`jspdf-autotable` are dynamically `import()`ed from each page's `handleExport*Pdf` callback (not statically imported), matching the Updates feature's own convention of keeping them out of the main bundle; unlike that existing precedent, this callback wraps the import in a try/catch and surfaces a failure via `showError` (`ExportPdfButton` itself just tracks the pending/disabled state — it doesn't swallow the error, the caller owns reporting it). The button is disabled while that page's own comments query is still loading, so an export can't ever be built from a partial comment list.
+
+## Change request form: customer project, deployments, deployment products, customer group
+
+The change request create page and edit dialog share `useChangeRequestScope` (`features/csm-operations/hooks`) and `ChangeRequestScopeFields` (`features/csm-operations/components`) for **Customer Project -> Deployments / Deployment products**, plus a read-only **Customer Group** (`ChangeRequestCustomerGroupField`, same file). The hook owns the cascade; its single data source is `useChangeRequestScopeLookups` (`POST /change-requests/link-options`), which returns the project's deployments (each with its `type` — a deployment already carries its environment role, so there is **no Environments field**), the project's `customerContacts` and, for the deployments chosen so far, the deployment products that follow.
+
+- Changing or clearing the project clears the deployments below it and re-derives the Customer Group. Deployment products are never picked — they are derived (`productsReady` is false while the lookup for the current selection is in flight, and the products are then not sent).
+- **Customer Group is read-only and derived.** It is the chosen project's registered contacts (the people who approve/review at the customer gates), shown as name chips with a lock icon, helper "Derived from the customer project's registered contacts" ("Select a Customer Project first." / "—" until a project is chosen, "No registered contacts on this project…" when empty). It is not form state, not in drafts or clones, and **never sent**: the backend refuses `customerGroupId` (and `environmentIds`) with a 400. The detail page shows the same list from `customerContacts`; at a customer gate with an empty list the Approval tab explains that no customer approvers were assigned (`noCustomerContactsHelper`).
+- Sent only when non-empty. The create page sends `projectId`, `deploymentIds`, `deploymentProductIds` (plus `category`, `comment`, `workNote`); the edit dialog sends the three scope fields **together** when any of them changed (the backend validates them as a unit), and not at all once the CR has reached `implement` (the dialog locks them with the reason; the backend refuses from there on). A saved project can be swapped but not cleared (the patch cannot express "no project").
+- Clone carries the project and category, but deliberately **not** deployments / products: they name the deployment the change targets, and a clone exists to promote the change to another one. A draft or clone from before this change may still hold `customerGroupId` / `environmentIds`; they are ignored (not read, not re-saved).
+- The draft keeps display names next to the ids (`*Labels`), because the pickers only know ids; without them a restored form shows raw UUIDs.
+- The detail response's `category` is the enum value (or an `{id, name|label}` ref on older responses) — always read it through `changeRequestCategoryValue` / `changeRequestCategoryLabel`.
+- e2e: `tests/e2e/utils/fakeChangeRequestApi.ts` fakes the whole slice (projects, link-options with per-project contacts, create, PATCH, detail) with the backend's own validation (including the `customerGroupId` / `environmentIds` refusals), so the cascade, wire payload, 400 path and lifecycle are tested without creating records anywhere.
+
+## Change request Approval tab: Approve / Reject follow the backend, never the state
+
+`ChangeRequestApprovals` renders Approve / Reject on the signed-in user's own `REQUESTED` row, enabled
+only when the row's `canDecide` is not `false`; it is never told the change request's state, so it cannot
+enable anything from it. The backend keeps an approval actionable only while the change is in its stage's
+state (entity service CLAUDE.md, "An approval is only actionable in its stage's state"): the rows of a stage
+the change has left (Review's once it moves to Customer Review / Closed / Rollback / Canceled) arrive
+`CANCELLED` (no controls, a dash), and a legacy `REQUESTED` one arrives with `canDecide: false` (the
+controls render disabled with the existing "You aren't able to approve or reject this stage" tooltip). A
+decision refused with a **409** (the change moved on while the page was open) shows the backend's message
+(`ChangeRequestApprovals` shows any 4xx message) and `useDecideChangeRequestApproval` refreshes the approvals,
+detail and list queries on it, so the stale row goes away.
+
+- Tests: `ChangeRequestApprovals.test.tsx` ("a Review approver across the change request's lifecycle"),
+  `CsmChangeRequestDetailPage.test.tsx` ("lifecycle: a Review approver's Approve / Reject follow the state", on its
+  stateful fake backend, which provisions the Review stage on entering Review and cancels the rows of the stages
+  the change has left after every step like the real one), `useDecideChangeRequestApproval.test.tsx` (the 409 refresh).
+- e2e: `fakeChangeRequestApi.ts` does the same (the "Review" stage for Normal changes, a reconcile after every PATCH and
+  decision, `canDecide` false and a 409 for a stale row -- `setState(...)` moves the CR without the sweep, which is how a test
+  plants a legacy row); the cases are in `change-request-lifecycle.spec.ts` ("a Review approver's controls follow the change
+  request's state", fake API) plus two against the real local stack in its "seeded fixtures" block (CHG-FIXED-002 walked through
+  Review -> Customer Review -> Closed; a planted legacy row refused with the 409 and repaired by migration 0193).
+
+## Change request Approval tab: opening an Assignment group
+
+In `ChangeRequestApprovals`, each row's **Assignment group** is a link-button (`Link component="button"`, `aria-haspopup="dialog"`, accessible name `View members of <group>`) that opens `ApprovalGroupDialog` (`features/csm-operations/components`): the group's name as the title, **Manager / Group email / Description** when it has them, and a **"Group Members (N)"** list (name, email, a "Lead" chip for `role: "lead"`), with loading, error (`QueryErrorState` + Try again), not-found and empty states. It closes with Esc, a click outside or the Close button, and focus returns to the link.
+
+- **Internal stages** carry `assignmentGroup: {id, name}` in `GET /change-requests/{id}/approvals` (`BeChangeRequestApproval.assignmentGroup`). Opening one mounts `useGroupDetail(id)` (`GET /groups/{id}`, `ApiQueryKeys.GROUP_DETAILS`, `staleTime` 60 s, resolves to `null` on 404), so the tab makes **no group request until a link is clicked**. The id is a *group* id, not a team id.
+- **Customer Approval / Customer Review** have no group (`assignmentGroup` is `null`): their Assignment group opens the same dialog titled **"Customer Group"** listing the project's registered contacts, from data already on the page (`customerContacts`, which `CsmChangeRequestDetailPage` passes down; else the stage's own approvers) -- **no request**.
+- A stage with neither (ServiceNow data source, legacy rows) stays plain text.
+- Test by role/name, not by position: the cell now holds a button, so a row's first `button` is no longer Approve (`within(row).getByRole("button", { name: "Approve" })`).
+- e2e: `fakeChangeRequestApi.ts` serves `GET /groups/{id}` (`FAKE_PEER_GROUP` / `FAKE_CAB_GROUP` / `FAKE_ECAB_GROUP`), puts `assignmentGroup` on every internal stage (`null` on the customer ones) and has `failGroups(status)` for the error state; the cases live in `change-request-lifecycle.spec.ts` ("opening an Assignment group", fake API) plus two against the real local stack in its "seeded fixtures" block (CHG-FIXED-004's Example Corp ABT group lists Alice, Bob and Carol -- not Jane, who is only in the team, nor the customer John -- and CHG-FIXED-007's Customer Group lists Dave and Erin), which need the rebuilt BFF and entity-service.
 
 ## Testing
 

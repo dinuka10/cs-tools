@@ -8,7 +8,7 @@ This service used to also expose `POST /events` (an HTTP ingest endpoint the bac
 
 The consume→dispatch path (event bus → `dispatch.Dispatcher`) **is real** — it sends actual emails, Google Chat alerts, and voice calls — but has one known, explicitly-flagged gap:
 
-- **SMS and direct call channels are unused.** `TwilioClient.SendSMS` has no caller anywhere in this service; `MakeCall` is only invoked by `handleIncidentCreated`. Both clients/methods exist and are tested, just not wired to any event type yet.
+- **SMS is unused.** `TwilioClient.SendSMS` has no caller anywhere in this service. Voice has two: `dispatch.handleIncidentCreated`'s single immediate call (`MakeCall`), and the incident call-escalation engine (`MakeCall` or `MakeSSMLCall`, see "Incident call escalation" below), which places the many calls of a ladder.
 
 A dead-letter topic **does** exist now (see "Event-driven notifications" below) — a record that exhausts the main consumer's retries is published there rather than dropped, and a separate DLQ consumer gets its own retry pass at it. There's still no third tier past that: a record that also exhausts the DLQ consumer's retries is logged and dropped for good.
 
@@ -64,7 +64,7 @@ This service is a pure consumer: csm-portal-backend and customer-portal-backend 
 
 **Every email template (all `case.*`/CR/onboarding templates, plus both SLA breach templates above) carries an "Expected sent to: `<!-- [INTENDED_FOR] -->`" row, shown only on a debug-redirected send.** The row sits behind `applyOptionalBlock(tmpl, "INTENDED_FOR", intendedFor)` like every other optional field in this package — an empty `intendedFor` (the normal, non-debug case) drops the row entirely rather than rendering it blank, so a real recipient never sees it at all. `sendPerGroup` computes it once per group, right where it redirects `to` to `emailDebugRecipients`: `intendedFor = strings.Join(to, ", ")` (the group's real, pre-redirect recipients) when `emailDebugMode` is true, `""` otherwise — then passes it as a second argument to its `render(caseLink, intendedFor)` callback, which every `case.*` handler's closure threads straight into its `Render*` call (a new trailing `intendedFor string` param on the five plain-signature functions, a new `IntendedFor` field on every `*EmailData` struct otherwise). The three non-`sendPerGroup` paths (CR approval/plan-date-notice, both onboarding invitation/welcome emails) do the same thing inline, at their own `emailDebugMode` branch, before building their own `*EmailData`/`RenderProjectContact*` call. `Engine.sendBreachEmails` follows the identical rule: `intendedFor` is the real `AssigneeEmail`/`TeamEmail` only when `emailDebugMode` redirected `to`, empty otherwise (see that function's own "unresolved team" exception below for the one case where this row names someone with no real address at all). The point is purely operational — so someone testing against `EMAIL_DEBUG_MODE=true` can tell, from the debug inbox alone, which real recipient a given redirected copy was actually meant for — and must never leak into a production send.
 
-A case with recipients spanning both portal roles (customer-role + CSM-role) resolves to two `groupByLink` groups, which is correct: in production that's two separate emails to two different real audiences. When `emailDebugMode` is true, both groups still each send their own separate `SendEmail` call, just redirected to the same configured `emailDebugRecipients` — so a tester watching that inbox legitimately sees one email per real group. (An earlier version of this tried merging every group's already-rendered HTML document into one email in debug mode; that concatenated multiple complete `<html>` documents into one body, which is invalid markup — reverted. If a case's recipients genuinely span two portal roles, seeing two emails during debug testing is expected, not a bug — see `recipientlinks.Resolver.linkFor`'s email-domain fallback below for reducing *misclassification*-driven splits, which is a separate concern from this.) A comment/description's rich-text HTML (as ServiceNow/the portal editors produce it, e.g. `<p><span style="white-space: pre-wrap;">...</span></p>`) goes through `internal/notifications.sanitizeRichText` before it reaches any `Render*` template — a real HTML-tokenizer-based (`golang.org/x/net/html`, not regex) allow-list sanitizer, not a blunt strip-everything pass: structure (paragraphs/line breaks/lists), basic formatting (bold/italic/underline), safe hyperlinks (`http`/`https`/`mailto`/`tel` schemes only), and inline images are preserved; everything else drops to its own inner (escaped) text. An inline image is never re-embedded as a `data:` URI in the output HTML — see "The WSO2 logo showed as a broken image in Gmail" below for why that gets stripped on render — instead `sanitizeRichText` decodes it, returns it separately as a `notifications.InlineImage{ContentID, ContentType, Data}`, and rewrites the tag to a short `<img src="cid:<contentId>">` reference. Every caller (`RenderCommentAddedEmail`/`RenderInternalNoteEmail`/`RenderCaseCreatedEmail`/`RenderCRPlanDateNoticeEmail`) returns `(string, []InlineImage)` instead of a plain string for this reason; `dispatch.sendPerGroup`'s own `render` callback returns the same pair, and converts the images to `[]notifications.EmailAttachment` (via `dispatch.inlineAttachments`, each marked `Inline: true` with its matching `ContentID`) passed straight into `EmailClient.SendEmail`'s `attachments` parameter — this is what actually makes the `cid:` reference resolve to a real, displayed image rather than a broken one.
+A case with recipients spanning both portal roles (customer-role + CSM-role) resolves to two `groupByLink` groups, which is correct: in production that's two separate emails to two different real audiences. When `emailDebugMode` is true, both groups still each send their own separate `SendEmail` call, just redirected to the same configured `emailDebugRecipients` — so a tester watching that inbox legitimately sees one email per real group. (An earlier version of this tried merging every group's already-rendered HTML document into one email in debug mode; that concatenated multiple complete `<html>` documents into one body, which is invalid markup — reverted. If a case's recipients genuinely span two portal roles, seeing two emails during debug testing is expected, not a bug — see `recipientlinks.Resolver.linkFor`'s email-domain fallback below for reducing *misclassification*-driven splits, which is a separate concern from this.) A comment/description's rich-text HTML (as ServiceNow/the portal editors produce it, e.g. `<p><span style="white-space: pre-wrap;">...</span></p>`) goes through `internal/notifications.sanitizeRichText` before it reaches any `Render*` template — a real HTML-tokenizer-based (`golang.org/x/net/html`, not regex) allow-list sanitizer, not a blunt strip-everything pass: structure (paragraphs/line breaks/lists/tables/headings/quotes/code blocks, plus a center/right/justify `text-align`), basic formatting (bold/italic/underline/strikethrough/inline code), safe hyperlinks (`http`/`https`/`mailto`/`tel` schemes only), and inline images are preserved; everything else drops to its own inner (escaped) text. This list is exactly what the announcement/comment editor's toolbar can produce (checked against the HTML Lexical itself exports for each format) — so a customer sees what the author composed; font size via the editor's Body/Caption block types is the one deliberate exception, since `rem`/`px` text sizing is unreliable across mail clients. Tables (`table`/`tr`/`th`/`td`), headings, quotes, `pre`/`code` and an aligned paragraph are re-emitted as fixed, hardcoded tags with inline styling — never the source's own attributes or styles (a `text-align` is reduced to one of three keywords) — and each cell's own leading/trailing paragraph breaks are trimmed; this exists because an announcement's product/version matrix used to arrive as one value per line. HTML void elements (`<col>`, `<hr>`, ...) never touch the sanitizer's tag stack, and any tag still open when the input ends is closed in reverse order, so a malformed unclosed `<table>` can't swallow the template's footer links. An inline image is never re-embedded as a `data:` URI in the output HTML — see "The WSO2 logo showed as a broken image in Gmail" below for why that gets stripped on render — instead `sanitizeRichText` decodes it, returns it separately as a `notifications.InlineImage{ContentID, ContentType, Data}`, and rewrites the tag to a short `<img src="cid:<contentId>">` reference. Every caller (`RenderCommentAddedEmail`/`RenderInternalNoteEmail`/`RenderCaseCreatedEmail`/`RenderCRPlanDateNoticeEmail`) returns `(string, []InlineImage)` instead of a plain string for this reason; `dispatch.sendPerGroup`'s own `render` callback returns the same pair, and converts the images to `[]notifications.EmailAttachment` (via `dispatch.inlineAttachments`, each marked `Inline: true` with its matching `ContentID`) passed straight into `EmailClient.SendEmail`'s `attachments` parameter — this is what actually makes the `cid:` reference resolve to a real, displayed image rather than a broken one.
 
 **Two more real, reported email-rendering bugs, both fixed in `internal/notifications`:**
 
@@ -127,37 +127,357 @@ The "Add Comment" CTA in all four templates changed from a solid-background butt
 
 ## SLA breach-alerting engine
 
-`internal/slaengine` is **not a Kafka consumer at all** — a deliberate break from every other package in this service. It's a plain poller: `RunTicker` calls `Tick` on a `SLA_TICK_INTERVAL` timer (default `5m`), which polls entity-service's `GET /sla-status` (paginating via `EntityClient.FetchAllActiveSLAStatuses`, entity-service's own `listPageSize`/`2000`-per-page) for every currently-active SLA clock, diffs each one's live `businessElapsedPercent` against a small per-clock cursor kept in Redis, and — on a genuinely new 50%/75%/100% crossing since the last poll — publishes `events.TypeSLATierReached` and sends a Google Chat breach card directly (not routed through `internal/dispatch`).
+`internal/slaengine` is **not a Kafka consumer of its own** — `internal/dispatch.Dispatcher` is the one and only Kafka consumer in this service; `slaengine.Engine`'s three triggers (`RegisterClocks`/`ApplyStateEffects`/`CompleteResponseClock`) are called directly from three of `Dispatcher`'s existing handlers (`handleCaseCreated`/`handleStatusChanged`/`handleCommentAdded`), the same way `dispatch.checkFrustration` is. Only `RunTicker` runs as its own goroutine, scanning a Redis wake-index on a plain ticker (`SLA_TICK_INTERVAL`, default `5m`) for a newly-due 50%/75%/100% checkpoint.
 
-**Replaces an earlier, Kafka-driven design entirely** — see entity-service's own `CLAUDE.md` ("SLA status") for the full history of why. In short: that design registered a durable clock per case on entity-service's `sla_clocks` table (a hand-built stand-in, using a hardcoded severity→duration guess, created before entity-service had its own real SLA data), consumed a `sla.clock.register` Kafka event to do so, and scheduled a Redis ZSET "wake index" off a locally-computed due date to know when to check each clock. Once entity-service gained `sla`/`sla_policy` tables synced live from ServiceNow's own SLA engine, that whole apparatus became redundant with data ServiceNow already computes more accurately — so it was removed rather than kept in sync with it. `sla_clocks`, `sla.clock.register`, `SLAClockRegisterPayload`, `WakeIndex`, `Engine.Handle`, and every `SLA_CONSUMER_*` env var are gone; `events.TypeSLATierReached`/`SLATierReachedPayload` survive unchanged, since something still publishes and might one day consume that event, and `notifications.GoogleChatClient.SendSLABreachAlert`'s call signature is unchanged too — the bulk `/sla-status` response carries the same display fields entity-service used to hand back from its old per-clock `GetClock` call.
+**Division of responsibility**: entity-service's job is to *trigger* — it already publishes `case.created`/`case.status_changed`/`case.comment_added` for its own reasons, and adds exactly one new thing this engine needs that it's uniquely positioned to compute: `events.CommentAddedPayload.IsSupportEngineerResponse` (it owns the role data; this service has no identity/role lookup of its own). This engine owns the actual SLA *policy interpretation and tracking* — durations, due dates, pause/resume, tier detection, alerting — driven entirely by those events plus one small, static reference table fetched once at startup (`GET /sla-duration-policy`).
 
-- **`client.go`** — `EntityClient`, a narrow HTTP client for entity-service's `GET /sla-status`. `SLAStatus` mirrors entity-service's own `domain.SLAStatus` response exactly (`CaseID`, `ClockType`, `BusinessElapsedPercent`, `HasBreached`, `IsPaused`, `StartedOn`, plus the same eight display fields the old `Clock` type carried — case number/WSO2 case id/title/type/product/team/priority/state — and two more, `ProjectOnboardingStatus`/`IsEvaluationAccount`, added purely for this engine's own Chat-audience routing, see `sendBreachAlert` below). `ListActiveSLAStatuses(ctx, limit, offset)` calls the endpoint once; `FetchAllActiveSLAStatuses(ctx)` pages through it with `listPageSize` (2000, matching entity-service's own `maxSLAStatusLimit`) until it has every active clock — `Engine.Tick`'s only entry point into entity-service per poll. No more register/get/patch trio: this service no longer owns any SLA state of its own to write, only reads.
-- **`redis.go`** — `TierStore`, a thin wrapper around plain Redis string keys (`sla:tier:<caseId>|<clockType>` → the last tier, as an int, this engine has alerted for or seeded as a baseline), each refreshed with a generous `tierTTL` (90 days) on every write so a clock that stops appearing in `/sla-status` (completed/closed) eventually expires on its own rather than accumulating forever — there's no explicit "clock finished" signal to react to instead. Replaces `WakeIndex`'s single ZSET: with no due date of this engine's own to schedule against anymore, there's nothing to *schedule*, only a per-clock "have I already alerted for this" cursor to remember between polls. Still the **first and only Redis dependency in this repo**; `cmd/server/main.go`'s `REDIS_URL`/`REDIS_ADDR`/`REDIS_PASSWORD` construction, TLS handling, and non-clustered-only caveat are all unchanged from the old design.
-- **`engine.go`** — `Engine.Tick(ctx)` (called by `RunTicker`'s ticker loop, and directly in tests; takes no explicit "now" — every tier decision comes from each clock's own live `businessElapsedPercent`, not a comparison against a point in time the way the wake-index design this replaced needed) fetches every active status and calls `processStatus` for each, joining any errors so one clock's failure never blocks another's. `tierForStatus(s)` derives a clock's current checkpoint (`0`/`50`/`75`/`100`) from `s.BusinessElapsedPercent`, trusting `s.HasBreached` directly for the 100% case rather than re-deriving it — entity-service's own `SLAStatus` doc comment already established `HasBreached` agrees with `BusinessElapsedPercent >= 100` in every case checked live, so there's no reason to duplicate that logic here.
+**Replaces a design that polled entity-service's `GET /sla-status` in bulk, every tick** — that endpoint (backed by the ServiceNow-synced `sla`/`sla_policy` tables) turned out to be genuinely too slow at real data volumes: its `OFFSET`-paginated query re-ran a full `DISTINCT ON`/sort/join from scratch on every single page (measured live: 6-34+ seconds per page), reliably tripping the gateway timeout between this service and entity-service — the `"slaengine: tick failed" ... upstream returned 503`/connection-reset errors this redesign exists to fix. Before that, an even earlier design hand-registered a clock per case on a now-removed entity-service `sla_clocks` table (a stand-in built before entity-service had real SLA data) and scheduled a Redis wake-index off a locally-computed due date — this design revives that mechanism (the wake-index itself was always sound) without reviving its entity-service dependency: every clock's state lives in Redis now, nowhere else. `events.TypeSLATierReached`/`SLATierReachedPayload` survive unchanged across all three designs.
 
-  `processStatus(ctx, s)` is where the actual diffing happens, keyed on `(s.CaseID, s.ClockType)`:
-  - **No cursor found** (first time this engine has ever seen this exact clock, or its cursor expired) — seed the cursor at the clock's **current** tier, alerting nothing. This is the load-bearing rule the whole redesign hinges on: entity-service's `sla` table already has roughly 120,000 pre-existing in-progress rows the moment this engine starts polling after deploy, most already well past 50%/75% elapsed — alerting for all of those on first sight would flood Chat with alerts for SLAs that have been sitting at that percentage for a long time, not ones that just crossed it. Only a tier crossed on a **subsequent** poll, relative to the seeded baseline, is a genuine new crossing worth alerting on.
-  - **Current tier below the stored cursor** — the percentage went backwards since the last poll (an SLA policy reset, or a fresh tracking cycle under the same case/clock-type pair — entity-service's own live data has this happen for roughly 0.5% of clocks at least once). Rebaseline to the new, lower tier without alerting — this is a new cycle starting, not a regression to warn about.
-  - **Current tier equals the stored cursor** — no-op.
-  - **Current tier above the stored cursor** — alert for every checkpoint strictly between the stored cursor and the current tier, in ascending order (`alertTier`, which publishes `events.TypeSLATierReached` then sends the Chat card), advancing the cursor one tier at a time as each succeeds. A failure partway through (Kafka publish or Chat send) stops there and leaves the cursor at the last *successfully* alerted tier — so the next `Tick` retries only the remaining tier(s), never skipping one or re-sending one that already went out.
-
-  A paused clock (`s.IsPaused`) is skipped outright, with no Redis round trip at all — ServiceNow itself freezes `businessElapsedPercent` while paused, so there's nothing to cross either way; this replaces the old design's explicit pause check against `GetClock.PausedOn` before firing a wake entry.
-
-  `sendBreachAlert` builds the Chat card straight from `SLAStatus`'s own fields, and posts it once per resolved Chat **audience**, not once per product — see `internal/chataudience` below for the routing rules, and `googlechat_sla.go`'s own bullet for why this alert type (unlike every `case.*`/`incident.created` Chat card) routes this way. No second per-clock lookup needed either way, unlike the old design's `GetClock` call, since the bulk `/sla-status` response already carries everything `SendSLABreachAlert` needs.
-
-- **`internal/chataudience`** (`resolve.go`) — `Resolve(team, isEvaluationAccount, onboardingStatus, now, hasAudience) []string` decides which Chat audience(s) an alert should post to: a case's own `team` (when `hasAudience(team)` reports a configured space for it) or the standing `"Incident Monitor"` fallback (no team, or an unrecognized/unconfigured one), plus `"Onboarding"` on top when `onboardingStatus` is still in progress, plus `"Americas"` and/or a second `"Incident Monitor"` add during a fixed IST overnight/weekend coverage window (deduped), or `"Evaluation"` alone overriding every other rule for an Evaluation Subscription account. A pure function, side-effect-free, taking exactly the facts `SLAStatus` (via entity-service's own `domain.SLAStatus`) and `notifications.GoogleChatClient.HasAudienceSpace` already provide — shared by `internal/slaengine.Engine.sendBreachAlert` today and, per explicit product direction, meant for a future customer-frustration-detector alert as well; `case.created`/`case.acknowledged`/`case.severity_changed` route to the fixed `chataudience.IncidentMonitor` constant directly instead, with no team/onboarding/evaluation resolution at all (`incident.created` has no Chat reaction), and so have no need of this package. Lives in its own package (not `internal/dispatch`, which has no need of it any more) so `internal/slaengine` — deliberately independent of `internal/dispatch`, see `client.go`'s own package doc comment — can use it without creating an import in either direction.
-- **SLA policy/duration knowledge no longer exists in this service at all** — it used to live entirely in entity-service anyway (`sla_policy.go`, now also removed there); this engine has never computed a duration itself, and now doesn't even receive one. It only reads `businessElapsedPercent`/`hasBreached` — values ServiceNow's own SLA engine computes and entity-service's sync keeps current.
-- **Pause/resume/early-completion never reach this service as an event, same as before** — but the mechanism changed. The old design had entity-service push pause/resume/early-tier-claims into a table this service polled per-clock (`GetClock`); now there's no push at all — `businessElapsedPercent` simply stops advancing while paused and starts again on resume, entirely inside ServiceNow/entity-service's own sync, and this engine's percentage-based diffing sees that for free without any special-casing. There is also no equivalent of the old "entity-service claims all three tiers at once to suppress a later spurious alert" mechanism (a support engineer's timely response no longer needs to race this engine at all) — `businessElapsedPercent` for a completed SLA target simply stops climbing past whatever it reached, so it can never cross a tier it hadn't already crossed.
-- **`googlechat_sla.go`** — `GoogleChatClient.SendSLABreachAlert`'s first parameter is a Chat **audience** key (see `internal/chataudience.Resolve`) — the one card whose audience is genuinely resolved per-case rather than a fixed constant; every other case.* Chat card routes to the fixed `chataudience.IncidentMonitor` audience instead (see "case.* Chat cards" below). Routes via `sendCardToAudience`/`GoogleChatConfig.AudienceSpaces`/`GOOGLE_CHAT_SPACES` (`notifications/googlechat.go`, see that file's own doc comment) — an audience with no configured space is skipped (logged), not an error, same as everywhere else that mechanism is used. Everything else about the card (shape, fields, button) is unchanged by this redesign — see its own doc comment (further down this file, under "case.* Chat cards" for the general card conventions it shares) — the bulk `/sla-status` response already carries every field the card needs. `SendSLABreachAlert`'s `teamLeadName` parameter (`s.TeamLeadName`, entity-service's own `"group".manager_id` join) is appended in parens to the Team line ("`<team> (<lead>)`") when non-empty, same convention as the SLA breach team email's own Team line (below) — "" leaves the line as the bare team name.
-- **SLA breach-alert EMAIL reaction (`sendBreachEmails`, `internal/notifications/sla_breach_email.go`)** — alongside the Chat card above, `Engine.alertTier` also best-effort-sends two emails on every tier crossing: one to the case's assignee (`s.AssigneeEmail`/`s.AssigneeName`), one to the case's team email group (`s.TeamEmail`/`s.TeamLeadName`, entity-service's `"group".group_email`/manager join — a dedicated team table may replace this later, not yet needed). Both are new `SLAStatus` fields (`client.go`), entity-service-resolved, best-effort empty-string when unresolvable — `sendBreachEmails` logs and skips (not an error) when a given recipient's email is empty, same posture as everywhere else in this package that treats a missing display value as absent rather than fatal. `s.CaseNumber` falls back to `s.CaseID` here too (same as `sendBreachAlert`'s own Chat card) — a work item entity-service's case-like joins don't cover would otherwise get a blank case reference in the email subject/body. Templates: `templates/sla_breach_assignee.html` (short personal notice, "Hello <name>,") and `templates/sla_breach_team.html` (full field set, same shape as the Chat card: Title/Case ID/Type/Product/Team/Priority/State/Opened At/SLA Percentage) — rendered via `notifications.RenderSLABreachAssigneeEmail`/`RenderSLABreachTeamEmail`, sharing `SLABreachEmailData` and this file's own `slaBreachHeaderTitle`/`SLABreachEmailSubject` helpers so the Chat card, the email subject, and the email header all read identically for the same tier crossing.
-
-  **`alertTier` attempts the emails regardless of whether the Chat alert itself succeeded** — `chatErr := e.sendBreachAlert(...)` is captured but not returned immediately; `sendBreachEmails` always runs next, and only then does `alertTier` return `chatErr` (if any). A Chat space outage must not also suppress email: `processStatus` releases a tier's Redis claim and retries the *whole* tier on any `alertTier` error (same `dispatch.go` `beginRecord`/`endRecord`-style reasoning as the Chat alert's own idempotency), and if the clock completes before Chat recovers, the case drops out of the active `/sla-status` list and that retry never comes — so gating email on Chat's own success risked losing it silently. A failed *email* send is still never folded into `alertTier`'s own error return (logged and swallowed, same as before) — only a Chat failure drives the tier retry.
-
-  Because email is now attempted on every call regardless of Chat's outcome, a tier retried solely because Chat failed would otherwise re-send an already-attempted email every time Chat kept failing. `sendBreachEmails` guards against this with its own Redis claim, `TierStore.ClaimEmail(caseID, clockType, tier)` (`sla:email-claimed:` keys, `redis.go`) — a separate SETNX from `ClaimTier`'s own `sla:tier-claimed:` keys, claimed once per tier regardless of the email send's own success/failure (mirroring the "best-effort, not retried" contract) and never released: only a genuine Chat failure ever triggers a retry of this tier, and that retry must find the email step already done. `NewEngine`'s three trailing params (`email *notifications.EmailClient, emailSendingEnabled, emailDebugMode bool, emailDebugRecipients []string`) gate this the same way `dispatch.Dispatcher` gates every other email: `emailSendingEnabled=false` or a nil `email` client skips entirely (not an error, and does not claim); `emailDebugMode=true` redirects `to` to `emailDebugRecipients` (skipped, logged, if that list is empty) while still rendering the body as if sent to the real address — see "Expected sent to:" below for how that shows up in the body.
-
-  Every outcome inside `sendBreachEmails`' own `send` closure (skip/sent/failed) is logged with a `recipient` attribute (`"assignee"` or `"team"`) — without it, both calls log an otherwise-identical line (same `caseId`/`clockType`/`tier`), making "which recipient was this about" unanswerable from the log alone on its own, a real gap hit diagnosing a live missing breach email. The team recipient also has one exception the assignee doesn't: when `s.Team` (the team's name) resolved but `s.TeamEmail` didn't (the team itself is known, its group just has no configured `group_email` yet — common while this data is still being backfilled), and `emailDebugMode` is on, the email still sends to `emailDebugRecipients` with the body's "Expected sent to:" row naming the team directly (`"<team> (no email on file)"`) rather than being silently skipped — so confirming team *routing* resolved correctly doesn't depend on every test environment also having every team's `group_email` filled in. Production never does this regardless of debug mode — there is still no real address to send to. An unassigned case's assignee has no equivalent name worth surfacing this way, so that recipient stays skipped in debug mode exactly as in production.
-- **`dispatch.go`'s `Handle` switch has an explicit no-op case for `events.TypeSLATierReached`** — still in `KnownTypes` (so `IsKnown()` passes) and still has a `Validate` case (so a genuinely malformed one is still rejected), but `dispatch.Dispatcher` itself has no reaction to it; returning `nil` rather than falling through to the switch's `default` is required, since erroring would burn the main consumer's retries and dead-letter an event that was never broken, just not this consumer's concern. `events.TypeSLAClockRegister` no longer exists at all — nothing publishes it anymore, so there's nothing left for any consumer to ignore.
+- **`client.go`** — `EntityClient.GetDurationPolicy(ctx)` is the *only* entity-service call this engine makes now, and only once, at `cmd/server/main.go` startup: `GET /sla-duration-policy` (a small, static reference table — at most 15 rows, severity × clock type, seeded directly from WSO2's own published Enterprise Support Policy, independent of `sla`/`sla_policy`) is parsed into `map[severity]map[clockType]time.Duration`, keyed by the same uppercase English word (`"CATASTROPHIC"`) a `case.created` payload's own `Priority` field carries — no translation needed to look a case's durations up by its own severity. A fetch failure here is loud (`slog.Error`) but not fatal: `main.go` simply never constructs the engine or starts `RunTicker` for this run (SLA tracking disabled, not a crash loop) — this is a nice-to-have layered on top of the notification channels this service exists for, not core delivery.
+- **`redis.go`** — `Store` holds everything in Redis, nothing durable anywhere else:
+  - **`sla:wake`**, one ZSET for the whole engine — member `"<caseId>|<clockType>|<tier>"`, score = that tier's due-at Unix timestamp. Ported from the pre-poll design's own `WakeIndex`.
+  - **`sla:clock:<caseId>|<clockType>`**, one HASH per clock — the Chat card's own display fields (`caseNumber`/`wso2CaseId`/`caseTitle`/`caseType`/`product`/`team`/`priority`/`startedAt`, written once by `RegisterClocks` and never refreshed, except `state`, which `ApplyStateEffects` keeps current on every `case.status_changed`), a `paused` flag, and an `alertedTier` cursor (0/50/75/100 — the highest tier already alerted *or force-completed*, same semantics a plain poll-engine cursor would have, just stored alongside the clock's own metadata instead of as a separate key). All refreshed with a generous `clockTTL` (90 days) on every write, so a clock with no further write ever touching it (a long-closed case) expires on its own.
+  - **`sla:tier-claimed:<caseId>|<clockType>|<tier>`**, a plain SETNX claim per tier — unchanged in spirit from the poll-engine's own `TierStore.ClaimTier`: if this service is ever deployed with more than one replica, only the replica that wins the claim alerts.
+  - `AdvanceAlertedTier` is a Lua script (ported from the poll-engine's own `advanceTierScript`, just against a hash field instead of a plain key) that only ever moves the cursor *forward* — the same compare-and-set two independent callers (a `Tick` claim, and `CompleteResponseClock`/`ApplyStateEffects`' `CLOSED` branch) need to never race each other backward.
+- **`engine.go`** — the three triggers, then the ticker:
+  - **`RegisterClocks(ctx, caseID, priority, createdAt, caseNumber, wso2CaseID, caseTitle, caseType, product, team)`** (called from `dispatch.handleCaseCreated`) looks up `priority` in the duration-policy map, and for each clock type the policy actually has an entry for at that severity (LOW/S4 has `response` only — see migration `0192`'s own seed data; nothing is registered for a type the policy has no row for) computes `dueAt = createdAt.Add(duration)`, applies `avoidWeekend` (rolls a Saturday/Sunday due date to the next Monday) only for `resolution` at `MEDIUM`/S3 — the one duration published as "1 Business Week" rather than a flat interval — writes the clock's metadata hash, and schedules its three (50/75/100%) wake entries via `tierTime(createdAt, actualDuration, tier)`. Both `avoidWeekend`/`tierTime` are ported verbatim from the pre-poll design.
+  - **`ApplyStateEffects(ctx, caseID, newStatus)`** (called from `dispatch.handleStatusChanged`, unconditionally — every effect here is idempotent, so a resent status change is harmless) matches `newStatus` case-insensitively against entity-service's own human display labels (`"Awaiting Info"`/`"Solution Proposed"` → pause `workaround`+`resolution`; `"Closed"` → force-complete `resolution` (`AdvanceAlertedTier` to 100) and pause `workaround` (there is still no real "workaround provided" signal anywhere in the events this engine consumes — a documented, accepted gap carried forward unchanged from every earlier design); anything else → resume both) and refreshes all three clocks' own `state` field for the next breach card, regardless of which branch fires.
+  - **`CompleteResponseClock(ctx, caseID)`** (called from `dispatch.handleCommentAdded`, only when `events.CommentAddedPayload.IsSupportEngineerResponse` is true) force-completes the response clock the same way — `AdvanceAlertedTier` to 100, idempotent under a redelivered comment-added event.
+  - **`Tick`/`RunTicker`** scan `sla:wake` for everything due at or before now and process each (`processDueMember`): drop it outright (removing the wake entry either way) if the clock is unregistered, paused, or already covered by `alertedTier` — the known, accepted gap this carries forward from every earlier design is that a **paused** clock's due member is dropped, not rescheduled for after resume; otherwise claim the tier (`ClaimTier`), and on a win, `alertTier` — publish `events.TypeSLATierReached`, then `sendBreachAlert`. A Kafka publish failure is a real, retried error (the claim is released, the wake entry stays for the next tick); a Chat-send failure is logged only and never retried — same explicit, carried-forward product decision the poll-engine made, for the same reason: retrying would mean re-claiming the tier, and one persistently broken Chat space would otherwise turn into an unbounded stream of duplicate alerts to every *other*, perfectly healthy space, repeating every tick forever.
+  - `sendBreachAlert` builds the Chat card straight from the clock's own stored metadata (no live entity-service lookup left to refresh it from) and posts once per resolved Chat **audience** — see `internal/chataudience` below. **Known, accepted reduction from the poll-engine's own version**: `isEvaluationAccount`/`onboardingStatus` are always `false`/`""` here (no event this engine consumes carries them any more — `case.created`'s own copies of those two fields are themselves long-deprecated and unused, see `events.CaseCreatedPayload`'s own doc comment), and `teamLeadName` is always `""` (no event carries that either, and there is no live lookup left to resolve it from). Both are purely routing/display niceties that degrade gracefully to `chataudience.Resolve`'s own team-then-"Incident Monitor" fallback and a bare team name on the card — not a crash, not silently wrong data, just less routing/display richness than a live bulk lookup could offer.
+- **The poll-engine's own SLA breach-alert EMAIL reaction (`sendBreachEmails`) is gone, not ported — a deliberate scope decision, not an oversight.** That feature needed `AssigneeEmail`/`TeamEmail`/`AssigneeName`, all resolved from entity-service's own live, bulk `/sla-status` join — none of which exist on any event this engine now consumes (`case.created`/`case.status_changed`/`case.comment_added`), and adding them would mean a further entity-service payload change, out of scope for this pass. The Chat alert (this service's primary alerting channel for every other event type too — `case.created`/`case.acknowledged`/`case.severity_changed`/frustration-detection all alert via Chat, with email as at most a secondary channel for ordinary `case.*` notifications, never for SLA breaches before this gap) is unaffected. Revisit by extending `case.created`'s payload with these fields if email parity is ever wanted back. `internal/notifications/sla_breach_email.go` and its two templates (`templates/sla_breach_assignee.html`/`sla_breach_team.html`) had no caller left once this feature was removed and were deleted outright, not left dangling.
+- **`internal/chataudience`** (`resolve.go`) — unchanged: `Resolve(team, isEvaluationAccount, onboardingStatus, now, hasAudience) []string` decides which Chat audience(s) an alert should post to, shared by `slaengine.Engine.sendBreachAlert` and `dispatch.checkFrustration`.
+- **`googlechat_sla.go`** — `GoogleChatClient.SendSLABreachAlert`'s call signature is unchanged by this redesign (`teamLeadName` is simply always passed `""` now — see `sendBreachAlert`'s own doc comment above).
+- **`dispatch.go`'s `Handle` switch still has an explicit no-op case for `events.TypeSLATierReached`** — unchanged: still in `KnownTypes`, still has a `Validate` case, but no reaction of its own; nothing in this service consumes that event.
+- **No new Kafka event type, no new consumer group, no new topic.** `RegisterClocks`/`ApplyStateEffects`/`CompleteResponseClock` are plain function calls from within `Dispatcher`'s own existing handlers, on the existing main consumer — only `RunTicker` is a separate goroutine, same as before.
+- **A case created before this engine's first deployment has no registered clock, and never will unless backfilled.** `RegisterClocks` only ever runs from `handleCaseCreated` — there is no backfill job. A one-off script reading existing cases and calling `RegisterClocks` per case would close this; not built here.
 - **`internal/timecardengine`/`events.TypeCaseBillableStatusChanged` no longer exist, on either side.** This used to be a dedicated consumer group here reacting to a case's severity crossing the LOW/S4 boundary (bulk-flipping every time card's `isBillable` for the case), with entity-service's own `Publish` call for it left commented out pending a Postgres `time_cards` table there. By the time that table existed (`time_card`/`time_card_approver`, already fully wired up — see entity-service's own CLAUDE.md), it became clear the event hop itself was never justified: entity-service already owns this data directly (a single `UPDATE time_card SET is_billable = ... WHERE case_id = ...`), so the reaction now happens there, synchronously, in-process — no Kafka round trip, no separate consumer group, no cross-service failure mode for what both ends recognized was never actually a notification to an external system. Removed entirely rather than left wired-but-dormant.
+
+## Cases and incidents are different entities
+
+A **case** is entity-service's `POST /cases` and `domain.CaseView`, carried by
+the `case.*` events. An **incident** is `POST /incidents` and
+`domain.IncidentView`, carried by the `incident.*` events. Both families exist
+here and they are not interchangeable: `case.comment_added` and
+`incident.comment_added` are different payloads about different entities, and
+`dispatch` reacts to the first while `internal/paging` reacts to the
+second.
+
+**"SRE incident" is not a third thing.** `integrations/sre-alert-ingestion-service`
+turns a vendor alert (Azure, Grafana, Site24x7, OpenSearch) into a platform
+incident through that same `POST /incidents`, so an alert-born incident is
+exactly what the `incident.*` events describe, and the call-escalation ladder
+below escalates it like any other. There is no separate SRE entity.
+
+## Incident call escalation
+
+The ladder lives in `internal/paging`, not `internal/escalation`: that
+package is the customer-frustration detector's client (next section), and
+"escalation" is the customer-initiated feature's word. The two share no
+code, types or configuration.
+
+`internal/paging` runs the incident call-escalation ladder from the
+"Synchronizing Twilio Alerts for New Incoming Incidents Based on ABT Model"
+specification: an unattended incident climbs five rungs (LEVEL_0 rotation
+lead/members — rotations only — then ABT leads, ABT team leads, Head of BU,
+Head of CRE), each rung placing several calls spaced apart before escalating,
+on a clock set entirely by the incident's priority (section 7.0's table, in
+`policy.go`'s `DefaultPolicy`, verbatim — with two documented divergences
+where the document's own rows don't sum to its stated totals; the formula
+wins and tests pin both). Like `internal/slaengine`, it is its own consumer
+group on the shared topic (`INCIDENT_ESCALATION_CONSUMER_GROUP`) plus a
+ticker, with Redis as its only durable state — the same `REDIS_URL`/
+`REDIS_ADDR` client, its own keys. Structure:
+
+- **`policy.go` / `plan.go` — pure.** `Lookup` resolves a priority (P-notation
+  or a label: both the case-severity vocabulary and ServiceNow's incident
+  priority enum, whose `MODERATE` is the spelling `MEDIUM` — `PLANNING` is
+  deliberately absent, section 7.0 has no row below P4). `BuildPlan` expands a
+  `Trigger` into every `PlannedCall`, resolving recipients **once per rung**
+  (a live roster could otherwise answer two attempts of one rung
+  differently). `ExecutionSummary`/`WorkNote` render section 11.0's work note
+  from the engine's *placed flags*, not from scheduled times — a cancellation
+  and a call due at the same instant race, the cancellation wins, and
+  reporting by time alone claimed calls that never happened.
+- **`resolver.go` — the seam.** `RoutingContext.HasNotificationLevel` decides
+  whether LEVEL_0 exists: rotation shifts only, **and on USA_WEEKEND only when
+  not ABT-eligible** (rule R10 has no notification level, R12/R14 do — the one
+  input that changes the ladder's shape rather than who answers).
+  `ABTEligible` is a `*bool` in both the payload and the routing context,
+  because there are three states: eligibility splits the rule table in half,
+  so "nobody told us" is genuinely different from "told no" — and it is the
+  common case, since no publisher sets it. Unknown reports the rule as
+  `UNKNOWN_ABT` rather than a confident wrong row, and keeps LEVEL_0 on a
+  USA_WEEKEND rotation (waking one extra person is the recoverable error;
+  dropping the fastest rung on a weekend night is not).
+  `RoutingContext.Rule` names which of section 5.0's fourteen rows an incident
+  routes by; nothing branches on it, it exists so the path is *reportable* —
+  it's in the schedule log line, every placed call, both endings, and the work
+  note. `Resolver` is the interface the rule table's data plugs into.
+  **`RosterResolver` is a stopgap**: the specification resolves recipients
+  from ServiceNow (`sys_user_group_type`, `u_team_member_role`, the On-Call
+  Scheduling module), none of which is reachable here, so an operator roster
+  (`INCIDENT_ESCALATION_ROSTER`, JSON) implements the table's specificity
+  order — team, then shift pool, then default — against hand-maintained data.
+  Section 8.0's LEVEL_0 availability filtering is not implemented (no
+  schedule to read). `StaticResolver` is for tests.
+- **`shift.go`.** `ShiftAt` derives the effective shift from the trigger
+  time in IST (section 6.0's boundaries); the night shift straddles midnight,
+  so pre-06:00 hours belong to the shift-day that opened the night before.
+  This assumes ServiceNow's `openedOn`/`createdOn` are UTC — the whole repo's
+  existing `parseSNDateTime` assumption, but a 5.5-hour error here puts an
+  incident in the wrong shift entirely, so confirm it against a real record.
+- **`engine.go` / `store.go` — the two halves.** `Handle` reacts to four
+  events: `incident.created` claims the incident **create-if-absent** (a
+  redelivered trigger must not restart a ladder from LEVEL_0);
+  `incident.priority_elevated` deliberately **replaces** a running ladder,
+  retiring its outstanding calls; `incident.acknowledged` (leaving NEW) and a
+  public `incident.comment_added` are the two halves of an acknowledgement and
+  **both are required**: each is recorded on the ladder's own state as it
+  arrives, in either order, and the ladder keeps climbing until the second one
+  does. A status move on its own is what a dispatcher does while triaging a
+  queue, and treating it as an answer silenced the pager for incidents nobody
+  had picked up. `acknowledgement.requireBoth: false` restores the old
+  either-gesture rule. A work note
+  (`isPublic: false`) is ignored. `Tick` (every `INCIDENT_ESCALATION_TICK_INTERVAL`,
+  default 5s — finer than the SLA engine's, since P0's calls are a minute
+  apart) scans the wake ZSET, and for each due call: **place, then record,
+  then drop the wake entry** — a crash between the first two repeats the call
+  next tick, which is the direction to fail in for a paging system.
+  **A trigger whose last call is already in the past is dropped**: this
+  group reads the topic from its first offset the first time it exists, so
+  the first deployment replays retention, and without that guard the next
+  tick burst-dials every rung of every stale incident. A short backlog still
+  catches up correctly (offsets are from the report time on purpose).
+- **`client.go`.** A narrow entity-service client whose one job is PATCHing
+  the execution summary onto the incident as a work note. **Optional**
+  (`CUSTOMER_ENTITY_BASE_URL` unset → summary logged instead), unlike the SLA
+  engine's — this engine's job is placing calls; the summary is a record.
+  Loop-safe: a work-notes-only PATCH publishes no escalation signal, and
+  `incident.comment_added` comes from a different endpoint this never calls.
+- **`config.go` — what a deployment may spend.** `INCIDENT_ESCALATION_CONFIG`
+  points at a YAML file governing **both** ladders (`cre:`/`sre:` sections):
+  an `enabled` master switch, a per-ladder `channel`, `trigger` conditions
+  (`priorities`/`teams`/`excludeTeams`/`shifts`/`requireKnownTeam`) deciding
+  which incidents get a ladder at all, and `safety` caps
+  (`maxCallsPerLadder`/`maxLevel`/`allowedNumbers`) capping what one ladder may
+  spend. It is a file rather than more environment variables because every
+  knob in it changes how many calls get placed, and therefore the bill — and
+  because the answer to "what will this deployment dial" should be one
+  readable thing, not eight variables assembled by hand from a container spec.
+  Rules worth keeping: an **unreadable or invalid file disables both ladders**
+  and logs it, never a silent fall back to defaults nobody chose; an
+  **unknown key is an error** (`KnownFields(true)`), because a misspelled
+  `maxCallsPerLadder` that is quietly dropped leaves an operator certain they
+  have capped the spend when they have not; `safety.maxLevel` is a **`*int`**
+  so absent and `0` are different — LEVEL_0 is a legitimate cap and the zero
+  value of the struct (what a deployment with no file, and every hand-built
+  `EngineConfig` in tests, gets) must mean *no* cap, not "truncate every ladder
+  to one rung". With **no `INCIDENT_ESCALATION_CONFIG` set at all** the service
+  behaves exactly as it did before the file existed, so adopting it is opt-in;
+  `INCIDENT_ESCALATION_ENABLED` overrides the file's master switch in both
+  directions, so a ladder can be stopped without editing and shipping a file
+  mid-incident. `Engine.applySafety` trims a freshly built plan to the caps
+  **before it is stored**, recording a `PlanIssue` (`LEVEL_CAPPED`,
+  `NUMBER_NOT_ALLOWED`, `CALL_CAP_REACHED`) for each, so a ladder reaching
+  fewer people than the rules say lands on the work note rather than being a
+  quiet saving.
+- **`notifier.go` - which channel a rung reaches people on.** The ladder's
+  timing, routing and cancellation are channel-agnostic; only the last hop
+  differs. `INCIDENT_ESCALATION_CHANNEL` picks `call` (the specification's
+  own, and the default), `chat` (a card in the incident's Google Chat space
+  via `SendEscalationAlert`), `both`, or **`log`** — which runs the entire
+  ladder and writes a line per rung naming who it *would* have reached,
+  reaching nobody. `log` exists because the two channels that reach people
+  both need an account: calls cost money per rung, chat needs a webhook for a
+  room real colleagues sit in, and neither is something to point at a test.
+  It is a channel rather than a global dry-run flag so it appears where every
+  other delivery decision does, and it is **exclusive** — `Channel.Uses`
+  reports false for `log` against `both`, so a log ladder wires that notifier
+  and nothing else; a live ladder that also emitted "would notify" lines would
+  read like a dry run mid-page. It logs the recipient's **name only**, never
+  an address or a number. **A chat card does not wake anyone**
+  - the initial Chat alert already exists and the ladder exists because it
+  was not enough overnight - so `chat` alone is a real reduction in what the
+  feature does. Where it earns its place is alongside the calls, giving the
+  room sight of an escalation climbing, and as the only channel exercisable
+  end to end without a telephony account. Chat posts **once per rung**, not
+  per attempt: a rung's repeats exist because a phone went unanswered, a
+  question a posted card cannot ask, and a P1 ladder's fourteen attempts
+  would bury the room. With `both`, each channel is attempted even if the
+  other fails.
+- **`internal/notifications/ssml.go`.** `MakeSSMLCall` speaks a typed
+  `Speech` tree as real nested SSML inside `<Say>`. It exists because
+  `MakeCall`'s chardata escaping — correct, and what stops TwiML injection —
+  read an SSML *string*'s tags aloud. The tree keeps both properties: markup
+  on the wire, text that can never become markup (caller text only ever
+  reaches the document through `xml.CharData`). Opt-in via
+  `INCIDENT_ESCALATION_SSML=true`. No `<speak>` root: in TwiML, `<Say>` is
+  the root.
+
+### The SRE ladder (`sre.go`, `teamschedule_sre.go`)
+
+There are two ladders, and **one engine per ladder**: `cmd/server/main.go`
+starts a CRE engine and an SRE engine (`EngineConfig.Kind`), each with its own
+channel, its own consumer group (`INCIDENT_ESCALATION_CONSUMER_GROUP`,
+`INCIDENT_ESCALATION_SRE_CONSUMER_GROUP`) and its own Redis namespace
+(`Store.ForLadder` -- the CRE ladder keeps the original keys, so ladders stored
+before this existed are still found). One engine per ladder because **a P0 CRE
+incident climbs both at once**: sharing one namespace would make the second
+SETNX look like a redelivery, and sharing one wake index would let each tick
+place the other ladder's calls over its own channel.
+
+**Which ladders an incident climbs is configuration, not code**: the file's
+top-level `routing:` section (`routing.go`). `Engine.claims` matches the
+incident's team family (`sre` / `cre` / `none`, from
+`TeamScheduleResolver.TeamFamily`), `contactType` and priority against the
+rules, and an engine claims the incident when a matching rule names its ladder
+-- so one incident can climb both. A rule with **no** `team` condition
+(`monitoring`) deliberately takes team-less incidents and overrides that
+ladder's `trigger.requireKnownTeam`; a rule that merely lists `none` among its
+teams (`cre-team`) matches them but leaves the decision to that ladder's own
+`requireKnownTeam`, so the CRE side keeps control of CRE. Absent, `DefaultRouting` applies:
+
+    cre-team      team [cre, none]                       -> cre
+    sre-abt-team  team [sre]                             -> sre   (sheet "Yes" rows)
+    cre-p0        team [cre], priority [P0, CRITICAL]    -> sre
+    monitoring    contactType [AZURE, SITE_247, SENTINEL]-> sre   (sheet "No" rows)
+
+`contactType` comes from entity-service's `incident.created`
+(`IncidentCreatedPayload.ContactType`, the incident view's label, falling back
+to the create request's); it is compared ignoring punctuation, so `SITE_247`
+matches the database's `SITE_24_7`. The one rule kept in code is a property of
+the SRE ladder, not of routing: its clock ignores priority, so an elevation
+starts an SRE ladder only through a rule that conditions on priority.
+`crePriorities` (the earlier SRE-only setting) is gone -- an unknown key, so a
+file still carrying it fails to load rather than being silently ignored.
+
+An incident is an SRE team's when its assignment group (after
+`sre.teams.aliases`) is in `sre.teams.abts`; with no list configured, the Team
+Schedule catalogue's team `family` answers.
+
+    LEVEL_0  L1 support   at once
+    LEVEL_1  L2 support   +interval (5m)
+    LEVEL_2  L3 support   +interval
+    LEVEL_3  L4 support   +interval, only with sre.timing.includeL4 (NOT CONFIRMED)
+
+**One call, one person per rung**, the same clock for every priority, and **no
+priority gate** -- `PolicyFor` gates only the CRE ladder on priority; an SRE
+incident at PLANNING still gets its clock. The clock is `sre.timing`
+(`SRETiming.Policy`); without a file, `INCIDENT_ESCALATION_SRE_L4` still turns
+L4 on. A rung is whoever holds that **tier** on an SRE window at the instant
+**that rung opens** (on-duty `tier`, else the window's own) -- not the report
+instant: a ladder reported at 13:25 opens L2 at 13:30, inside TZ2, and asked
+at 13:25 it called TZ1's L2 after they had gone home, or nobody when TZ1 had
+no holder for the tier. `BuildPlan` sets `RoutingContext.At` to the rung's
+opening time for the SRE ladder only; the CRE ladder keeps the report instant,
+its rungs being fixed by the shift the incident arrived in. Picked in this order: the
+incident's own SRE team; then the zone whose L1 block is live -- weekdays
+12:00-15:00 IST the TZ1 and TZ2 escalation windows are both live, and the SRE
+team confirmed only one person is called; then `sre.teams.abts` order; then
+email. The rota has no L4 tier, so L4 is the lead of the answering team -- the
+incident's own, or for a CRE P0 the team of whoever took L1. An assumption.
+
+**Stops on**: `incident.assigned` (an engineer set as the assignee, published
+by entity-service) or `incident.acknowledged` (leaving NEW). A public comment
+does **not** stop an SRE ladder -- it may be a third party triaging -- and an
+assignee does not stop a CRE one (the engine's `Kind` decides; there is no
+per-plan check). An elevation never restarts an SRE team's ladder: its clock
+does not depend on priority. The voice message and card say "assign the
+incident to yourself", and the rule is reported as `SRE_TIERS`.
+
+**Configuration** is the file's `sre:` section, the same shape as `cre:` plus
+`timing` and `teams.abts`/`teams.aliases`; who climbs it is `routing:`. Each
+ladder's own keys are refused on the other (a `timing:` under `cre:` is an
+error, not ignored), and a team in both `cre.teams.abts` and `sre.teams.abts` is
+an error -- its lead would still be called on every CRE ladder's
+`all_team_leads` rung.
+
+**Numbers**: the rota holds none. `INCIDENT_ESCALATION_PHONES` (JSON, e-mail ->
+E.164) or `INCIDENT_ESCALATION_TEST_CALL_TO` (every call to one number) fill
+them through `TeamScheduleResolver.WithPhoneBook`. A chat-only ladder needs
+neither.
+
+**Where alert-born incidents come from.** `sre-alert-core-service` creates the
+CSM incident (`engine.deliverAndPersist` -> `notify.NotifyCSM` -> `POST
+/incidents` on csm-integration-service, which passes the body through to
+entity-service). entity-service publishes `incident.created` through
+`publishIncidentCreatedEvent` on every data source, plain `postgres` included,
+once the insert commits; the event is enriched from the stored incident, so it
+carries the team, priority and contact type routing reads. The create request
+sends `contactType` when the alert's source has one (AZURE, SITE_247,
+SENTINEL), which the `monitoring` rule matches. It sends no assignment group:
+entity-service assigns the incident to its service's support group (#2353), and
+that group's family is what the `sre-abt-team` rule matches. The local
+end-to-end tools (`sre-e2e.sh`, `trigger-escalation.sh`) still publish the
+event themselves, through `entity-service/internal/tools/publishincident`, to
+drive a ladder without creating an incident.
+
+**Wiring** (`cmd/server/main.go`): inside the Redis block, started only when
+the ladder has somebody to resolve rungs from (`escalationStartProblem`): the
+Team Schedule, with `INCIDENT_ESCALATION_RESOLVER=team-schedule` and
+`CUSTOMER_ENTITY_BASE_URL` set, or else a non-empty
+`INCIDENT_ESCALATION_ROSTER` — a ladder that can never call anyone is worse
+than an absent one, because it looks like coverage. The roster is required
+only when it is what the ladder reads (it used to be required in both modes);
+one that is set but does not parse stops the engine either way. Shares `CALL_SENDING_ENABLED` with the dispatcher's call. Startup
+warns when `INCIDENT_DEFAULT_CALL_TO` is also set: the dispatcher's single
+immediate call predates the ladder and is **not** in the specification (its
+initial reaction is the Chat alert and an email); unset it once the ladder
+covers an environment, or an incident gets both.
+
+**Phone numbers** come from each person's own CSM Portal profile. The Team
+Schedule names who to call but holds no numbers, and a call plan drops anyone
+without one (`NO_NUMBER`). `ProfilePhoneResolver` wraps whichever resolver is
+in use and fills a missing number from the person's Asgardeo user (the
+portal's profile dialog writes the `mobile` phone there; `scim.Client.MobileNumber`
+reads it back), once per person per two minutes, 3 s per lookup. A number
+named in `escalation.yaml` is never replaced; a lookup that fails, times out
+or is not E.164 leaves that one person `NO_NUMBER` and never fails the tier.
+`phones.source: none` turns it off. Nothing is persisted outside the plan, and
+the number is never logged.
+
+**Calls switch on when the ABT lead pool is verified.** Before any call is
+placed, `applySafety` asks the resolver for its whole lead pool
+(`LeadPoolResolver`; every `lead` on the ABT teams, numbers filled from
+profiles) and, if any lead has no E.164 number, holds the plan's calls
+(`safety.callWithoutVerifiedLeads: true` overrides). Without this, a lead tier
+with no numbers is skipped as `NO_NUMBER` and an unanswered incident of any
+priority climbs from LEVEL_0 straight to the heads. Separately, the heads
+(LEVEL_3/LEVEL_4) are held when no call on LEVEL_0..LEVEL_2 has a number
+(`safety.callHeadsWithoutLowerTiers: true` overrides).
+
+Both holds are setup, not incident outcomes, so they are **logged only, never
+written to the work note**: a call-only ladder held by the gate schedules
+nothing and writes no note (`Plan.CallsHeld`); with `both`, entries keep their
+chat cards and only the call is skipped (`PlannedCall.HoldCall`). A resolver
+without a lead pool (the hand-maintained roster, whose entries carry numbers)
+is not checked. To keep calls off entirely regardless, use `channel: chat` or
+`log`.
+
+**Not built**: the email at each rung (section 10.0), the two
+erroneous-scenario emails (section 12.0), LEVEL_0 availability filtering
+(section 8.0), a ServiceNow-backed `Resolver`. **No longer relevant**: `abtEligible` was never populated by any publisher, so
+every incident used to route as `UNKNOWN_ABT`. The updated rule table does not
+ask: whether an incident is on an ABT team is answered from the team's own
+`team.type`, which entity-service already records, and the matched rule's id is
+stamped onto the routing context by `BuildPlan` and reported everywhere. The
+field remains on the payload for decode compatibility and is unread.
+
+**Testing**: `matrix_test.go` walks all fourteen rules against all five
+priorities; `store_test.go` runs against a real Redis when one is reachable
+(`REDIS_URL` first, then `REDIS_ADDR`) and skips otherwise. See "Testing the
+incident call escalation" in `README.md` for exercising a ladder end-to-end
+against the local Team Schedule or the full service.
+
+## Frustration detection (`case.comment_added`)
+
+`dispatch.checkFrustration`, called from the top of `handleCommentAdded` for every `case.comment_added` event, sends a new comment to the existing `ai-escalate-comment-detector` service (a separate deployable, not part of this repo) for an OpenAI-backed frustration analysis, and posts a Chat alert when that service's own configured threshold is crossed. Entirely optional and best-effort: unset `ESCALATION_DETECTOR_BASE_URL` means the step is a no-op (no detector configured, so `d.frustrationDetector` stays `nil`), and any failure along the way (the role lookup, the detector call, the Chat post) is logged and swallowed, never propagated as the record's own error — the comment's own email reaction, driven entirely by the code below this call, is the primary thing this handler exists for.
+
+- **`internal/escalation`** (`client.go`) is a minimal client for the detector's single-comment `POST /escalations` endpoint — not `/contexts` (the multi-comment endpoint that service's own code uses to post its own, unrelated Google Chat alert to its own configured space; this client never calls it, so that code path and that space are never involved here). `DetectEscalation(ctx, caseID, caseNumber, product, comment)` fills `commentPostedTimestampInSN`/`snCustomerServiceCaseSysId` with best-effort placeholder values (the current time, an empty string) — required fields on the detector's own `EscalationRequest` type that this client has no real source for and that service only uses for echoing back in its response/its own debug logging, never for the analysis itself. Authenticated via OAuth2 client credentials (`internal/oauthhttp`), sharing the same `OAUTH2_CLIENT_ID`/`OAUTH2_CLIENT_SECRET`/`OAUTH2_TOKEN_URL` credentials the email and customer entity clients already use — only `ESCALATION_DETECTOR_BASE_URL`/`ESCALATION_DETECTOR_SCOPES` are specific to this client. The response read is bounded (`io.LimitReader`, 1 MiB) so a misbehaving/misconfigured detector can't have this buffer an unbounded body in memory on the Kafka consumer path. `Result.ShouldAlert` is the detector's own `isEmailTrigger` (crossed *that* service's configured threshold) — callers gate an actual Chat alert on this, not `IsFrustrated` alone, which is just the model's raw judgment call before being measured against a bar.
+- **Author classification (`recipientlinks.Resolver.IsCustomer`)** — `checkFrustration` only ever sends a comment to the detector when its author resolves to a customer: `events.CommentAddedPayload.AuthorEmail` (the comment author's own resolved email, added alongside `Product`/`Team`/`IsEvaluationAccount`/`ProjectOnboardingStatus` specifically for this feature) is classified the same role-then-domain-fallback way `linkFor` already classifies a *recipient's* email for portal-link routing (see "Event-driven notifications" above) — reusing that exact mechanism rather than inventing a second one. An internal/CSM-authored comment, or a payload with no resolved author email at all, skips the detector call entirely — no API cost, no Chat alert.
+- **Chat routing (`SendFrustrationAlert`, `chataudience.Resolve`)** — once `ShouldAlert` is true, the alert routes exactly like an SLA breach alert: team-first (the payload's own `Team`), falling back to `"Incident Monitor"`, plus the `Evaluation`/`Onboarding`/`Americas`/weekend overlays — not the fixed-`"Incident Monitor"`-only posture `case.created`/`case.acknowledged`/`case.severity_changed` use. `IsEvaluationAccount`/`ProjectOnboardingStatus` are Postgres-only facts on the publisher's side (entity-service's `CaseRepository.ProjectOnboardingInfo`) and are simply their zero value on a pure-ServiceNow deployment with no Postgres pool — `chataudience.Resolve` treats that the same as "not an evaluation account, no onboarding status," not an error. A failure sending to one resolved audience doesn't stop the others (`errors.Join`), each logged individually with its own `audience` attribute.
+- **Idempotency (`checkFrustration`'s own `recordBaseKey(record)+"/frustration"` claim)** — this call sits *before* the email-sending code in `handleCommentAdded`, whose own return value (driven by the email path) is what `eventbus.Consumer` retries on. Without its own tracking, a record retried solely because the email send kept failing would redo frustration detection (a second OpenAI call) and repost the Chat alert on every attempt — the exact repeated-Chat-alert-on-retry-and-DLQ-hand-off failure mode this file's own `sendPerGroup`/`forgetEmailGroups`/chatKey mechanisms elsewhere already exist to prevent. Unlike the single-channel `chatKey` shape `handleCaseAcknowledged`/`handleIncidentCreated` use (forget on success *or* failure, safe there only because their own success/failure directly determines whether the whole function gets retried at all), this claim is deliberately **not** released on success — only on `record.NoMoreRetries` (no further attempt coming, ever, on any topic), registered as a `defer` *before* the `claim` call itself: on the genuinely final retry, `claim` can return `false` (an earlier attempt still holds the key) and return early, and without the `defer` already registered by that point, the key would leak in `d.done` forever — a real bug caught by this feature's own regression test (`TestDispatcher_Handle_CommentAdded_FrustrationDetection_NotRepeatedWhenEmailRetries`) before the ordering was fixed.
 
 ## Running locally
 

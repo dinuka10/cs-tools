@@ -18,6 +18,7 @@ import { useState } from "react";
 import { useLocation } from "react-router";
 import { navNodeForPath } from "@config/csmNavItems";
 import { matchCaseLocation } from "@context/case-tabs/caseRoutePatterns";
+import { usePortalView } from "@context/current-user/usePortalView";
 
 export interface CurrentLocationTab {
   /** A short label for whatever non-case page the user is (or was last) on
@@ -50,10 +51,14 @@ export interface CurrentLocationTab {
 export function useCurrentLocationTab(): CurrentLocationTab {
   const location = useLocation();
   const isCaseRoute = matchCaseLocation(location.pathname) !== undefined;
+  // The viewer view has no dashboard (its landing is the cases list), so a
+  // case opened first -- a reload, bookmark or emailed link -- pins that
+  // instead of the CS dashboard.
+  const fallbackPathname = usePortalView() === "sales-sa" ? "/cases" : "/dashboard";
 
   const [lastNonCaseLocation, setLastNonCaseLocation] = useState(() =>
     isCaseRoute
-      ? { pathname: "/dashboard", search: "", hash: "" }
+      ? { pathname: fallbackPathname, search: "", hash: "" }
       : { pathname: location.pathname, search: location.search, hash: location.hash },
   );
 

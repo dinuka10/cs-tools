@@ -51,7 +51,12 @@ func userOf(t string, active bool) repository.AccessUser {
 	return repository.AccessUser{UserType: t, Active: active}
 }
 
-var testInternalClientIDs = map[string]bool{"csm-backend": true, "integration": true}
+var testClientConfig = AccessClientConfig{
+	M2MClientIDs:                  map[string]bool{"csm-backend": true, "integration": true},
+	CSMPortalBackendClientID:      "csm-portal",
+	CSMPortalUserDomain:           "wso2.com",
+	CustomerPortalBackendClientID: "customer-portal",
+}
 
 func TestAccessService_ResolveScope(t *testing.T) {
 	const email = "jane@example.com"
@@ -118,10 +123,32 @@ func TestAccessService_ResolveScope(t *testing.T) {
 			id: auth.Identity{Validated: true, ClientID: "stranger"}, wantErr: &apierror.UnauthorizedError{}, wantNoDBCall: true},
 		{name: "no user and no client at all -> 401",
 			id: auth.Identity{Validated: true}, wantErr: &apierror.UnauthorizedError{}, wantNoDBCall: true},
+
+		// --- CSM portal client: unrestricted ONLY with a matching-domain user email ---
+		{name: "csm portal client, matching domain -> everything, no DB lookup needed",
+			id: auth.Identity{Validated: true, ClientID: "csm-portal", UserEmail: "engineer@wso2.com"}, wantAll: true, wantHasInternalAccess: true, wantNoDBCall: true},
+		{name: "csm portal client, matching domain case-insensitively -> everything",
+			id: auth.Identity{Validated: true, ClientID: "csm-portal", UserEmail: "Engineer@WSO2.COM"}, wantAll: true, wantHasInternalAccess: true, wantNoDBCall: true},
+		{name: "csm portal client, non-matching domain -> refused (403), not resolved some other way",
+			id: auth.Identity{Validated: true, ClientID: "csm-portal", UserEmail: "someone@example.com"}, wantErr: &apierror.ForbiddenError{}, wantNoDBCall: true},
+		{name: "csm portal client, domain is a suffix trick (evilwso2.com) -> refused, not treated as wso2.com",
+			id: auth.Identity{Validated: true, ClientID: "csm-portal", UserEmail: "attacker@evilwso2.com"}, wantErr: &apierror.ForbiddenError{}, wantNoDBCall: true},
+		{name: "csm portal client, no user token at all -> refused (403), never falls back to unconditional trust",
+			id: auth.Identity{Validated: true, ClientID: "csm-portal"}, wantErr: &apierror.ForbiddenError{}, wantNoDBCall: true},
+
+		// --- Customer portal client: ALWAYS resolved from the user token, never unconditionally trusted ---
+		{name: "customer portal client forwarding a customer's token -> scoped to their registered projects, same as any other caller",
+			id: auth.Identity{Validated: true, ClientID: "customer-portal", UserEmail: email}, users: []repository.AccessUser{userOf("EXTERNAL", true)},
+			projects: []string{"p1"}, wantProjects: []string{"p1"}},
+		{name: "customer portal client forwarding a genuinely INTERNAL user's token -> everything, but only because the DB says so, not the client id",
+			id: auth.Identity{Validated: true, ClientID: "customer-portal", UserEmail: email}, users: []repository.AccessUser{userOf("INTERNAL", true)},
+			wantAll: true, wantHasInternalAccess: true},
+		{name: "customer portal client, no user token at all -> 401, never unconditionally trusted",
+			id: auth.Identity{Validated: true, ClientID: "customer-portal"}, wantErr: &apierror.UnauthorizedError{}, wantNoDBCall: true},
 	}
 	for _, tt := range tests {
 		repo := &fakeAccessRepo{users: tt.users, projects: tt.projects}
-		scope, err := NewAccessService(repo, testInternalClientIDs).ResolveScope(idCtx(tt.id))
+		scope, err := NewAccessService(repo, testClientConfig).ResolveScope(idCtx(tt.id))
 
 		if tt.wantNoDBCall && (repo.userLookups != 0 || repo.projectCalls != 0) {
 			t.Errorf("%s: repo was consulted (userLookups=%d projectCalls=%d), want zero DB calls", tt.name, repo.userLookups, repo.projectCalls)
@@ -170,7 +197,7 @@ func TestAccessService_ResolveScope(t *testing.T) {
 // Internal users must not trigger a project lookup at all.
 func TestAccessService_InternalSkipsProjectLookup(t *testing.T) {
 	repo := &fakeAccessRepo{users: []repository.AccessUser{userOf("INTERNAL", true)}}
-	_, _ = NewAccessService(repo, nil).ResolveScope(idCtx(auth.Identity{Validated: true, UserEmail: "a@b.c"}))
+	_, _ = NewAccessService(repo, AccessClientConfig{}).ResolveScope(idCtx(auth.Identity{Validated: true, UserEmail: "a@b.c"}))
 	if repo.projectCalls != 0 {
 		t.Fatalf("project lookups = %d, want 0", repo.projectCalls)
 	}
@@ -188,7 +215,7 @@ func TestAccessService_InternalSkipsProjectLookup(t *testing.T) {
 // cache.
 func TestAccessService_ResolveScope_UsesCachedScopeFromContext(t *testing.T) {
 	repo := &fakeAccessRepo{}
-	svc := NewAccessService(repo, testInternalClientIDs)
+	svc := NewAccessService(repo, testClientConfig)
 
 	want := repository.SearchScope{Unrestricted: false, ProjectIDs: []string{"p1", "p2"}, ViewerEmail: "cached@test.local"}
 	// Deliberately NOT auth.WithIdentity: a cache hit must not need to
@@ -216,7 +243,7 @@ func TestAccessService_ResolveScope_UsesCachedScopeFromContext(t *testing.T) {
 // own first call on a request -- still resolves for real, against the repo.
 func TestAccessService_ResolveScope_FallsThroughWithoutCachedScope(t *testing.T) {
 	repo := &fakeAccessRepo{users: []repository.AccessUser{userOf("EXTERNAL", true)}, projects: []string{"p1"}}
-	svc := NewAccessService(repo, testInternalClientIDs)
+	svc := NewAccessService(repo, testClientConfig)
 
 	scope, err := svc.ResolveScope(idCtx(auth.Identity{Validated: true, UserEmail: "real@test.local"}))
 	if err != nil {
@@ -227,5 +254,56 @@ func TestAccessService_ResolveScope_FallsThroughWithoutCachedScope(t *testing.T)
 	}
 	if repo.userLookups != 1 || repo.projectCalls != 1 {
 		t.Errorf("repo calls = %d userLookups, %d projectCalls, want exactly 1 and 1 -- the uncached path must still do real work", repo.userLookups, repo.projectCalls)
+	}
+}
+
+// TestAccessService_CustomerPortalBackendClientID_OverlapWithM2M is the regression
+// test for the scenario this three-config split exists to prevent: a
+// customer-facing BFF's client id ending up ALSO listed in M2MClientIDs
+// (a copy-paste mistake in config, or the wrong list entirely) must not
+// grant it the unconditional access that list otherwise confers --
+// CustomerPortalBackendClientID is checked first and wins regardless of what else
+// the id appears in. See AccessClientConfig and ResolveScope's own doc
+// comments.
+func TestAccessService_CustomerPortalBackendClientID_OverlapWithM2M(t *testing.T) {
+	cfg := AccessClientConfig{
+		M2MClientIDs:                  map[string]bool{"customer-portal": true}, // the mistake
+		CustomerPortalBackendClientID: "customer-portal",
+	}
+	repo := &fakeAccessRepo{users: []repository.AccessUser{userOf("EXTERNAL", true)}, projects: []string{"p1"}}
+	svc := NewAccessService(repo, cfg)
+
+	scope, err := svc.ResolveScope(idCtx(auth.Identity{Validated: true, ClientID: "customer-portal", UserEmail: "customer@example.com"}))
+	if err != nil {
+		t.Fatalf("ResolveScope() = err %v, want a normal scoped resolution", err)
+	}
+	if scope.Unrestricted {
+		t.Fatal("ResolveScope() returned Unrestricted=true for a customer-portal client id present in M2MClientIDs -- the veto failed to prevent the exact misconfiguration it exists for")
+	}
+	if len(scope.ProjectIDs) != 1 || scope.ProjectIDs[0] != "p1" {
+		t.Errorf("ProjectIDs = %v, want [p1] (resolved from the forwarded user token, not the client id)", scope.ProjectIDs)
+	}
+	if repo.userLookups != 1 {
+		t.Errorf("userLookups = %d, want 1 -- the veto must still resolve from the user token, not skip the DB like an M2M caller would", repo.userLookups)
+	}
+}
+
+// TestAccessService_CSMPortalBackendClientID_OverlapWithM2M proves the CSM-portal
+// domain gate survives the same kind of overlap: even if CSMPortalBackendClientID
+// is also mistakenly listed in M2MClientIDs, a non-matching-domain user
+// email is still refused, not unconditionally trusted.
+func TestAccessService_CSMPortalBackendClientID_OverlapWithM2M(t *testing.T) {
+	cfg := AccessClientConfig{
+		M2MClientIDs:             map[string]bool{"csm-portal": true}, // the mistake
+		CSMPortalBackendClientID: "csm-portal",
+		CSMPortalUserDomain:      "wso2.com",
+	}
+	repo := &fakeAccessRepo{}
+	svc := NewAccessService(repo, cfg)
+
+	_, err := svc.ResolveScope(idCtx(auth.Identity{Validated: true, ClientID: "csm-portal", UserEmail: "someone@example.com"}))
+	var forbidden *apierror.ForbiddenError
+	if !errors.As(err, &forbidden) {
+		t.Fatalf("ResolveScope() = %T (%v), want *apierror.ForbiddenError -- the domain gate must survive being also listed in M2MClientIDs", err, err)
 	}
 }

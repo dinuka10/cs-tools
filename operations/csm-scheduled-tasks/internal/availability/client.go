@@ -24,7 +24,7 @@
 // Dashboard is concurrently reading. Doing that over HTTP from here would
 // mean pulling the whole working set across the wire on every run, and this
 // component holds no database credentials anyway. Same split as
-// internal/outagecomm and internal/cloudstatus.
+// internal/cloudstatus.
 package availability
 
 import (

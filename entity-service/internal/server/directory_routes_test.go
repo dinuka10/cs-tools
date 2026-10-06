@@ -110,3 +110,17 @@ func TestCuratedCataloguesAreNoLongerServedHere(t *testing.T) {
 		}
 	}
 }
+
+// TestGroupDetailRouteIsAbsentWithoutAPool pins that GET /groups/{id} (one
+// group and its members) is Postgres-only like /teams/{id}/members: under
+// DATA_SOURCE=servicenow there is no pool, so the route is not registered
+// rather than answering from a nil repository.
+func TestGroupDetailRouteIsAbsentWithoutAPool(t *testing.T) {
+	router := newDirectoryRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "/groups/22222222-2222-4222-8222-222222222222", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET /groups/{id} = %d, want 404 when the pool is nil", rec.Code)
+	}
+}

@@ -305,59 +305,107 @@ func (s *problemService) createProblemSNFirst(ctx context.Context, req domain.Cr
 	return resp, nil
 }
 
-// UpdateProblem supports exactly 5 fields under
-// DATA_SOURCE=postgres-servicenow-dual-write (s.snWriteback != nil):
-// AssignedToID, CauseNotes, FixNotes, Workaround, TargetResolutionDate --
-// see ProblemRepository.UpdateProblemFields' own doc comment for their
-// column mapping. Every other mode still returns the
-// unconditional ServiceUnavailableError below.
-//
-// Transition and AssignmentGroupID are rejected outright, exactly like
-// incidentService.UpdateIncident's own rejected-field list: Transition is
-// validated server-side by ServiceNow's own workflow engine, with no fixed,
-// confirmed transition rule set (preconditions, side effects) to reimplement
-// here (see domain.UpdateProblemRequest's own doc comment); AssignmentGroupID
-// has no backing column at all -- problem has no CMDB/assignment-group table
-// anywhere in this schema (same gap ChangeRequestRepository's own package
-// doc comment already documents for change_request.GroupID).
-//
-// A best-effort, async ServiceNow mirror write follows via s.snWriteback,
-// exactly the Postgres-first/async-mirror shape
-// incidentService.UpdateIncident already uses, for the identical reason: a
-// failed mirror here just leaves ServiceNow's copy of an EXISTING problem
-// stale on one field until retried by hand, not a permanent orphan the way
-// a failed async CREATE would be.
-//
-// snProblemService.UpdateProblem (the mirror target) does no live pre-read
-// either -- confirmed against its own doc comment, a straightforward
-// validate-then-PATCH, so mirrorReq is passed to it directly with no
-// narrower patcher interface needed, unlike case's snFieldsBundlePatcher
-// indirection.
-func (s *problemService) UpdateProblem(ctx context.Context, req domain.UpdateProblemRequest) (domain.UpdateProblemResponse, error) {
-	if s.snWriteback == nil {
-		return domain.UpdateProblemResponse{}, &apierror.ServiceUnavailableError{
-			Msg: "updating a problem is not available on this data source: no defined state-transition rule exists in this schema",
+// problemTransitions is ServiceNow's ProblemUtils._PROBLEM_TRANSITIONS: the
+// five forward moves of the problem state model its API allows, keyed by the
+// request's transition name. One table for both data sources, so Postgres
+// and ServiceNow can never disagree about what a move means.
+var problemTransitions = map[string]repository.ProblemTransition{
+	"assess":  {Name: "assess", From: "NEW", To: "ASSESS"},
+	"confirm": {Name: "confirm", From: "ASSESS", To: "ROOT_CAUSE_ANALYSIS"},
+	"fix":     {Name: "fix", From: "ROOT_CAUSE_ANALYSIS", To: "FIX_IN_PROGRESS"},
+	"resolve": {Name: "resolve", From: "FIX_IN_PROGRESS", To: "RESOLVED"},
+	"close":   {Name: "close", From: "RESOLVED", To: "CLOSED"},
+}
+
+// checkProblemTransitionRequirements refuses a move ServiceNow would refuse
+// for a missing field, before anything is written. ServiceNow's state model
+// (ProblemStateUtils, discovery script 61) wants an assignee to move to
+// Assess and fix notes to move to Resolved -- the fields of its own "Assess"
+// and "Resolve" dialogs (resolve's resolution code is set by the move
+// itself). A value in the request decides; only an absent one falls back to
+// the value already on the problem. Without this, dual-write gets ServiceNow's misleading 409 ("a
+// populated 'Assigned to' is a confirmed live cause") and Postgres-only mode
+// would move a problem ServiceNow never would.
+func checkProblemTransitionRequirements(t repository.ProblemTransition, req domain.UpdateProblemRequest, current domain.ProblemDetail) error {
+	// A value in the request decides, blank or not: the same save writes it,
+	// so a blank one would clear what the problem has. Only an absent value
+	// falls back to the problem's own.
+	has := func(fromReq *string, onProblem bool) bool {
+		if fromReq != nil {
+			return strings.TrimSpace(*fromReq) != ""
+		}
+		return onProblem
+	}
+	switch t.Name {
+	case "assess":
+		if !has(req.AssignedToID, current.AssignedTo != nil && current.AssignedTo.ID != "") {
+			return &apierror.ValidationError{Msg: "assess needs an assignee: send assignedToId, or assign the problem first"}
+		}
+	case "resolve":
+		if !has(req.FixNotes, current.FixNotes != nil && strings.TrimSpace(*current.FixNotes) != "") {
+			return &apierror.ValidationError{Msg: "resolve needs fix notes: send fixNotes, or add them to the problem first"}
 		}
 	}
+	return nil
+}
+
+// UpdateProblem implements ProblemService for both Postgres data sources.
+// A request carries a transition (a state move), plain fields, or both --
+// the fields apply in the same save as the move, as ServiceNow's "Fix" UI
+// action sets cause/fix notes while moving the state.
+//
+//   - DATA_SOURCE=postgres: Postgres is the only copy. A transition is
+//     checked against the problem's current state (wrong state = 400 naming
+//     it, as ServiceNow answers) and applied with its side effects and the
+//     fields in one transaction (ProblemRepository.ApplyProblemTransition).
+//   - DATA_SOURCE=postgres-servicenow-dual-write, transition: ServiceNow
+//     FIRST, synchronously, with the whole request. ServiceNow runs its own
+//     state model and business rules and can refuse or silently revert a
+//     move (its "Update Problem State to Assess" rule forces Assess back
+//     whenever the problem has an assignee; ProblemUtils reports that as a
+//     409). Only once ServiceNow has accepted is the same move written to
+//     Postgres, without the from-state check, since Postgres may lag
+//     ServiceNow. A ServiceNow refusal returns as-is and Postgres is
+//     untouched, so the two never disagree about the state.
+//   - dual-write, fields only: Postgres first, then a best-effort async
+//     ServiceNow mirror (snWriteback), as before. A failed mirror leaves
+//     ServiceNow one field stale until retried, never a different state.
+func (s *problemService) UpdateProblem(ctx context.Context, req domain.UpdateProblemRequest) (domain.UpdateProblemResponse, error) {
 	if err := validateUUIDs("id", []string{req.ID}); err != nil {
 		return domain.UpdateProblemResponse{}, err
 	}
-	if req.Transition != nil || req.AssignmentGroupID != nil {
-		return domain.UpdateProblemResponse{}, &apierror.ValidationError{Msg: "transition and assignmentGroupId are only supported for the ServiceNow data source"}
+	var transition *repository.ProblemTransition
+	if req.Transition != nil {
+		t, ok := problemTransitions[strings.TrimSpace(*req.Transition)]
+		if !ok {
+			return domain.UpdateProblemResponse{}, &apierror.ValidationError{Msg: "transition must be one of: assess, confirm, fix, resolve, close"}
+		}
+		name := t.Name
+		req.Transition = &name
+		transition = &t
 	}
-	if req.AssignedToID == nil && req.CauseNotes == nil && req.FixNotes == nil &&
-		req.Workaround == nil && req.TargetResolutionDate == nil {
-		return domain.UpdateProblemResponse{}, &apierror.ValidationError{Msg: "at least one of assignedToId, causeNotes, fixNotes, workaround, or targetResolutionDate must be provided"}
+	if transition == nil && req.AssignedToID == nil && req.AssignmentGroupID == nil && req.CauseNotes == nil &&
+		req.FixNotes == nil && req.Workaround == nil && req.TargetResolutionDate == nil {
+		return domain.UpdateProblemResponse{}, &apierror.ValidationError{Msg: "at least one of transition, assignedToId, assignmentGroupId, causeNotes, fixNotes, workaround, or targetResolutionDate must be provided"}
 	}
-	if req.AssignedToID != nil {
-		if err := validateUUIDs("assignedToId", []string{*req.AssignedToID}); err != nil {
+	for field, val := range map[string]*string{"assignedToId": req.AssignedToID, "assignmentGroupId": req.AssignmentGroupID} {
+		if val != nil {
+			if err := validateUUIDs(field, []string{*val}); err != nil {
+				return domain.UpdateProblemResponse{}, err
+			}
+		}
+	}
+	// One instant, two spellings: Postgres gets RFC3339 (what the repository
+	// parses), ServiceNow its own "YYYY-MM-DD HH:mm:ss" (UTC), which is also
+	// what the portal sends and this API documents.
+	var snTargetDate *string
+	if req.TargetResolutionDate != nil {
+		t, err := parseProblemTargetDate(*req.TargetResolutionDate)
+		if err != nil {
 			return domain.UpdateProblemResponse{}, err
 		}
-	}
-	if req.TargetResolutionDate != nil {
-		if _, err := time.Parse(time.RFC3339, *req.TargetResolutionDate); err != nil {
-			return domain.UpdateProblemResponse{}, &apierror.ValidationError{Msg: "targetResolutionDate must be a valid RFC3339 timestamp"}
-		}
+		pg, sn := t.Format(time.RFC3339), t.Format(problemTargetDateLayout)
+		req.TargetResolutionDate, snTargetDate = &pg, &sn
 	}
 
 	actorEmail, err := s.resolveActorEmail(ctx)
@@ -365,69 +413,51 @@ func (s *problemService) UpdateProblem(ctx context.Context, req domain.UpdatePro
 		return domain.UpdateProblemResponse{}, err
 	}
 
-	updatedOn, err := s.repo.UpdateProblemFields(ctx, req, actorEmail)
-	if err != nil {
-		return domain.UpdateProblemResponse{}, err
+	if transition != nil {
+		current, err := s.repo.GetProblem(ctx, req.ID)
+		if err != nil {
+			return domain.UpdateProblemResponse{}, err
+		}
+		if err := checkProblemTransitionRequirements(*transition, req, current); err != nil {
+			return domain.UpdateProblemResponse{}, err
+		}
 	}
 
-	// Best-effort ServiceNow mirror write, DATA_SOURCE=postgres-servicenow-dual-write
-	// only (guaranteed by the s.snWriteback == nil guard above). Dispatched
-	// immediately once Postgres has committed -- BEFORE the GetProblem
-	// re-read below, deliberately -- because the write has already
-	// succeeded at this point regardless of whether the re-read that
-	// follows does. Dispatching only after a successful re-read would mean
-	// a re-read failure (e.g. a transient connection blip) skips the mirror
-	// entirely: the caller gets an error for a write that actually
-	// succeeded, ServiceNow never gets the update, and -- since
-	// s.snWriteback.Dispatch itself was never called -- nothing lands in
-	// sn_writeback_failures either, silent drift the dispatcher can't even
-	// report on. Fires asynchronously and never affects this response.
-	// mirrorReq carries only ID plus the field(s) this call actually set --
-	// never forwards req itself -- so this can never accidentally carry
-	// Transition/AssignmentGroupID (both already rejected above and
-	// therefore always nil here) into the mirror call.
-	mirrorReq := domain.UpdateProblemRequest{
-		ID:                   req.ID,
-		AssignedToID:         req.AssignedToID,
-		CauseNotes:           req.CauseNotes,
-		FixNotes:             req.FixNotes,
-		Workaround:           req.Workaround,
-		TargetResolutionDate: req.TargetResolutionDate,
+	var updatedOn time.Time
+	switch {
+	case transition != nil && s.snMirror != nil:
+		snReq := req
+		snReq.TargetResolutionDate = snTargetDate
+		if _, err := s.snMirror.UpdateProblem(ctx, snReq); err != nil {
+			return domain.UpdateProblemResponse{}, err
+		}
+		updatedOn, err = s.repo.ApplyProblemTransition(ctx, req, *transition, false, actorEmail)
+		if err != nil {
+			// ServiceNow has moved; Postgres has not. Loud, like
+			// createProblemSNFirst's own drift branch: the next sync, or a
+			// retry of the same request, brings Postgres level.
+			slog.ErrorContext(ctx, "update problem: ServiceNow applied the transition but the Postgres write failed",
+				"problemId", req.ID, "transition", transition.Name, "error", err)
+			return domain.UpdateProblemResponse{}, err
+		}
+	case transition != nil:
+		updatedOn, err = s.repo.ApplyProblemTransition(ctx, req, *transition, true, actorEmail)
+		if err != nil {
+			return domain.UpdateProblemResponse{}, err
+		}
+	default:
+		updatedOn, err = s.repo.UpdateProblemFields(ctx, req, actorEmail)
+		if err != nil {
+			return domain.UpdateProblemResponse{}, err
+		}
+		s.mirrorProblemFields(ctx, req, snTargetDate)
 	}
-	payload := map[string]any{"id": req.ID}
-	if req.AssignedToID != nil {
-		payload["assignedToId"] = *req.AssignedToID
-	}
-	if req.CauseNotes != nil {
-		payload["causeNotes"] = *req.CauseNotes
-	}
-	if req.FixNotes != nil {
-		payload["fixNotes"] = *req.FixNotes
-	}
-	if req.Workaround != nil {
-		payload["workaround"] = *req.Workaround
-	}
-	if req.TargetResolutionDate != nil {
-		payload["targetResolutionDate"] = *req.TargetResolutionDate
-	}
-	s.snWriteback.Dispatch(ctx, "problem", req.ID, "update", payload,
-		func(writeCtx context.Context) error {
-			_, err := s.snMirror.UpdateProblem(writeCtx, mirrorReq)
-			return err
-		},
-	)
 
-	// Re-read via GetProblem, matching incidentService.UpdateIncident's own
-	// GetIncidentByID re-read pattern, since UpdateProblemFields only
-	// returns updated_on -- State/ResolutionCode/AssignedTo must reflect the
-	// real post-write state, not be guessed at from req. The mirror above
-	// has already been dispatched by this point regardless of whether this
-	// re-read succeeds: a failure here only means this response can't
-	// confirm the post-write view, not that the write itself (or its
-	// mirror) is in question -- logged loudly, same convention as
-	// createProblemSNFirst's own drift-logging branch, and returned as an
-	// error since UpdateProblemResponse has no partial-view shape to fall
-	// back to.
+	// Re-read so State/ResolutionCode/AssignedTo show the real post-write
+	// state, not a guess from req. A failure here only means this response
+	// can't confirm the write, not that the write (or its mirror) is in
+	// question -- logged, and returned as an error since
+	// UpdateProblemResponse has no partial shape to fall back to.
 	detail, err := s.repo.GetProblem(ctx, req.ID)
 	if err != nil {
 		slog.ErrorContext(ctx, "update problem: problem was updated but the post-write re-read failed",
@@ -436,22 +466,53 @@ func (s *problemService) UpdateProblem(ctx context.Context, req domain.UpdatePro
 	}
 
 	updatedOnStr := updatedOn.UTC().Format(time.RFC3339)
-	view := domain.UpdateProblemView{
-		ID:             detail.ID,
-		UpdatedOn:      &updatedOnStr,
-		UpdatedBy:      &actorEmail,
-		State:          detail.State,
-		ResolutionCode: detail.ResolutionCode,
-		AssignedTo:     detail.AssignedTo,
-		// AssignmentGroup is always nil -- problem has no assignment-group
-		// column anywhere (see this type's own package doc comment in
-		// problem_repo.go).
-	}
-
 	return domain.UpdateProblemResponse{
 		Message: "Problem updated successfully",
-		Problem: view,
+		Problem: domain.UpdateProblemView{
+			ID:             detail.ID,
+			UpdatedOn:      &updatedOnStr,
+			UpdatedBy:      &actorEmail,
+			State:          detail.State,
+			ResolutionCode: detail.ResolutionCode,
+			AssignedTo:     detail.AssignedTo,
+		},
 	}, nil
+}
+
+// mirrorProblemFields is the dual-write fields-only path's best-effort async
+// ServiceNow write; a no-op on DATA_SOURCE=postgres. Dispatched once Postgres
+// has committed and before the re-read, so a failed re-read can't skip it.
+// mirrorReq carries only the fields this call set, never a transition (a
+// transition goes to ServiceNow synchronously instead).
+func (s *problemService) mirrorProblemFields(ctx context.Context, req domain.UpdateProblemRequest, snTargetDate *string) {
+	if s.snWriteback == nil {
+		return
+	}
+	mirrorReq := domain.UpdateProblemRequest{
+		ID:                   req.ID,
+		AssignedToID:         req.AssignedToID,
+		AssignmentGroupID:    req.AssignmentGroupID,
+		CauseNotes:           req.CauseNotes,
+		FixNotes:             req.FixNotes,
+		Workaround:           req.Workaround,
+		TargetResolutionDate: snTargetDate,
+	}
+	payload := map[string]any{"id": req.ID}
+	for key, val := range map[string]*string{
+		"assignedToId": req.AssignedToID, "assignmentGroupId": req.AssignmentGroupID,
+		"causeNotes": req.CauseNotes, "fixNotes": req.FixNotes, "workaround": req.Workaround,
+		"targetResolutionDate": snTargetDate,
+	} {
+		if val != nil {
+			payload[key] = *val
+		}
+	}
+	s.snWriteback.Dispatch(ctx, "problem", req.ID, "update", payload,
+		func(writeCtx context.Context) error {
+			_, err := s.snMirror.UpdateProblem(writeCtx, mirrorReq)
+			return err
+		},
+	)
 }
 
 // maxWorkItemSubjectLength is work_item.subject's VARCHAR length (migration
@@ -460,3 +521,20 @@ const maxWorkItemSubjectLength = 512
 
 // validProblemCategoryPG is problem_category_enum's label set (migration 0059).
 var validProblemCategoryPG = map[string]bool{"SOFTWARE": true, "HARDWARE": true, "NETWORK": true, "DATABASE": true}
+
+// problemTargetDateLayout is ServiceNow's date-time format, the one
+// ProblemUtils requires for targetResolutionDate and the portal sends (UTC).
+const problemTargetDateLayout = "2006-01-02 15:04:05"
+
+// parseProblemTargetDate accepts targetResolutionDate as this API documents
+// it -- "YYYY-MM-DD HH:mm:ss", UTC -- and as RFC3339, and returns it in UTC.
+func parseProblemTargetDate(v string) (time.Time, error) {
+	v = strings.TrimSpace(v)
+	if t, err := time.ParseInLocation(problemTargetDateLayout, v, time.UTC); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t.UTC(), nil
+	}
+	return time.Time{}, &apierror.ValidationError{Msg: "targetResolutionDate must be YYYY-MM-DD HH:mm:ss (UTC) or an RFC3339 timestamp"}
+}

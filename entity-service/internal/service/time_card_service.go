@@ -19,6 +19,7 @@ package service
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -26,6 +27,32 @@ import (
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/middleware"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
+
+// validateApproverIDsExcludeSubmitter rejects a request that names the
+// submitting user as one of the time card's own approvers. This is the
+// backend half of the "no self-approval" rule: TimeCardRepository.
+// TransitionTimeCardState already refuses to let a submitter approve/reject
+// their own card at decide-time, but until now nothing stopped that same
+// submitter/approver pairing from being written in the first place, on
+// either CreateTimeCard or UpdateTimeCardFields -- the webapp's own time
+// card dialog already filters itself out of the approver picker, but that
+// is a UI convenience only, not an enforced rule; a direct API call (or a
+// stale client) could still persist it. Comparing against submitterID
+// here, rather than re-reading the card's own stored user_id, is
+// deliberately cheap and correct for both call sites: CreateTimeCard
+// writes submitterID as the new card's own user_id, and
+// UpdateTimeCardFields's own WHERE clause already requires the row's
+// user_id to equal the acting caller before any update applies at all, so
+// the two are guaranteed to be the same person by the time either request
+// reaches the repository.
+func validateApproverIDsExcludeSubmitter(approverIDs []string, submitterID string) error {
+	for _, approverID := range approverIDs {
+		if strings.EqualFold(approverID, submitterID) {
+			return &apierror.ValidationError{Msg: "you cannot be your own time card approver"}
+		}
+	}
+	return nil
+}
 
 var validTimeCardState = map[domain.TimeCardState]bool{
 	domain.TimeCardStatePending:   true,
@@ -258,6 +285,9 @@ func (s *timeCardService) CreateTimeCard(ctx context.Context, req domain.CreateT
 	if err != nil {
 		return domain.TimeCardMutationResponse{}, err
 	}
+	if err := validateApproverIDsExcludeSubmitter(req.ApproverIDs, userID); err != nil {
+		return domain.TimeCardMutationResponse{}, err
+	}
 
 	view, err := s.repo.CreateTimeCard(ctx, req, userID)
 	if err != nil {
@@ -339,6 +369,9 @@ func (s *timeCardService) UpdateTimeCard(ctx context.Context, req domain.UpdateT
 		}
 	}
 	if err := validateTimeCardMinutes(minutes...); err != nil {
+		return domain.TimeCardMutationResponse{}, err
+	}
+	if err := validateApproverIDsExcludeSubmitter(req.ApproverIDs, actorID); err != nil {
 		return domain.TimeCardMutationResponse{}, err
 	}
 

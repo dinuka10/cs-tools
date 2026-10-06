@@ -230,45 +230,17 @@ Timeout is five minutes, not the sixty seconds the neighbouring sweeps use.
 Volume is the normal case here, and cutting a healthy run off partway leaves
 some subjects updated and the rest stale.
 
-## Outage communication
+## Outage emails (moved out)
 
-The SRE-facing pair of outage emails: one when an outage is declared, one
-when it is resolved. Task name **`outage_communication`**, default schedule
-`*/5 * * * *`. The Go port of ServiceNow's `Outage Communication` flow.
-
-*** NOT THE SAME AS `outage_internal_notification`. *** That task is the
-internal-STAKEHOLDER notice, a different ServiceNow flow with a different
-audience and a different idempotency mechanism. They share the outage table
-and nothing else. Two tasks, two sub-cron names, two `SUB_CRON_RECIPIENTS`
-entries.
-
-**Recipients are configuration, and that is an evidenced decision.**
-ServiceNow resolves a group literally named `SRE Team`, which on the dev
-instance is `SRE_Team@gmail.com` with three members — a gmail address
-standing in for an internal list. Of seventeen active groups matching /SRE/,
-only one other has any address at all and it is a personal one. So there is
-no real distribution list to derive from, and the port takes its audience
-from `SUB_CRON_RECIPIENTS["outage_communication"].to` instead.
-
-Unlike the report tasks, `to` here is the REAL audience of the email, not
-just the failure-alert list — the same arrangement `outage_internal_notification`
-uses. See "Alerting" for which tasks work which way.
-
-*** AN UNCONFIGURED DEPLOYMENT IS SAFE, AND THE ORDER MATTERS. *** With no
-`SUB_CRON_RECIPIENTS` entry the `to` list is empty and the handler returns
-BEFORE it sweeps. That is deliberate: the sweep writes a communication-log
-row per decision, and those rows are the port's idempotency guard, so
-sweeping with nowhere to deliver would mark outages as announced to nobody
-and they would never be announced again.
-
-**It is also inert until digiops-cs mirrors `outage.outage_communication`.**
-Without that column the repository degrades to "nothing to send" rather than
-failing the sweep — narrow on purpose, so only `undefined_column` is
-swallowed.
-
-**What it will not send.** ServiceNow's declaration branch requires
-`type=outage`, so a DEGRADATION or PLANNED outage produces no email at all.
-Reproduced deliberately; widening it is a product change, not a port.
+The two outage emails -- `outage_internal_notification` (internal
+stakeholders) and `outage_communication` (SRE declaration/resolution) -- used
+to be sub-crons here. They now run in entity-service's outage notice drainer,
+which publishes them on the `outage-events` topic, and csm-notification-service
+sends them: seconds after the change, as ServiceNow's record-triggered flows
+do, instead of on this component's tick. Their recipients moved with them
+(`OUTAGE_NOTIFICATION_RECIPIENTS` / `OUTAGE_COMMUNICATION_RECIPIENTS` on
+entity-service); `SUB_CRON_RECIPIENTS` entries for the two old task names are
+now ignored.
 
 ## Alerting
 

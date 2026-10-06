@@ -62,6 +62,7 @@ import {
 import { useGetCsmIncidentActivities } from "@features/csm-operations/api/useCsmIncidentActivities";
 import EditIncidentDialog from "@features/csm-operations/components/EditIncidentDialog";
 import EntityRefLink from "@features/csm-operations/components/EntityRefLink";
+import IncidentTasksWidget from "@features/csm-operations/components/IncidentTasksWidget";
 import IncidentActionBar from "@features/csm-operations/components/IncidentActionBar";
 import IncidentCreateMenu from "@features/csm-operations/components/IncidentCreateMenu";
 import IncidentResolutionDialog from "@features/csm-operations/components/IncidentResolutionDialog";
@@ -908,7 +909,7 @@ export default function CsmIncidentDetailPage(): JSX.Element {
               <MetaCell label="Subcategory">
                 <Typography variant="body2">{incident.subcategory || "—"}</Typography>
               </MetaCell>
-              <MetaCell label="Contact type">
+              <MetaCell label="Channel">
                 <Typography variant="body2">{incident.contactType || "—"}</Typography>
               </MetaCell>
               <MetaCell label="Impact">
@@ -938,67 +939,77 @@ export default function CsmIncidentDetailPage(): JSX.Element {
       )}
 
       {activeTab === "related" && (
-        <Box
-          sx={{
-            display: "grid",
-            gap: 2,
-            gridTemplateColumns: {
-              xs: "1fr",
-              md: "repeat(2, minmax(0, 1fr))",
-            },
-            alignItems: "start",
-          }}
-        >
-          {hasLinks ? (
-            <Card sx={{ p: 2.5, display: "flex", flexDirection: "column", gap: 2 }}>
-              <Typography variant="subtitle2">Linked records</Typography>
-              <Box
-                sx={{
-                  display: "grid",
-                  gap: 2,
-                  gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-                }}
-              >
-                <MetaCell label="Parent incident">
-                  <EntityRefLink value={incident.parent} routeBase="/operations/incidents" />
-                </MetaCell>
-                <MetaCell label="Change request">
-                  <EntityRefLink value={incident.changeRequest} routeBase="/operations/change-requests" />
-                </MetaCell>
-                <MetaCell label="Problem">
-                  <EntityRefLink value={incident.problem} routeBase="/operations/problems" />
-                </MetaCell>
-                {/* "Caused by" has no confirmed target record type (could be a
-                    change request, a problem, or something else) — same caveat
-                    as Problem.originCase — so it's left as plain text rather
-                    than guessing a route. */}
-                <MetaCell label="Caused by"><RefText value={incident.causedBy} /></MetaCell>
-              </Box>
-            </Card>
-          ) : (
-            <Typography variant="body2" color="text.secondary">
-              No linked records for this incident.
-            </Typography>
-          )}
+        <Box sx={{ display: "flex", flexDirection: "column", gap: 2 }}>
+          {/* Tasks first and full width: the table needs the room, and it
+              is the part of this tab people act on. */}
+          <IncidentTasksWidget incidentId={incident.id as string} />
 
-          {hasLinkedServiceRequests && (
-            <Card sx={{ p: 2.5, display: "flex", flexDirection: "column", gap: 1.5 }}>
-              <Typography variant="subtitle2">Linked service requests</Typography>
-              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
-                {incident.linkedServiceRequests?.map((sr) => (
-                  <Chip
-                    key={sr.id}
-                    size="small"
-                    variant="outlined"
-                    clickable
-                    label={`${sr.number} — ${sr.name}`}
-                    onClick={() => navigate(`/cases/${encodeURIComponent(sr.id)}`)}
-                    sx={{ fontWeight: 600 }}
-                  />
-                ))}
-              </Box>
-            </Card>
-          )}
+          <Box
+            sx={{
+              display: "grid",
+              gap: 2,
+              gridTemplateColumns: {
+                xs: "1fr",
+                md: "repeat(2, minmax(0, 1fr))",
+              },
+              alignItems: "start",
+            }}
+          >
+            {hasLinks ? (
+              <Card sx={{ p: 2.5, display: "flex", flexDirection: "column", gap: 2 }}>
+                <Typography variant="subtitle2">Linked records</Typography>
+                <Box
+                  sx={{
+                    display: "grid",
+                    gap: 2,
+                    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+                  }}
+                >
+                  <MetaCell label="Parent incident">
+                    <EntityRefLink value={incident.parent} routeBase="/operations/incidents" />
+                  </MetaCell>
+                  <MetaCell label="Change request">
+                    <EntityRefLink value={incident.changeRequest} routeBase="/operations/change-requests" />
+                  </MetaCell>
+                  <MetaCell label="Problem">
+                    <EntityRefLink value={incident.problem} routeBase="/operations/problems" />
+                  </MetaCell>
+                  {/* "Caused by" has no confirmed target record type (could be a
+                      change request, a problem, or something else) — same caveat
+                      as Problem.originCase — so it's left as plain text rather
+                      than guessing a route. */}
+                  <MetaCell label="Caused by"><RefText value={incident.causedBy} /></MetaCell>
+                </Box>
+              </Card>
+            ) : (
+              <Card sx={{ p: 2.5, display: "flex", flexDirection: "column", gap: 1.5 }}>
+                <Typography variant="subtitle2">Linked records</Typography>
+                <Typography variant="body2" color="text.secondary">
+                  No linked records for this incident.
+                </Typography>
+              </Card>
+            )}
+
+
+            {hasLinkedServiceRequests && (
+              <Card sx={{ p: 2.5, display: "flex", flexDirection: "column", gap: 1.5 }}>
+                <Typography variant="subtitle2">Linked service requests</Typography>
+                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1 }}>
+                  {incident.linkedServiceRequests?.map((sr) => (
+                    <Chip
+                      key={sr.id}
+                      size="small"
+                      variant="outlined"
+                      clickable
+                      label={`${sr.number} — ${sr.name}`}
+                      onClick={() => navigate(`/cases/${encodeURIComponent(sr.id)}`)}
+                      sx={{ fontWeight: 600 }}
+                    />
+                  ))}
+                </Box>
+              </Card>
+            )}
+          </Box>
         </Box>
       )}
 

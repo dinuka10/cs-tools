@@ -17,86 +17,47 @@
 package auth
 
 import (
-	"encoding/base64"
-	"errors"
+	"crypto/sha256"
+	"crypto/subtle"
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 )
 
-const bearerPrefix = "Bearer "
+// MinWakeTokenLen rejects a token too short to resist guessing; `openssl rand -hex 32` gives 64.
+const MinWakeTokenLen = 32
 
-// dummySalt is used only to burn CPU time on an unknown-user auth attempt, never for real secret storage.
-var dummySalt = []byte("integration-users-timing-salt!!")
+const bearerPrefix = "bearer "
 
-// RequireAuth requires a valid Authorization header (Bearer base64("<username>:<secret>"), or Basic i.e. -u) naming an enabled integration_users row; every failure is a generic 401, and only the username is logged, never the secret.
-func RequireAuth(repo *UserRepo, logger *slog.Logger) func(http.Handler) http.Handler {
+// RequireWakeToken guards /alertz with the shared ALERT_CORE_WAKE_TOKEN, sent as Authorization: Bearer <token>; an empty token rejects every call, so a missing secret never leaves the route open.
+func RequireWakeToken(token string, logger *slog.Logger) func(http.Handler) http.Handler {
+	// Comparing digests keeps the comparison constant-time even when the lengths differ.
+	want := sha256.Sum256([]byte(token))
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			username, secret, ok := parseCredentials(r)
-			if !ok {
-				logger.Warn("auth: missing or malformed Authorization header", "path", r.URL.Path)
+			got, ok := bearerToken(r)
+			if !ok || token == "" {
+				logger.Warn("auth: missing or malformed wake token", "path", r.URL.Path)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-
-			u, err := repo.Get(r.Context(), username)
-			if err != nil {
-				if !errors.Is(err, ErrUserNotFound) {
-					logger.Error("auth: lookup failed", "username", username, "error", err)
-				} else {
-					logger.Warn("auth: unknown user", "username", username)
-					// Burn comparable time to a real VerifySecret call so response timing can't be used to enumerate usernames.
-					HashSecret(secret, dummySalt, Iterations)
-				}
+			digest := sha256.Sum256([]byte(got))
+			if subtle.ConstantTimeCompare(digest[:], want[:]) != 1 {
+				logger.Warn("auth: wrong wake token", "path", r.URL.Path)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-
-			if !u.Enabled {
-				logger.Warn("auth: disabled user", "username", username)
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			if !VerifySecret(secret, u.Salt, u.SecretHash, u.Iterations) {
-				logger.Warn("auth: secret mismatch", "username", username)
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-
-			if u.IsExpired(time.Now()) {
-				logger.Warn("auth: secret expired", "username", username)
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-// parseCredentials extracts username/secret from either Bearer base64("<username>:<secret>") or Basic (what -u sends, decoded via net/http's BasicAuth).
-func parseCredentials(r *http.Request) (username, secret string, ok bool) {
-	// Case-insensitive per RFC 7235, as BasicAuth already is for Basic.
-	if header := r.Header.Get("Authorization"); len(header) >= len(bearerPrefix) &&
-		strings.EqualFold(header[:len(bearerPrefix)], bearerPrefix) {
-		token := header[len(bearerPrefix):]
-		decoded, err := base64.StdEncoding.DecodeString(token)
-		if err != nil {
-			return "", "", false
-		}
-		username, secret, found := strings.Cut(string(decoded), ":")
-		if !found || username == "" || secret == "" {
-			return "", "", false
-		}
-		return username, secret, true
+// bearerToken returns the token from Authorization: Bearer <token>; the scheme is case-insensitive (RFC 7235).
+func bearerToken(r *http.Request) (string, bool) {
+	h := r.Header.Get("Authorization")
+	if len(h) <= len(bearerPrefix) || !strings.EqualFold(h[:len(bearerPrefix)], bearerPrefix) {
+		return "", false
 	}
-
-	username, secret, ok = r.BasicAuth()
-	if !ok || username == "" || secret == "" {
-		return "", "", false
-	}
-	return username, secret, true
+	token := strings.TrimSpace(h[len(bearerPrefix):])
+	return token, token != ""
 }

@@ -36,6 +36,88 @@ vi.mock("@api/useSearchUsersByName", () => ({
   useSearchInternalUsersByName: (...args: unknown[]) => useSearchUsersByNameMock(...(args as [])),
 }));
 
+// Customer Project picker: a plain labelled input that reports the typed id and
+// its display name; exposes whether it may be cleared.
+const PROJECT_NAMES: Record<string, string> = { "proj-a": "Acme Project", "proj-b": "Beta Project" };
+vi.mock("@features/csm-cases/components/AsyncProjectSelect", () => ({
+  default: ({
+    label,
+    value,
+    knownLabel,
+    disableClearable,
+    disabled,
+    onChange,
+  }: {
+    label: string;
+    value: string;
+    knownLabel?: string;
+    disableClearable?: boolean;
+    disabled?: boolean;
+    onChange: (next: string, name?: string) => void;
+  }) => (
+    <input
+      aria-label={label}
+      data-known-label={knownLabel ?? ""}
+      data-disable-clearable={String(!!disableClearable)}
+      disabled={disabled}
+      value={value}
+      onChange={(e) => onChange(e.target.value, PROJECT_NAMES[e.target.value])}
+    />
+  ),
+}));
+// project -> deployments / deployment products / customer contacts lookup, same
+// contract as the real hook: a project's deployments always come back, products
+// only for the chosen ones, and the contacts (the read-only Customer Group) are
+// the project's own.
+const SCOPE_FIXTURE: Record<
+  string,
+  Array<{ id: string; label: string; products: Array<{ id: string; label: string }> }>
+> = {
+  "proj-a": [
+    {
+      id: "dep-prod",
+      label: "Acme Production",
+      products: [
+        { id: "dp-apim", label: "API Manager 4.3.0" },
+        { id: "dp-is", label: "Identity Server 7.0.0" },
+      ],
+    },
+    {
+      id: "dep-stg",
+      label: "Acme Staging",
+      products: [{ id: "dp-apim-stg", label: "API Manager 4.2.0" }],
+    },
+  ],
+  "proj-b": [
+    {
+      id: "dep-b",
+      label: "Beta Development",
+      products: [{ id: "dp-b", label: "Choreo 1.0" }],
+    },
+  ],
+};
+const CONTACTS_FIXTURE: Record<string, Array<{ id: string; name: string }>> = {
+  "proj-a": [
+    { id: "pc-1", name: "Alice Aaron" },
+    { id: "pc-2", name: "Bob Bell" },
+  ],
+  "proj-b": [{ id: "pc-9", name: "Carol Cook" }],
+};
+vi.mock("@features/csm-operations/api/useChangeRequestScopeLookups", () => ({
+  useChangeRequestScopeLookups: (projectId: string | undefined, deploymentIds: string[]) => ({
+    deployments: (projectId ? (SCOPE_FIXTURE[projectId] ?? []) : []).map((d) => ({
+      id: d.id,
+      label: d.label,
+      products: deploymentIds.includes(d.id) ? d.products : undefined,
+    })),
+    customerContacts: projectId ? (CONTACTS_FIXTURE[projectId] ?? []) : [],
+    contactsReady: !!projectId,
+    isLoading: false,
+    isError: false,
+    refetch: vi.fn(),
+  }),
+}));
+
 /**
  * Stand-in for the rich-text editor: a textarea whose value is the HTML.
  *
@@ -451,5 +533,380 @@ describe("EditChangeRequestDialog — the 'in the past' hint follows the profile
     // digits would be 08:00Z, i.e. earlier than now.
     renderDialog({ plannedStartOn: "2030-03-01 16:00:00", plannedEndOn: "2030-03-01 20:00:00" });
     expect(screen.queryByText(PAST_HINT)).not.toBeInTheDocument();
+  });
+});
+
+describe("EditChangeRequestDialog — Customer Approval / Customer Review checkboxes", () => {
+  const approvalBox = (): HTMLElement => screen.getByRole("checkbox", { name: "Customer Approval" });
+  const reviewBox = (): HTMLElement => screen.getByRole("checkbox", { name: "Customer Review" });
+
+  it("renders both as checkboxes reflecting the stored flags, enabled while the gates are ahead", () => {
+    renderDialog({ state: "assess", customerApprovalRequired: true, customerReviewRequired: false });
+    expect(approvalBox()).toBeChecked();
+    expect(approvalBox()).toBeEnabled();
+    expect(reviewBox()).not.toBeChecked();
+    expect(reviewBox()).toBeEnabled();
+    expect((approvalBox() as HTMLInputElement).type).toBe("checkbox");
+  });
+
+  it("treats absent flags as unchecked and leaves Save disabled with no change", () => {
+    renderDialog({ state: "new" });
+    expect(approvalBox()).not.toBeChecked();
+    expect(reviewBox()).not.toBeChecked();
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it("sends only customerApprovalRequired when only Customer Approval was toggled", () => {
+    const { onSave } = renderDialog({ state: "authorize", customerApprovalRequired: false });
+    fireEvent.click(approvalBox());
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ customerApprovalRequired: true });
+  });
+
+  it("sends only customerReviewRequired when only Customer Review was toggled", () => {
+    const { onSave } = renderDialog({ state: "implement", customerReviewRequired: false });
+    fireEvent.click(reviewBox());
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ customerReviewRequired: true });
+  });
+
+  it("sends both, and can switch an enabled flag off", () => {
+    const { onSave } = renderDialog({
+      state: "assess",
+      customerApprovalRequired: true,
+      customerReviewRequired: false,
+    });
+    fireEvent.click(approvalBox());
+    fireEvent.click(reviewBox());
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({
+      customerApprovalRequired: false,
+      customerReviewRequired: true,
+    });
+  });
+
+  it("does not send a flag that was toggled back to its original value", () => {
+    renderDialog({ state: "assess", customerApprovalRequired: false });
+    fireEvent.click(approvalBox());
+    fireEvent.click(approvalBox());
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it.each(["customer_approval", "scheduled", "implement", "review", "customer_review", "closed", "rollback", "canceled"])(
+    "disables Customer Approval once the CR is in %s, with an explanation",
+    (state) => {
+      renderDialog({ state, customerApprovalRequired: true });
+      expect(approvalBox()).toBeDisabled();
+      expect(approvalBox()).toHaveAccessibleDescription(/locked/i);
+    },
+  );
+
+  it.each(["new", "assess", "authorize"])("keeps Customer Approval editable in %s", (state) => {
+    renderDialog({ state });
+    expect(approvalBox()).toBeEnabled();
+  });
+
+  it.each(["customer_review", "closed", "rollback", "canceled"])(
+    "disables Customer Review once the CR is in %s, with an explanation",
+    (state) => {
+      renderDialog({ state, customerReviewRequired: true });
+      expect(reviewBox()).toBeDisabled();
+      expect(reviewBox()).toHaveAccessibleDescription(/locked/i);
+    },
+  );
+
+  it.each(["new", "assess", "authorize", "customer_approval", "scheduled", "implement", "review"])(
+    "keeps Customer Review editable in %s",
+    (state) => {
+      renderDialog({ state });
+      expect(reviewBox()).toBeEnabled();
+    },
+  );
+
+  it("still lets Customer Review be changed while Customer Approval is locked, and sends only that", () => {
+    const { onSave } = renderDialog({
+      state: "scheduled",
+      customerApprovalRequired: true,
+      customerReviewRequired: false,
+    });
+    expect(approvalBox()).toBeDisabled();
+    fireEvent.click(reviewBox());
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ customerReviewRequired: true });
+  });
+
+  it("shows the backend's refusal message when a late edit is rejected (400)", () => {
+    render(
+      <EditChangeRequestDialog
+        cr={{ ...BASE_CR, state: "assess" }}
+        isSaving={false}
+        saveError="customerApprovalRequired can no longer be changed once the change request is scheduled"
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(/can no longer be changed/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Customer Project / Deployments / Deployment products / Customer Group / Category
+// ---------------------------------------------------------------------------
+
+const SCOPED_CR: Partial<BeChangeRequestDetail> = {
+  state: "scheduled",
+  project: { id: "proj-a", name: "Acme Project" },
+  deployments: [{ id: "dep-prod", name: "Acme Production" }],
+  deploymentProducts: [
+    { id: "dp-apim", name: "API Manager 4.3.0" },
+    { id: "dp-is", name: "Identity Server 7.0.0" },
+  ],
+  customerContacts: [
+    { id: "pc-1", name: "Alice Aaron" },
+    { id: "pc-2", name: "Bob Bell" },
+  ],
+};
+
+function pickOptions(field: string, names: string[]): void {
+  const input = screen.getByRole("combobox", { name: field });
+  fireEvent.mouseDown(input);
+  for (const name of names) fireEvent.click(screen.getByRole("option", { name }));
+  fireEvent.keyDown(input, { key: "Escape" });
+}
+
+function chips(field: string): string[] {
+  const root = screen.getByRole("combobox", { name: field }).closest(".MuiInputBase-root");
+  return Array.from(root?.querySelectorAll(".MuiChip-label") ?? []).map((c) => c.textContent ?? "");
+}
+
+function groupChips(): string[] {
+  const root = screen.getByLabelText("Customer Group").closest(".MuiInputBase-root");
+  return Array.from(root?.querySelectorAll(".MuiChip-label") ?? []).map((c) => c.textContent ?? "");
+}
+
+function productChips(): string[] {
+  const root = screen.getByLabelText("Deployment products").closest(".MuiInputBase-root");
+  return Array.from(root?.querySelectorAll(".MuiChip-label") ?? []).map((c) => c.textContent ?? "");
+}
+
+describe("EditChangeRequestDialog — customer project, deployments, deployment products", () => {
+  it("seeds them from the record, with names rather than ids", () => {
+    renderDialog(SCOPED_CR);
+    expect(screen.getByLabelText("Customer Project")).toHaveValue("proj-a");
+    expect(screen.getByLabelText("Customer Project")).toHaveAttribute("data-known-label", "Acme Project");
+    expect(chips("Deployments")).toEqual(["Acme Production"]);
+    expect(productChips()).toEqual(["API Manager 4.3.0", "Identity Server 7.0.0"]);
+  });
+
+  it("has no Environments field", () => {
+    renderDialog(SCOPED_CR);
+    expect(screen.queryByRole("combobox", { name: "Environments" })).not.toBeInTheDocument();
+  });
+
+  it("sends nothing for them, and keeps Save disabled, when none was touched", () => {
+    renderDialog(SCOPED_CR);
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it("renders them empty (Deployments disabled) for a change request with no project", () => {
+    renderDialog();
+    expect(screen.getByLabelText("Customer Project")).toHaveValue("");
+    expect(screen.getByRole("combobox", { name: "Deployments" })).toBeDisabled();
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it("cascades a deployment change and sends the whole scope together, deployment products included", () => {
+    const { onSave } = renderDialog(SCOPED_CR);
+    pickOptions("Deployments", ["Acme Staging"]);
+    expect(chips("Deployments")).toEqual(["Acme Production", "Acme Staging"]);
+    expect(productChips()).toEqual(["API Manager 4.3.0", "Identity Server 7.0.0", "API Manager 4.2.0"]);
+
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledWith({
+      projectId: "proj-a",
+      deploymentIds: ["dep-prod", "dep-stg"],
+      deploymentProductIds: ["dp-apim", "dp-is", "dp-apim-stg"],
+    });
+  });
+
+  it("drops a removed deployment's products", () => {
+    const { onSave } = renderDialog({
+      ...SCOPED_CR,
+      deployments: [
+        { id: "dep-prod", name: "Acme Production" },
+        { id: "dep-stg", name: "Acme Staging" },
+      ],
+      deploymentProducts: [
+        { id: "dp-apim", name: "API Manager 4.3.0" },
+        { id: "dp-is", name: "Identity Server 7.0.0" },
+        { id: "dp-apim-stg", name: "API Manager 4.2.0" },
+      ],
+    });
+    pickOptions("Deployments", ["Acme Production"]); // toggles Production off
+    expect(productChips()).toEqual(["API Manager 4.2.0"]);
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({
+      projectId: "proj-a",
+      deploymentIds: ["dep-stg"],
+      deploymentProductIds: ["dp-apim-stg"],
+    });
+  });
+
+  it("clears the dependents when the project changes, and sends the new project with empty lists", () => {
+    const { onSave } = renderDialog(SCOPED_CR);
+    fireEvent.change(screen.getByLabelText("Customer Project"), { target: { value: "proj-b" } });
+    expect(chips("Deployments")).toEqual([]);
+    expect(productChips()).toEqual([]);
+
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({
+      projectId: "proj-b",
+      deploymentIds: [],
+      deploymentProductIds: [],
+    });
+  });
+
+  it("sends the chosen project and deployments when a project is set for the first time", () => {
+    const { onSave } = renderDialog();
+    fireEvent.change(screen.getByLabelText("Customer Project"), { target: { value: "proj-b" } });
+    pickOptions("Deployments", ["Beta Development"]);
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({
+      projectId: "proj-b",
+      deploymentIds: ["dep-b"],
+      deploymentProductIds: ["dp-b"],
+    });
+  });
+
+  it("does not let a saved project be cleared (the patch cannot express it), but does when none is saved", () => {
+    const first = render(
+      <EditChangeRequestDialog
+        cr={{ ...BASE_CR, ...SCOPED_CR }}
+        isSaving={false}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText("Customer Project")).toHaveAttribute("data-disable-clearable", "true");
+    first.unmount();
+    renderDialog();
+    expect(screen.getByLabelText("Customer Project")).toHaveAttribute("data-disable-clearable", "false");
+  });
+
+  it.each(["implement", "review", "customer_review", "closed", "canceled"])(
+    "locks the project and deployments, with the reason, once the change request is in %s",
+    (state) => {
+      const { onSave } = renderDialog({ ...SCOPED_CR, state });
+      expect(screen.getByText(/can't be changed once implementation has started/i)).toBeInTheDocument();
+      expect(screen.getByLabelText("Customer Project")).toBeDisabled();
+      expect(screen.getByRole("combobox", { name: "Deployments" })).toBeDisabled();
+      expect(saveButton()).toBeDisabled();
+      expect(onSave).not.toHaveBeenCalled();
+    },
+  );
+
+  it("stays editable up to and including scheduled", () => {
+    renderDialog({ ...SCOPED_CR, state: "scheduled" });
+    expect(screen.queryByText(/can't be changed once implementation/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Deployments" })).toBeEnabled();
+  });
+
+  it("shows the backend's refusal of an inconsistent combination verbatim", () => {
+    const message = "deploymentIds: deployment dep-x does not belong to project proj-a";
+    render(
+      <EditChangeRequestDialog
+        cr={{ ...BASE_CR, ...SCOPED_CR }}
+        isSaving={false}
+        saveError={message}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+  });
+});
+
+describe("EditChangeRequestDialog — Customer Group (the project's registered contacts, read-only)", () => {
+  it("shows the record's project's registered contacts as a locked, read-only field", () => {
+    renderDialog(SCOPED_CR);
+    expect(groupChips()).toEqual(["Alice Aaron", "Bob Bell"]);
+    const field = screen.getByLabelText("Customer Group");
+    expect(field).toHaveAttribute("readonly");
+    expect(field).toHaveAttribute("aria-readonly", "true");
+    expect(screen.getByText("Derived from the customer project's registered contacts")).toBeInTheDocument();
+  });
+
+  it("is not a picker: no Customer group search field, and typing changes nothing", () => {
+    renderDialog(SCOPED_CR);
+    expect(screen.queryByLabelText("Customer group")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Customer Group"), { target: { value: "x" } });
+    expect(screen.getByLabelText("Customer Group")).toHaveValue("");
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it("says to choose a project first for a change request that has none", () => {
+    renderDialog();
+    expect(groupChips()).toEqual([]);
+    expect(screen.getAllByText("Select a Customer Project first.").length).toBeGreaterThan(0);
+  });
+
+  it("re-derives when the project changes, and sends no group with the new project", () => {
+    const { onSave } = renderDialog(SCOPED_CR);
+    fireEvent.change(screen.getByLabelText("Customer Project"), { target: { value: "proj-b" } });
+    expect(groupChips()).toEqual(["Carol Cook"]);
+    fireEvent.click(saveButton());
+    const sent = onSave.mock.calls[0]![0] as Record<string, unknown>;
+    expect(sent).toHaveProperty("projectId", "proj-b");
+    expect(sent).not.toHaveProperty("customerGroupId");
+    expect(sent).not.toHaveProperty("environmentIds");
+  });
+
+  it("keeps showing the contacts when the scope is locked (the group is information, not an edit)", () => {
+    renderDialog({ ...SCOPED_CR, state: "implement" });
+    expect(groupChips()).toEqual(["Alice Aaron", "Bob Bell"]);
+  });
+
+  it("shows the backend's 400 about the removed customerGroupId verbatim", () => {
+    const message =
+      "customerGroupId is no longer accepted: the customer group is derived from the customer project's registered contacts";
+    render(
+      <EditChangeRequestDialog
+        cr={{ ...BASE_CR, ...SCOPED_CR }}
+        isSaving={false}
+        saveError={message}
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+  });
+});
+
+describe("EditChangeRequestDialog — Category", () => {
+  it("seeds from a plain category value, and leaves Save disabled until it changes", () => {
+    renderDialog({ category: "devops" });
+    expect(screen.getByRole("combobox", { name: "Category" })).toHaveTextContent("DevOps");
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it("seeds from an entity-ref category too", () => {
+    renderDialog({ category: { id: "network", name: "Network" } });
+    expect(screen.getByRole("combobox", { name: "Category" })).toHaveTextContent("Network");
+  });
+
+  it("sends only the new category when it is changed", () => {
+    const { onSave } = renderDialog({ category: "devops" });
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "Category" }));
+    fireEvent.click(screen.getByRole("option", { name: "Hotfix Release - Cloud" }));
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledWith({ category: "hotfix_release_cloud" });
+  });
+
+  it("does not send a category when it is cleared (the patch cannot express it)", () => {
+    renderDialog({ category: "devops" });
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "Category" }));
+    fireEvent.click(screen.getByRole("option", { name: "-- Select --" }));
+    expect(saveButton()).toBeDisabled();
   });
 });

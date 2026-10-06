@@ -17,11 +17,9 @@
 package allocator
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"strconv"
@@ -32,161 +30,89 @@ import (
 	"time"
 
 	"sre-alert-ingestion-service/internal/model"
+	"sre-alert-ingestion-service/internal/postgres"
 )
 
-type fakeRow struct{ vendor, alert string }
+type fakeRow struct{ source, alert, fingerprint string }
 
 // fakeStore is an in-memory alert_seq + alerts table with knobs for the failure cases.
 type fakeStore struct {
-	mu      sync.Mutex
-	seq     int64
-	rows    map[string]fakeRow
-	inserts map[string]int // insert calls per id, filler included
+	mu   sync.Mutex
+	seq  int64
+	rows map[string]fakeRow
 
-	casCalls atomic.Int64
-	reads    atomic.Int64 // ReadSeq calls
-	exists   atomic.Int64 // read-backs
-	claims   atomic.Int64 // applied compare-and-sets
-	casDelay time.Duration
-
-	// stealNext rejects the next N compare-and-sets by advancing seq by stealBy first,
-	// as another replica winning the race would.
-	stealNext int
-	stealBy   int64
-	// rejectAll rejects every compare-and-set (claim exhaustion).
-	rejectAll bool
-
-	// failRealInsert fails inserts of real alerts (not filler rows) for which it returns true.
-	failRealInsert func(alert string) bool
-	failAllInserts bool
-	// failFillers fails this many filler inserts before letting them through.
-	failFillers int
-	// insertGate, if set, blocks every Insert until closed.
-	insertGate chan struct{}
-	// hideOnce makes the first read-back of an id miss, as Cosmos DB sometimes does.
-	hideOnce map[string]bool
-	// neverVisible makes every read-back miss.
-	neverVisible bool
-
-	// throttleInserts throttles the next N real inserts; throttleAllInserts throttles all of them.
-	throttleInserts    int
-	throttleAllInserts bool
-	// throttleCAS throttles the next N compare-and-sets.
-	throttleCAS int
-
-	// readGate, if set, blocks ReadSeq until closed; readEntered is signalled on entry.
-	readGate    chan struct{}
-	readEntered chan struct{}
+	claims       atomic.Int64
+	insertCalls  atomic.Int64
+	claimErr     error
+	claimDelay   time.Duration
+	claimGate    chan struct{}
+	claimEntered chan struct{}
+	// interleave advances the sequence between each value handed out, the way a second replica drawing from alert_seq does.
+	interleave bool
+	// failInserts fails this many InsertBatch calls before letting them through; -1 fails them all.
+	failInserts int
+	insertGate  chan struct{}
 }
-
-// errThrottled is a Cosmos DB 429 asking for a 1 ms wait, to keep tests fast.
-var errThrottled = errors.New("Request rate is large. More Request Units may be needed. RetryAfterMs=1")
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{rows: map[string]fakeRow{}, inserts: map[string]int{}, hideOnce: map[string]bool{}}
+	return &fakeStore{rows: map[string]fakeRow{}}
 }
 
-func (f *fakeStore) ReadSeq(context.Context) (int64, error) {
-	f.reads.Add(1)
-	if f.readEntered != nil {
+func (f *fakeStore) ClaimIDs(_ context.Context, n int) ([]int64, error) {
+	f.claims.Add(1)
+	if f.claimEntered != nil {
 		select {
-		case f.readEntered <- struct{}{}:
+		case f.claimEntered <- struct{}{}:
 		default:
 		}
 	}
-	if f.readGate != nil {
-		<-f.readGate
+	if f.claimGate != nil {
+		<-f.claimGate
+	}
+	if f.claimDelay > 0 {
+		time.Sleep(f.claimDelay)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.seq, nil
+	if f.claimErr != nil {
+		return nil, f.claimErr
+	}
+	ids := make([]int64, n)
+	for i := range ids {
+		f.seq++
+		ids[i] = f.seq
+		if f.interleave {
+			f.seq++
+		}
+	}
+	return ids, nil
 }
 
-func (f *fakeStore) CompareAndSet(_ context.Context, from, to int64) (bool, int64, error) {
-	f.casCalls.Add(1)
-	if f.casDelay > 0 {
-		time.Sleep(f.casDelay)
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.throttleCAS > 0 {
-		f.throttleCAS--
-		return false, 0, errThrottled
-	}
-	if f.stealNext > 0 {
-		f.stealNext--
-		f.seq += f.stealBy
-	}
-	if f.rejectAll || f.seq != from {
-		return false, f.seq, nil
-	}
-	f.seq = to
-	f.claims.Add(1)
-	return true, to, nil
-}
-
-func (f *fakeStore) Insert(_ context.Context, id, vendor, alert string) error {
+func (f *fakeStore) InsertBatch(_ context.Context, rows []postgres.InsertRow) error {
+	f.insertCalls.Add(1)
 	if f.insertGate != nil {
 		<-f.insertGate
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.inserts[id]++
-	isFiller := strings.HasPrefix(alert, fillerPrefix)
-	if !isFiller && (f.throttleAllInserts || f.throttleInserts > 0) {
-		if f.throttleInserts > 0 {
-			f.throttleInserts--
+	if f.failInserts != 0 {
+		if f.failInserts > 0 {
+			f.failInserts--
 		}
-		return errThrottled
-	}
-	if isFiller && f.failFillers > 0 {
-		f.failFillers--
 		return errors.New("write timeout")
 	}
-	if f.failAllInserts || (!isFiller && f.failRealInsert != nil && f.failRealInsert(alert)) {
-		return errors.New("write timeout")
+	for _, r := range rows {
+		if _, ok := f.rows[r.ID]; !ok {
+			f.rows[r.ID] = fakeRow{source: r.Source, alert: string(r.Alert), fingerprint: r.Fingerprint}
+		}
 	}
-	f.rows[id] = fakeRow{vendor: vendor, alert: alert}
 	return nil
 }
 
-func (f *fakeStore) InsertFiller(ctx context.Context, id, vendor, filler string) (bool, string, error) {
-	f.mu.Lock()
-	row, ok := f.rows[id]
-	f.mu.Unlock()
-	if ok {
-		f.mu.Lock()
-		f.inserts[id]++
-		f.mu.Unlock()
-		return false, row.alert, nil
-	}
-	return true, "", f.Insert(ctx, id, vendor, filler)
-}
-
-func (f *fakeStore) Exists(_ context.Context, id string) (bool, error) {
-	f.exists.Add(1)
+func (f *fakeStore) rowCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.neverVisible {
-		return false, nil
-	}
-	if f.hideOnce[id] {
-		delete(f.hideOnce, id)
-		return false, nil
-	}
-	_, ok := f.rows[id]
-	return ok, nil
-}
-
-type recordingNotifier struct {
-	mu       sync.Mutex
-	failures []StoreFailure
-}
-
-func (n *recordingNotifier) StoreFailed(f StoreFailure) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	n.failures = append(n.failures, f)
+	return len(f.rows)
 }
 
 type countingWaker struct{ n atomic.Int64 }
@@ -195,15 +121,15 @@ func (w *countingWaker) Wake() { w.n.Add(1) }
 
 func testConfig() Config {
 	return Config{
-		QueueSize: 5000, MaxBatch: 200, WriteConcurrency: 64, ClaimMaxAttempts: 20,
-		InsertAttempts: 3, InsertBaseDelay: time.Millisecond, ClaimJitter: time.Millisecond,
+		QueueSize: 5000, MaxBatch: 200, WriteConcurrency: 64,
+		InsertAttempts: 3, InsertBaseDelay: time.Millisecond,
 		QueueMaxBytes: 1 << 30, QueryTimeout: time.Millisecond, WriteDeadline: time.Minute,
 	}
 }
 
-func newTestAllocator(t *testing.T, store *fakeStore, n FailureNotifier, w Waker, cfg Config) *Allocator {
+func newTestAllocator(t *testing.T, store *fakeStore, w Waker, cfg Config) *Allocator {
 	t.Helper()
-	a := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, n, w, cfg)
+	a := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, w, cfg)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -228,10 +154,23 @@ func seqOf(t *testing.T, id string) int64 {
 	return n
 }
 
-func TestConcurrentSubmits_UniqueConsecutiveIDsWithFewClaims(t *testing.T) {
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatal("condition not met in time")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestConcurrentSubmits_UniqueIDsWithFewClaims(t *testing.T) {
 	store := newFakeStore()
-	store.casDelay = 2 * time.Millisecond // a real claim takes a few ms; lets the queue fill
-	a := newTestAllocator(t, store, nil, nil, testConfig())
+	store.claimDelay = 2 * time.Millisecond
+	cfg := testConfig()
+	cfg.WriteConcurrency = 4
+	a := newTestAllocator(t, store, nil, cfg)
 
 	const total = 1000
 	ids := make([]string, total)
@@ -250,212 +189,50 @@ func TestConcurrentSubmits_UniqueConsecutiveIDsWithFewClaims(t *testing.T) {
 	}
 	wg.Wait()
 
-	seen := map[int64]bool{}
+	seen := map[string]bool{}
 	for _, id := range ids {
-		n := seqOf(t, id)
-		if seen[n] {
+		if seen[id] {
 			t.Fatalf("id %s issued twice", id)
 		}
-		seen[n] = true
+		seen[id] = true
 	}
-	for n := int64(1); n <= total; n++ {
-		if !seen[n] {
-			t.Fatalf("gap: id %d never issued", n)
-		}
-	}
-	if len(store.rows) != total {
-		t.Errorf("rows = %d, want %d", len(store.rows), total)
-	}
-	if store.seq != total {
-		t.Errorf("alert_seq = %d, want %d", store.seq, total)
+	if store.rowCount() != total {
+		t.Errorf("rows = %d, want %d", store.rowCount(), total)
 	}
 	if c := store.claims.Load(); c >= total/10 {
-		t.Errorf("claims = %d, want far fewer than %d", c, total)
-	} else {
-		t.Logf("%d alerts claimed in %d compare-and-sets", total, c)
+		t.Errorf("claim calls = %d, want far fewer than %d", c, total)
 	}
 }
 
-func TestLostCompareAndSet_IsRetriedWithReturnedValue(t *testing.T) {
+func TestInterleavedSequence_UsesTheIDsItWasGiven(t *testing.T) {
 	store := newFakeStore()
-	store.stealNext, store.stealBy = 3, 10 // another replica wins three times, 10 ids each
-	a := newTestAllocator(t, store, nil, nil, testConfig())
-
-	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u1"), alert("svc", "u2")})
-	if err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	if ids[0] != "ALT000000031" || ids[1] != "ALT000000032" {
-		t.Errorf("ids = %v, want ALT000000031, ALT000000032 after 30 stolen ids", ids)
-	}
-	if c := store.casCalls.Load(); c != 4 {
-		t.Errorf("compare-and-sets = %d, want 4 (3 lost + 1 won)", c)
-	}
-}
-
-func TestClaimExhausted_FailsWithoutWritingRows(t *testing.T) {
-	store := newFakeStore()
-	store.rejectAll = true
-	cfg := testConfig()
-	cfg.ClaimMaxAttempts = 3
-	a := newTestAllocator(t, store, nil, nil, cfg)
-
-	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); !errors.Is(err, ErrClaimFailed) {
-		t.Fatalf("err = %v, want ErrClaimFailed", err)
-	}
-	if len(store.rows) != 0 {
-		t.Errorf("rows = %d, want none: nothing was claimed", len(store.rows))
-	}
-}
-
-func TestInsertFailure_WritesFillerAndFails(t *testing.T) {
-	store := newFakeStore()
-	store.failRealInsert = func(a string) bool { return strings.Contains(a, `"service":"bad"`) }
-	notifier := &recordingNotifier{}
-	a := newTestAllocator(t, store, notifier, nil, testConfig())
-
-	ids, err := a.Submit(context.Background(), "prometheus", "req-9", []model.Alert{alert("good", "u1"), alert("bad", "u2")})
-	if !errors.Is(err, ErrStoreFailed) {
-		t.Fatalf("err = %v, want ErrStoreFailed (503)", err)
-	}
-	if len(ids) != 2 {
-		t.Fatalf("ids = %v", ids)
-	}
-	good, bad := store.rows[ids[0]], store.rows[ids[1]]
-	if !strings.Contains(good.alert, `"service":"good"`) {
-		t.Errorf("good row = %q", good.alert)
-	}
-	if !strings.HasPrefix(bad.alert, "VOID: ") || bad.vendor != "prometheus" {
-		t.Errorf("failed id should hold a filler row, got %+v", bad)
-	}
-	var probe model.Alert
-	if json.Unmarshal([]byte(bad.alert), &probe) == nil {
-		t.Error("filler row must not parse as an alert, or alerts-core would process it")
-	}
-	if n := store.inserts[ids[1]]; n != 4 {
-		t.Errorf("insert calls on the failed id = %d, want 3 attempts + 1 filler", n)
-	}
-	if len(notifier.failures) != 1 {
-		t.Fatalf("notifications = %d, want 1", len(notifier.failures))
-	}
-	f := notifier.failures[0]
-	if f.AltID != ids[1] || f.Vendor != "prometheus" || f.RequestID != "req-9" || !f.FillerWritten || f.Alert.Service != "bad" {
-		t.Errorf("failure = %+v", f)
-	}
-}
-
-func TestInsertAndFillerBothFail_ReportsFillerMissing(t *testing.T) {
-	store := newFakeStore()
-	store.failAllInserts = true
-	notifier := &recordingNotifier{}
-	a := newTestAllocator(t, store, notifier, nil, testConfig())
-
-	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); !errors.Is(err, ErrStoreFailed) {
-		t.Fatalf("err = %v, want ErrStoreFailed", err)
-	}
-	if len(notifier.failures) != 1 || notifier.failures[0].FillerWritten {
-		t.Errorf("failures = %+v, want one with FillerWritten=false", notifier.failures)
-	}
-	if n := store.inserts["ALT000000001"]; n != 6 {
-		t.Errorf("insert calls = %d, want 3 attempts + 3 filler attempts", n)
-	}
-}
-
-func TestFillerRetried_UntilWritten(t *testing.T) {
-	store := newFakeStore()
-	store.failRealInsert = func(string) bool { return true }
-	store.failFillers = 2
-	notifier := &recordingNotifier{}
-	a := newTestAllocator(t, store, notifier, nil, testConfig())
-
-	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
-	if !errors.Is(err, ErrStoreFailed) {
-		t.Fatalf("err = %v, want ErrStoreFailed", err)
-	}
-	if !strings.HasPrefix(store.rows[ids[0]].alert, fillerPrefix) {
-		t.Errorf("row = %+v, want the filler after its third attempt", store.rows[ids[0]])
-	}
-	if len(notifier.failures) != 1 || !notifier.failures[0].FillerWritten {
-		t.Errorf("failures = %+v, want FillerWritten=true", notifier.failures)
-	}
-}
-
-func TestReadBackMiss_RetriesOnSameID(t *testing.T) {
-	store := newFakeStore()
-	store.hideOnce["ALT000000001"] = true
-	cfg := testConfig()
-	cfg.ReadBack = true
-	a := newTestAllocator(t, store, nil, nil, cfg)
-
-	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
-	if err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	if ids[0] != "ALT000000001" || store.inserts["ALT000000001"] != 2 {
-		t.Errorf("ids = %v, inserts = %d; want the same id re-inserted once", ids, store.inserts["ALT000000001"])
-	}
-}
-
-func TestNoReadBack_ByDefault(t *testing.T) {
-	store := newFakeStore()
-	a := newTestAllocator(t, store, nil, nil, testConfig())
-	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	if n := store.exists.Load(); n != 0 {
-		t.Errorf("read-backs = %d, want 0 with ReadBack off", n)
-	}
-}
-
-func TestClaim_ReadsSeqOnlyOnce(t *testing.T) {
-	store := newFakeStore()
-	a := newTestAllocator(t, store, nil, nil, testConfig())
-	for i := range 3 {
-		ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
-		if err != nil || ids[0] != fmt.Sprintf("ALT%09d", i+1) {
-			t.Fatalf("Submit %d = %v, %v", i, ids, err)
-		}
-	}
-	if n := store.reads.Load(); n != 1 {
-		t.Errorf("alert_seq reads = %d, want 1: later claims start from the value last set", n)
-	}
-}
-
-func TestClaim_StaleCachedSeqUsesReturnedValue(t *testing.T) {
-	store := newFakeStore()
-	a := newTestAllocator(t, store, nil, nil, testConfig())
-	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); err != nil {
-		t.Fatalf("Submit: %v", err)
-	}
-	store.mu.Lock()
-	store.seq += 5 // another replica claimed 2..6
-	store.mu.Unlock()
-	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "v")})
-	if err != nil || ids[0] != "ALT000000007" {
-		t.Fatalf("ids = %v, err = %v; want ALT000000007", ids, err)
-	}
-	if n := store.reads.Load(); n != 1 {
-		t.Errorf("alert_seq reads = %d, want 1: the rejection returns the current value", n)
-	}
-}
-
-func TestBatchSubmission_GetsConsecutiveIDsInOrder(t *testing.T) {
-	store := newFakeStore()
-	store.seq = 41
-	a := newTestAllocator(t, store, nil, nil, testConfig())
+	store.interleave = true
+	a := newTestAllocator(t, store, nil, testConfig())
 
 	batch := []model.Alert{alert("a", "1"), alert("b", "2"), alert("c", "3")}
 	ids, err := a.Submit(context.Background(), "prometheus", "req", batch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, id := range ids {
-		if seqOf(t, id) != int64(42+i) {
-			t.Fatalf("ids = %v, want ALT000000042..44", ids)
+	for i, want := range []int64{1, 3, 5} {
+		if seqOf(t, ids[i]) != want {
+			t.Fatalf("ids = %v, want the claimed values 1, 3, 5 rather than an assumed consecutive range", ids)
 		}
-		if !strings.Contains(store.rows[id].alert, `"service":"`+batch[i].Service+`"`) {
-			t.Errorf("row %s holds the wrong alert: %s", id, store.rows[id].alert)
+		if !strings.Contains(store.rows[ids[i]].alert, `"service":"`+batch[i].Service+`"`) {
+			t.Errorf("row %s holds the wrong alert: %s", ids[i], store.rows[ids[i]].alert)
 		}
+	}
+}
+
+func TestBatch_OneClaimAndOneInsertPerBatch(t *testing.T) {
+	store := newFakeStore()
+	a := newTestAllocator(t, store, nil, testConfig())
+
+	if _, err := a.Submit(context.Background(), "prometheus", "req", []model.Alert{alert("a", "1"), alert("b", "2")}); err != nil {
+		t.Fatal(err)
+	}
+	if store.claims.Load() != 1 || store.insertCalls.Load() != 1 {
+		t.Errorf("claims = %d inserts = %d, want 1 and 1", store.claims.Load(), store.insertCalls.Load())
 	}
 }
 
@@ -463,7 +240,7 @@ func TestLargeSubmissionIsNotSplit(t *testing.T) {
 	store := newFakeStore()
 	cfg := testConfig()
 	cfg.MaxBatch = 2
-	a := newTestAllocator(t, store, nil, nil, cfg)
+	a := newTestAllocator(t, store, nil, cfg)
 
 	batch := make([]model.Alert, 5)
 	for i := range batch {
@@ -473,14 +250,14 @@ func TestLargeSubmissionIsNotSplit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seqOf(t, ids[0]) != 1 || seqOf(t, ids[4]) != 5 || store.claims.Load() != 1 {
-		t.Errorf("ids = %v, claims = %d; want one claim of 5 consecutive ids", ids, store.claims.Load())
+	if len(ids) != 5 || store.claims.Load() != 1 || store.rowCount() != 5 {
+		t.Errorf("ids = %v, claims = %d; want one claim of 5 ids", ids, store.claims.Load())
 	}
 }
 
-func TestMissingUniqueIdentifier_UsesOwnAltID(t *testing.T) {
+func TestMissingUniqueIdentifier_UsesOwnAltIDInFingerprint(t *testing.T) {
 	store := newFakeStore()
-	a := newTestAllocator(t, store, nil, nil, testConfig())
+	a := newTestAllocator(t, store, nil, testConfig())
 
 	ids, err := a.Submit(context.Background(), "datadog", "req", []model.Alert{alert("svc", "")})
 	if err != nil {
@@ -493,12 +270,15 @@ func TestMissingUniqueIdentifier_UsesOwnAltID(t *testing.T) {
 	if stored.UniqueIdentifier != ids[0] {
 		t.Errorf("unique_identifier = %q, want %q", stored.UniqueIdentifier, ids[0])
 	}
+	if got := store.rows[ids[0]].fingerprint; got != model.Fingerprint(stored) {
+		t.Errorf("fingerprint = %q, want it computed from the stored alert", got)
+	}
 }
 
 func TestWakesOncePerBatch(t *testing.T) {
 	store := newFakeStore()
 	waker := &countingWaker{}
-	a := newTestAllocator(t, store, nil, waker, testConfig())
+	a := newTestAllocator(t, store, waker, testConfig())
 
 	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("a", "1"), alert("b", "2")}); err != nil {
 		t.Fatal(err)
@@ -508,36 +288,101 @@ func TestWakesOncePerBatch(t *testing.T) {
 	}
 }
 
+func TestClaimFailure_FailsWithoutWritingRows(t *testing.T) {
+	store := newFakeStore()
+	store.claimErr = errors.New("connection refused")
+	a := newTestAllocator(t, store, nil, testConfig())
+
+	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); !errors.Is(err, ErrClaimFailed) {
+		t.Fatalf("err = %v, want ErrClaimFailed", err)
+	}
+	if store.rowCount() != 0 || store.insertCalls.Load() != 0 {
+		t.Errorf("rows = %d inserts = %d, want none", store.rowCount(), store.insertCalls.Load())
+	}
+}
+
+func TestInsertFailure_RetriesThenSucceeds(t *testing.T) {
+	store := newFakeStore()
+	store.failInserts = 2
+	waker := &countingWaker{}
+	a := newTestAllocator(t, store, waker, testConfig())
+
+	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
+	if err != nil {
+		t.Fatalf("err = %v, want success on the third attempt", err)
+	}
+	if store.insertCalls.Load() != 3 || store.rowCount() != 1 || store.claims.Load() != 1 {
+		t.Errorf("inserts = %d rows = %d claims = %d, want 3, 1, 1 (retries reuse the claimed ids)", store.insertCalls.Load(), store.rowCount(), store.claims.Load())
+	}
+	if _, ok := store.rows[ids[0]]; !ok || waker.n.Load() != 1 {
+		t.Errorf("row for %s missing or wake not sent", ids[0])
+	}
+}
+
+func TestInsertFailure_ExhaustsAttemptsAndFails(t *testing.T) {
+	store := newFakeStore()
+	store.failInserts = -1
+	waker := &countingWaker{}
+	a := newTestAllocator(t, store, waker, testConfig())
+
+	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("err = %v, want ErrStoreFailed (503)", err)
+	}
+	if store.insertCalls.Load() != 3 || store.rowCount() != 0 || waker.n.Load() != 0 {
+		t.Errorf("inserts = %d rows = %d wakes = %d, want 3, 0, 0", store.insertCalls.Load(), store.rowCount(), waker.n.Load())
+	}
+}
+
+func TestInsertFailure_StopsAtWriteDeadline(t *testing.T) {
+	store := newFakeStore()
+	store.failInserts = -1
+	cfg := testConfig()
+	cfg.InsertAttempts = 1000
+	cfg.InsertBaseDelay = 20 * time.Millisecond
+	cfg.WriteDeadline = 100 * time.Millisecond
+	cfg.QueryTimeout = 10 * time.Millisecond
+	a := newTestAllocator(t, store, nil, cfg)
+
+	start := time.Now()
+	if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")}); !errors.Is(err, ErrStoreFailed) {
+		t.Fatalf("err = %v, want ErrStoreFailed", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("retries ran %v, want them cut off near the 100ms write deadline", elapsed)
+	}
+}
+
 func TestQueueFull_FailsImmediately(t *testing.T) {
 	store := newFakeStore()
-	store.readGate = make(chan struct{})
-	store.readEntered = make(chan struct{}, 1)
+	store.claimGate = make(chan struct{})
+	store.claimEntered = make(chan struct{}, 1)
 	cfg := testConfig()
 	cfg.QueueSize = 1
-	a := newTestAllocator(t, store, nil, nil, cfg)
+	cfg.WriteConcurrency = 1
+	a := newTestAllocator(t, store, nil, cfg)
 
-	results := make(chan error, 2)
-	go func() {
-		_, err := a.Submit(context.Background(), "aws", "r1", []model.Alert{alert("a", "1")})
+	results := make(chan error, 3)
+	submit := func(uid string) {
+		_, err := a.Submit(context.Background(), "aws", uid, []model.Alert{alert("a", uid)})
 		results <- err
-	}()
-	<-store.readEntered // the claimer holds the first submission and is blocked on ReadSeq
-	go func() {
-		_, err := a.Submit(context.Background(), "aws", "r2", []model.Alert{alert("b", "2")})
-		results <- err
-	}()
+	}
+	go submit("1")
+	<-store.claimEntered // the only writer is blocked claiming for submission 1
+	go submit("2")
+	waitFor(t, func() bool { return len(a.queue) == 0 }) // the batcher holds 2, waiting for a writer
+	go submit("3")
 	waitFor(t, func() bool { return len(a.queue) == 1 })
 
 	start := time.Now()
-	if _, err := a.Submit(context.Background(), "aws", "r3", []model.Alert{alert("c", "3")}); !errors.Is(err, ErrQueueFull) {
+	if _, err := a.Submit(context.Background(), "aws", "4", []model.Alert{alert("d", "4")}); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("err = %v, want ErrQueueFull", err)
 	}
 	if time.Since(start) > 100*time.Millisecond {
 		t.Error("a full queue must fail immediately, not wait")
 	}
 
-	close(store.readGate)
-	for range 2 {
+	close(store.claimGate)
+	for range 3 {
 		if err := <-results; err != nil {
 			t.Errorf("queued submissions should still succeed, got %v", err)
 		}
@@ -546,11 +391,12 @@ func TestQueueFull_FailsImmediately(t *testing.T) {
 
 func TestShutdown_DrainsQueueThenRejects(t *testing.T) {
 	store := newFakeStore()
-	store.readGate = make(chan struct{})
-	store.readEntered = make(chan struct{}, 1)
+	store.claimGate = make(chan struct{})
+	store.claimEntered = make(chan struct{}, 1)
 	cfg := testConfig()
-	cfg.MaxBatch = 1 // the claimer holds exactly one, so the other four stay visibly queued
-	a := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, nil, nil, cfg)
+	cfg.MaxBatch = 1
+	cfg.WriteConcurrency = 1
+	a := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, nil, cfg)
 
 	results := make(chan error, 5)
 	for i := range 5 {
@@ -559,8 +405,8 @@ func TestShutdown_DrainsQueueThenRejects(t *testing.T) {
 			results <- err
 		}()
 	}
-	<-store.readEntered
-	waitFor(t, func() bool { return len(a.queue) == 4 })
+	<-store.claimEntered
+	waitFor(t, func() bool { return len(a.queue) == 3 })
 
 	closed := make(chan error, 1)
 	go func() {
@@ -573,7 +419,7 @@ func TestShutdown_DrainsQueueThenRejects(t *testing.T) {
 		t.Errorf("Submit after Close = %v, want ErrShuttingDown", err)
 	}
 
-	close(store.readGate)
+	close(store.claimGate)
 	for range 5 {
 		if err := <-results; err != nil {
 			t.Errorf("queued submission lost on shutdown: %v", err)
@@ -582,15 +428,15 @@ func TestShutdown_DrainsQueueThenRejects(t *testing.T) {
 	if err := <-closed; err != nil {
 		t.Errorf("Close = %v", err)
 	}
-	if len(store.rows) != 5 {
-		t.Errorf("rows = %d, want 5", len(store.rows))
+	if store.rowCount() != 5 {
+		t.Errorf("rows = %d, want 5", store.rowCount())
 	}
 }
 
 func TestCancelledRequest_StillWritesItsRow(t *testing.T) {
 	store := newFakeStore()
-	store.readGate = make(chan struct{})
-	a := newTestAllocator(t, store, nil, nil, testConfig())
+	store.claimGate = make(chan struct{})
+	a := newTestAllocator(t, store, nil, testConfig())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -601,95 +447,84 @@ func TestCancelledRequest_StillWritesItsRow(t *testing.T) {
 		t.Fatalf("err = %v, want ErrTimeout", err)
 	}
 
-	close(store.readGate)
+	close(store.claimGate)
 	closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelClose()
 	if err := a.Close(closeCtx); err != nil {
 		t.Fatal(err)
 	}
-	if len(store.rows) != 1 {
-		t.Errorf("rows = %d, want 1: a claimed id must get its row even after the client left", len(store.rows))
+	if store.rowCount() != 1 {
+		t.Errorf("rows = %d, want 1: an accepted alert must be written even after the client left", store.rowCount())
 	}
 }
 
-func waitFor(t *testing.T, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatal("condition not met in time")
+func TestQueueBytes_LimitAndRelease(t *testing.T) {
+	big := alert("svc", "u")
+	big.Description = strings.Repeat("x", 200)
+
+	t.Run("over the limit", func(t *testing.T) {
+		store := newFakeStore()
+		cfg := testConfig()
+		cfg.QueueMaxBytes = 100
+		a := newTestAllocator(t, store, nil, cfg)
+		if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{big}); !errors.Is(err, ErrQueueBytesFull) {
+			t.Fatalf("err = %v, want ErrQueueBytesFull", err)
 		}
-		time.Sleep(time.Millisecond)
-	}
-}
-
-func TestCloseTimeout_LogsUnwrittenIDs(t *testing.T) {
-	store := newFakeStore()
-	store.insertGate = make(chan struct{})
-	var logs bytes.Buffer
-	var logMu sync.Mutex
-	logger := slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &logMu}, nil))
-	a := New(logger, store, nil, nil, testConfig())
-
-	submitted := make(chan struct{})
-	go func() {
-		_, _ = a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u1"), alert("svc", "u2")})
-		close(submitted)
-	}()
-	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
-		a.pendingMu.Lock()
-		n := len(a.pending)
-		a.pendingMu.Unlock()
-		if n == 2 {
-			break
+		if store.claims.Load() != 0 || a.QueueBytes() != 0 {
+			t.Errorf("claimed %d times, %d bytes held; want nothing", store.claims.Load(), a.QueueBytes())
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("ids were never claimed")
+	})
+
+	cases := map[string]func(*fakeStore){
+		"stored":         func(*fakeStore) {},
+		"insert failure": func(s *fakeStore) { s.failInserts = -1 },
+		"claim failure":  func(s *fakeStore) { s.claimErr = errors.New("connection refused") },
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeStore()
+			setup(store)
+			a := newTestAllocator(t, store, nil, testConfig())
+			_, _ = a.Submit(context.Background(), "aws", "req", []model.Alert{big})
+			if b := a.QueueBytes(); b != 0 {
+				t.Errorf("queue bytes = %d, want 0", b)
+			}
+		})
+	}
+
+	t.Run("shutdown", func(t *testing.T) {
+		store := newFakeStore()
+		store.insertGate = make(chan struct{})
+		a := New(slog.New(slog.NewTextHandler(io.Discard, nil)), store, nil, testConfig())
+		done := make(chan struct{})
+		go func() {
+			_, _ = a.Submit(context.Background(), "aws", "req", []model.Alert{big})
+			close(done)
+		}()
+		waitFor(t, func() bool { return a.QueueBytes() > 0 })
+		closed := make(chan error, 1)
+		go func() { closed <- a.Close(context.Background()) }()
+		close(store.insertGate)
+		<-done
+		if err := <-closed; err != nil {
+			t.Fatal(err)
 		}
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := a.Close(ctx); err == nil {
-		t.Fatal("Close should time out while writes are blocked")
-	}
-	logMu.Lock()
-	out := logs.String()
-	logMu.Unlock()
-	if !strings.Contains(out, "have no row") || !strings.Contains(out, "ALT000000001") || !strings.Contains(out, "ALT000000002") {
-		t.Errorf("log should name the unwritten ids, got:\n%s", out)
-	}
-	close(store.insertGate)
-	<-submitted
+		if b := a.QueueBytes(); b != 0 {
+			t.Errorf("queue bytes = %d after shutdown, want 0", b)
+		}
+		if _, err := a.Submit(context.Background(), "aws", "req", []model.Alert{big}); !errors.Is(err, ErrShuttingDown) || a.QueueBytes() != 0 {
+			t.Errorf("submit after close: err = %v, bytes = %d", err, a.QueueBytes())
+		}
+	})
 }
 
-type lockedWriter struct {
-	w  io.Writer
-	mu *sync.Mutex
-}
-
-func (l *lockedWriter) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Write(p)
-}
-
-func TestReadBackAlwaysMisses_KeepsStoredAlert(t *testing.T) {
-	store := newFakeStore()
-	store.neverVisible = true
-	notifier := &recordingNotifier{}
-	cfg := testConfig()
-	cfg.ReadBack = true
-	a := newTestAllocator(t, store, notifier, nil, cfg)
-
-	ids, err := a.Submit(context.Background(), "aws", "req", []model.Alert{alert("svc", "u")})
-	if err != nil {
-		t.Fatalf("err = %v, want success: the alert did land", err)
-	}
-	if row := store.rows[ids[0]]; !strings.Contains(row.alert, `"service":"svc"`) {
-		t.Errorf("row = %q, want the real alert, not a filler", row.alert)
-	}
-	if len(notifier.failures) != 0 {
-		t.Errorf("failures = %+v, want none", notifier.failures)
+func TestSizeOf_SharedDescriptionCountedOnce(t *testing.T) {
+	desc := strings.Repeat("d", 1000)
+	one := alert("svc", "u")
+	one.Description = desc
+	batch := []model.Alert{one, one, one}
+	fields := sizeOf([]model.Alert{one}) - int64(len(desc))
+	if got, want := sizeOf(batch), 3*fields+int64(len(desc)); got != want {
+		t.Errorf("sizeOf = %d, want %d (description counted once)", got, want)
 	}
 }

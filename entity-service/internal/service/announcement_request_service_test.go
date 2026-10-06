@@ -1245,6 +1245,98 @@ func TestAnnouncementRequestService_Search(t *testing.T) {
 			t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
 		}
 	})
+
+	t.Run("forwards a states list to the repo unchanged", func(t *testing.T) {
+		repo := &fakeAnnouncementRequestRepo{}
+		svc := NewAnnouncementRequestService(repo, nil, nil)
+		want := []domain.AnnouncementRequestState{
+			domain.AnnouncementRequestStateDraft,
+			domain.AnnouncementRequestStatePendingApproval,
+		}
+		_, err := svc.Search(context.Background(), domain.SearchAnnouncementRequestsRequest{States: want})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(repo.gotSearchReq.States) != len(want) || repo.gotSearchReq.States[0] != want[0] || repo.gotSearchReq.States[1] != want[1] {
+			t.Fatalf("expected states %v forwarded to the repo, got %v", want, repo.gotSearchReq.States)
+		}
+	})
+
+	t.Run("an empty states list is accepted as no state filter", func(t *testing.T) {
+		repo := &fakeAnnouncementRequestRepo{}
+		svc := NewAnnouncementRequestService(repo, nil, nil)
+		if _, err := svc.Search(context.Background(), domain.SearchAnnouncementRequestsRequest{
+			States: []domain.AnnouncementRequestState{},
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("rejects a states list containing an invalid state", func(t *testing.T) {
+		repo := &fakeAnnouncementRequestRepo{}
+		svc := NewAnnouncementRequestService(repo, nil, nil)
+		_, err := svc.Search(context.Background(), domain.SearchAnnouncementRequestsRequest{
+			States: []domain.AnnouncementRequestState{domain.AnnouncementRequestStateDraft, "bogus"},
+		})
+		var ve *apierror.ValidationError
+		if !isValidationError(err, &ve) {
+			t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("rejects state combined with states", func(t *testing.T) {
+		repo := &fakeAnnouncementRequestRepo{}
+		svc := NewAnnouncementRequestService(repo, nil, nil)
+		draft := domain.AnnouncementRequestStateDraft
+		_, err := svc.Search(context.Background(), domain.SearchAnnouncementRequestsRequest{
+			State:  &draft,
+			States: []domain.AnnouncementRequestState{domain.AnnouncementRequestStateApproved},
+		})
+		var ve *apierror.ValidationError
+		if !isValidationError(err, &ve) {
+			t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("rejects state combined with an explicitly empty states list", func(t *testing.T) {
+		repo := &fakeAnnouncementRequestRepo{}
+		svc := NewAnnouncementRequestService(repo, nil, nil)
+		draft := domain.AnnouncementRequestStateDraft
+		_, err := svc.Search(context.Background(), domain.SearchAnnouncementRequestsRequest{
+			State:  &draft,
+			States: []domain.AnnouncementRequestState{},
+		})
+		var ve *apierror.ValidationError
+		if !isValidationError(err, &ve) {
+			t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("rejects readyForScheduledPublish combined with an explicitly empty states list", func(t *testing.T) {
+		repo := &fakeAnnouncementRequestRepo{}
+		svc := NewAnnouncementRequestService(repo, nil, nil)
+		_, err := svc.Search(context.Background(), domain.SearchAnnouncementRequestsRequest{
+			ReadyForScheduledPublish: true,
+			States:                   []domain.AnnouncementRequestState{},
+		})
+		var ve *apierror.ValidationError
+		if !isValidationError(err, &ve) {
+			t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("rejects readyForScheduledPublish combined with states", func(t *testing.T) {
+		repo := &fakeAnnouncementRequestRepo{}
+		svc := NewAnnouncementRequestService(repo, nil, nil)
+		_, err := svc.Search(context.Background(), domain.SearchAnnouncementRequestsRequest{
+			ReadyForScheduledPublish: true,
+			States:                   []domain.AnnouncementRequestState{domain.AnnouncementRequestStateApproved},
+		})
+		var ve *apierror.ValidationError
+		if !isValidationError(err, &ve) {
+			t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+		}
+	})
 }
 
 func TestAnnouncementRequestService_RecordDeliveries(t *testing.T) {

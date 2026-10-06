@@ -43,6 +43,15 @@ var commentTypeToEnum = map[domain.CommentType]string{
 // any other non-empty value rather than trusting it at face value.
 const commentCreatedByAgent = "agent"
 
+// commentAgentDisplayName is the author name a comment written by
+// commentCreatedByAgent reads back with. ServiceNow resolved the agent to its
+// "Novera" user, and the customer portal relies on that: it marks a chat
+// message as the assistant's only when the author's name is "Novera". There
+// is no "user" row for "agent" on this data source, so without this the
+// assistant's saved replies come back unattributed and render as the
+// customer's own messages when a chat is resumed.
+const commentAgentDisplayName = "Novera"
+
 // commentAdminRoleName is the role.name (migration 0008's seed data, joined
 // through user_role) that grants a caller admin-level access to comment
 // edit/delete/visibility decisions on this data source -- confirmed against
@@ -116,7 +125,7 @@ func commentRowToDomain(row repository.CommentRow) domain.Comment {
 		// account), matching the display name case_repo.go's
 		// SearchCaseActivities already resolves for the same comment on the
 		// case activity timeline -- there is no id to attach either way.
-		CreatedBy: domain.NewUserReference("", row.CreatedBy, row.CreatedByName),
+		CreatedBy: domain.NewUserReference("", row.CreatedBy, commentAuthorName(row)),
 	}
 	if row.Type != nil {
 		if t, ok := commentEnumToType[*row.Type]; ok {
@@ -124,6 +133,15 @@ func commentRowToDomain(row repository.CommentRow) domain.Comment {
 		}
 	}
 	return c
+}
+
+// commentAuthorName is row.CreatedByName, except that the Novera agent, which
+// has no "user" row to resolve against, is named commentAgentDisplayName.
+func commentAuthorName(row repository.CommentRow) string {
+	if row.CreatedByName == "" && strings.EqualFold(row.CreatedBy, commentCreatedByAgent) {
+		return commentAgentDisplayName
+	}
+	return row.CreatedByName
 }
 
 // commentCallerVisibility is the resolved caller identity SearchComments needs
@@ -427,12 +445,12 @@ func (s *commentService) DeleteComment(ctx context.Context, id string) error {
 // GetCommentEditHistory implements CommentService. Gated by the same
 // author-or-admin rule as UpdateComment/DeleteComment: only the comment's
 // author or an admin may view its edit history. Prior comment bodies can
-// carry the same sensitive content the current body does, and this is the
-// only place WORK_NOTE/internal comment content isn't otherwise scoped by
-// case/work_item membership at this layer -- an unrestricted read here would
-// let any authenticated caller (including a customer-role one) read the full
-// edit history of any comment on the platform just by knowing or enumerating
-// its UUID.
+// carry the same sensitive content the current body does. Row-level security
+// already limits comments and their edit history to project members and hides
+// WORK_NOTE rows from external callers (migrations 0147, 0175, 0191); this
+// author-or-admin rule is the narrower check on top, so that a member cannot
+// read another author's earlier bodies just by knowing or enumerating a
+// comment UUID.
 func (s *commentService) GetCommentEditHistory(ctx context.Context, id string) (domain.GetCommentEditHistoryResponse, error) {
 	if err := validateUUIDs("id", []string{id}); err != nil {
 		return domain.GetCommentEditHistoryResponse{}, err

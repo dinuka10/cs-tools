@@ -19,8 +19,8 @@ info:
   title: SRE Alert API
   version: 1.0.0
   description: >-
-    Receives alert webhooks from monitoring vendors, normalizes them into the
-    canonical alert and stores them for sre-alert-core-service. One POST route per vendor.
+    Receives alert webhooks from monitoring sources, normalizes them into the
+    canonical alert and stores them for sre-alert-core-service. One POST route per source.
 servers:
   - url: /api/wso2/v1/sre_alert_api
 tags:
@@ -32,20 +32,14 @@ paths:
       operationId: postAwsAlert
       summary: Receive an AWS alert webhook
       description: >-
-        An SNS SubscriptionConfirmation is confirmed and emailed to the team named by ?team=
-        (answers 200, stores nothing); notifications are stored as alerts.
-      parameters:
-        - name: team
-          in: query
-          required: false
-          description: Team to email about SNS subscription confirmations (default "Default").
-          schema:
-            type: string
+        An SNS SubscriptionConfirmation is verified and confirmed, and an UnsubscribeConfirmation is
+        logged; both answer 200 and store nothing. Notifications are stored as alerts; any other SNS
+        message type is rejected with 400.
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '200':
-          description: SNS subscription confirmation handled; nothing stored.
+          description: SNS subscribe or unsubscribe confirmation handled; nothing stored.
         '201':
           $ref: '#/components/responses/Stored'
         '400':
@@ -63,7 +57,7 @@ paths:
       operationId: postAzureAlert
       summary: Receive an Azure Monitor alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -82,7 +76,7 @@ paths:
       operationId: postDatadogAlert
       summary: Receive a Datadog alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -101,7 +95,7 @@ paths:
       operationId: postElasticsearchAlert
       summary: Receive an Elasticsearch alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -120,7 +114,7 @@ paths:
       operationId: postGcpAlert
       summary: Receive a GCP alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -139,7 +133,7 @@ paths:
       operationId: postIcingaAlert
       summary: Receive an Icinga alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -158,7 +152,7 @@ paths:
       operationId: postOpenobserveAlert
       summary: Receive an OpenObserve alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -177,7 +171,7 @@ paths:
       operationId: postOpensearchAlert
       summary: Receive an OpenSearch alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -196,7 +190,7 @@ paths:
       operationId: postPrometheusAlert
       summary: Receive a Prometheus Alertmanager alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -237,7 +231,7 @@ paths:
       operationId: postSite24x7Alert
       summary: Receive a Site24x7 alert webhook
       requestBody:
-        $ref: '#/components/requestBodies/VendorPayload'
+        $ref: '#/components/requestBodies/SourcePayload'
       responses:
         '201':
           $ref: '#/components/responses/Stored'
@@ -252,9 +246,9 @@ paths:
 
 components:
   requestBodies:
-    VendorPayload:
+    SourcePayload:
       required: true
-      description: The vendor's native webhook payload, sent as-is (up to 1 MiB).
+      description: The source's native webhook payload, sent as-is (up to 1 MiB).
       content:
         application/json:
           schema:
@@ -322,15 +316,17 @@ components:
       properties:
         status:
           type: string
-          example: stored
+          example: OK
+        alt_id:
+          type: string
+          description: The stored alert's id. Present when the request stored exactly one alert.
+          example: ALT000000123
         alt_ids:
           type: array
+          description: Every stored alert's id, in request order. Present only for a multi-alert request that stored several alerts.
           items:
             type: string
             example: ALT000000123
-        count:
-          type: integer
-          example: 1
     Error:
       type: object
       properties:

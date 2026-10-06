@@ -73,7 +73,11 @@ type ProjectMembershipRepository interface {
 	// rather than at their next membership event. basis supplies what the
 	// database cannot (the contact's account classification and isCsAdmin);
 	// nil, or a basis that reports !ok, skips the re-derivation.
-	DeactivateBySfID(ctx context.Context, membershipSfID string, basis AdminRoleBasisFunc) (bool, error)
+	//
+	// affected names the user behind the membership (or, when no user row
+	// matches, the membership's own email), so the caller can drop that
+	// user's cached profile after the commit.
+	DeactivateBySfID(ctx context.Context, membershipSfID string, basis AdminRoleBasisFunc) (found bool, affected []domain.AffectedUser, err error)
 }
 
 // AdminRoleBasis is what re-deriving a contact's account-level admin role
@@ -160,25 +164,35 @@ func NewProjectMembershipRepository(db *Scoped) ProjectMembershipRepository {
 	return &projectMembershipRepo{db: db}
 }
 
-func (r *projectMembershipRepo) DeactivateBySfID(ctx context.Context, membershipSfID string, basis AdminRoleBasisFunc) (bool, error) {
+func (r *projectMembershipRepo) DeactivateBySfID(ctx context.Context, membershipSfID string, basis AdminRoleBasisFunc) (bool, []domain.AffectedUser, error) {
 	ctx = WithSystemIdentity(ctx)
-	return InTxReturning(ctx, r.db, func(tx pgx.Tx) (bool, error) {
+	affected, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) ([]domain.AffectedUser, error) {
 		return deactivateBySfIDTx(ctx, tx, membershipSfID, basis)
 	})
+	if err != nil {
+		return false, nil, err
+	}
+	return affected != nil, affected, nil
 }
 
-// deactivateBySfIDTx is DeactivateBySfID's body, run inside tx.
-func deactivateBySfIDTx(ctx context.Context, tx pgx.Tx, membershipSfID string, basis AdminRoleBasisFunc) (bool, error) {
+// deactivateBySfIDTx is DeactivateBySfID's body, run inside tx. A nil result
+// means no membership carried the id; a found one always returns a non-nil
+// (possibly empty) slice.
+func deactivateBySfIDTx(ctx context.Context, tx pgx.Tx, membershipSfID string, basis AdminRoleBasisFunc) ([]domain.AffectedUser, error) {
 	tag, err := tx.Exec(ctx, `
 		UPDATE project_contact
 		SET state = $2::project_contact_state_enum, updated_on = NOW(), updated_by = $3
 		WHERE sf_id = $1`,
 		membershipSfID, domain.MembershipStateDeactivated, domain.SalesforceSyncActor)
 	if err != nil {
-		return false, fmt.Errorf("deactivate project contact by sf_id: %w", err)
+		return nil, fmt.Errorf("deactivate project contact by sf_id: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return false, nil
+		return nil, nil
+	}
+	affected, err := membershipAffectedUsers(ctx, tx, membershipSfID)
+	if err != nil {
+		return nil, err
 	}
 
 	// Salesforce has no LastModifiedDate to offer for a deleted record, so
@@ -189,15 +203,45 @@ func deactivateBySfIDTx(ctx context.Context, tx pgx.Tx, membershipSfID string, b
 		SET event_type = $2, updated_on = NOW(), updated_by = $3
 		WHERE membership_sf_id = $1 AND step = 'DATABASE'::onboarding_step_enum`,
 		membershipSfID, string(domain.SalesforceEventDeleted), domain.SalesforceSyncActor); err != nil {
-		return false, fmt.Errorf("mark DATABASE step deleted: %w", err)
+		return nil, fmt.Errorf("mark DATABASE step deleted: %w", err)
 	}
 
 	if basis != nil {
 		if err := rederiveAdminAfterDeactivate(ctx, tx, membershipSfID, basis); err != nil {
-			return false, err
+			return nil, err
 		}
 	}
-	return true, nil
+	return affected, nil
+}
+
+// membershipAffectedUsers names the users behind the memberships with this
+// Salesforce id, resolved the way rederiveAdminAfterDeactivate resolves its
+// user (project_contact -> account_contact -> "user" by user_name). A
+// membership with no matching user row is named by its own email instead.
+// Always non-nil.
+func membershipAffectedUsers(ctx context.Context, tx querier, membershipSfID string) ([]domain.AffectedUser, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT COALESCE(u.id::text, ''), COALESCE(NULLIF(u.email, ''), pc.email, '')
+		FROM project_contact pc
+		LEFT JOIN account_contact ac ON ac.id = pc.account_contact_id
+		LEFT JOIN "user" u ON LOWER(u.user_name) = LOWER(ac.user_name)
+		WHERE pc.sf_id = $1`, membershipSfID)
+	if err != nil {
+		return nil, fmt.Errorf("deactivate project contact: resolve affected users: %w", err)
+	}
+	defer rows.Close()
+	affected := []domain.AffectedUser{}
+	for rows.Next() {
+		var u domain.AffectedUser
+		if err := rows.Scan(&u.ID, &u.Email); err != nil {
+			return nil, fmt.Errorf("deactivate project contact: resolve affected users: %w", err)
+		}
+		affected = append(affected, u)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("deactivate project contact: resolve affected users: %w", err)
+	}
+	return affected, nil
 }
 
 // rederiveAdminAfterDeactivate re-runs syncDerivedAdminRole for the user

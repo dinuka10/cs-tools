@@ -162,6 +162,26 @@ type scimPhonePayload struct {
 	Mobile string `json:"mobile"`
 }
 
+// scimAddRoleMembersRequest is the request body for PATCH
+// /organizations/internal/roles/{id} (the SCIM operations service's own
+// add-role-members endpoint, not a direct call to the identity provider) --
+// emails only; the SCIM operations service resolves each to its own user ID
+// and performs the actual role-membership update.
+type scimAddRoleMembersRequest struct {
+	Emails []string `json:"emails"`
+}
+
+// scimAddRoleMembersResponse mirrors the SCIM operations service's
+// {addedUsers, failedUsers, addedGroups, failedGroups} response. This client
+// only ever sends emails, never groups, so AddedGroups/FailedGroups are read
+// but unused here.
+type scimAddRoleMembersResponse struct {
+	AddedUsers   []string `json:"addedUsers"`
+	FailedUsers  []string `json:"failedUsers"`
+	AddedGroups  []string `json:"addedGroups"`
+	FailedGroups []string `json:"failedGroups"`
+}
+
 // ---- public types ----
 
 // UserInfo holds the SCIM-derived fields for a user, extracted from the raw SCIM response.

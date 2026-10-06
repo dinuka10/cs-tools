@@ -163,6 +163,71 @@ func (c *Client) EnsureExternalUser(ctx context.Context, email, givenName, famil
 	return user, nil
 }
 
+// searchInternalRequest is the wire shape of POST
+// /organizations/internal/users/search: one user by userName (the staff
+// email), only the phone numbers. Mirrors the CSM Portal backend's
+// SearchUser, which reads the same attribute for the profile page.
+type searchInternalRequest struct {
+	Domain     string   `json:"domain"`
+	Attributes []string `json:"attributes"`
+	Filter     string   `json:"filter"`
+	StartIndex int      `json:"startIndex"`
+}
+
+type searchInternalResponse struct {
+	Resources []struct {
+		PhoneNumbers []struct {
+			Type  string `json:"type"`
+			Value string `json:"value"`
+		} `json:"phoneNumbers"`
+	} `json:"Resources"`
+}
+
+// MobileNumber returns the "mobile" phone number a WSO2 staff member set on
+// their CSM Portal profile -- the portal stores it on the person's Asgardeo
+// user in the "internal" organization, and this reads it back. An empty
+// string with a nil error means the person exists with no mobile number, or
+// does not exist at all; either way there is nothing to dial.
+//
+// Read-only. The number is personal data: it is returned, never logged here.
+func (c *Client) MobileNumber(ctx context.Context, email string) (string, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return "", fmt.Errorf("scim: email is required")
+	}
+	// userName is the staff email; a value carrying a quote could change the
+	// filter's meaning, and no real address does.
+	if strings.ContainsAny(email, "\" ") {
+		return "", fmt.Errorf("scim: email is not a plain address")
+	}
+	reqBody, err := json.Marshal(searchInternalRequest{
+		Domain:     "DEFAULT",
+		Attributes: []string{"phoneNumbers"},
+		Filter:     "userName eq " + email,
+		StartIndex: 1,
+	})
+	if err != nil {
+		return "", fmt.Errorf("scim: encode search request: %w", err)
+	}
+	_, respBody, err := c.do(ctx, http.MethodPost, "/organizations/internal/users/search", reqBody)
+	if err != nil {
+		return "", err
+	}
+	var res searchInternalResponse
+	if err := json.Unmarshal(respBody, &res); err != nil {
+		return "", fmt.Errorf("scim: decode search response: %w", err)
+	}
+	if len(res.Resources) == 0 {
+		return "", nil
+	}
+	for _, p := range res.Resources[0].PhoneNumbers {
+		if p.Type == "mobile" {
+			return strings.TrimSpace(p.Value), nil
+		}
+	}
+	return "", nil
+}
+
 // do executes an authenticated HTTP request against the SCIM operations
 // service and returns the response's status code and raw body. Only 200 and
 // 201 are successes: EnsureExternalUser needs to tell them apart, so unlike

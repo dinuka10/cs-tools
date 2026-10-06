@@ -197,6 +197,65 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 		if p.CallTo != "" && !e164Pattern.MatchString(p.CallTo) {
 			return fmt.Errorf("events: %s callTo %q is not a valid E.164 phone number", t, p.CallTo)
 		}
+	case TypeIncidentAcknowledged:
+		var p IncidentAcknowledgedPayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		// entityID is the incident id — the only thing that ties this signal
+		// to the ladder it cancels, so an empty one is useless rather than
+		// merely incomplete. PreviousState/NewState are both required: the
+		// publisher only emits this on a transition it has already
+		// established, so a missing side means the payload is wrong.
+		if entityID == "" || p.PreviousState == "" || p.NewState == "" {
+			return fmt.Errorf("events: missing required field for %s", t)
+		}
+	case TypeIncidentAssigned:
+		var p IncidentAssignedPayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		// entityID ties the signal to the ladder it stops; AssigneeID is what
+		// makes it an acknowledgement at all.
+		if entityID == "" || p.AssigneeID == "" {
+			return fmt.Errorf("events: missing required field for %s", t)
+		}
+	case TypeIncidentCommentAdded:
+		var p IncidentCommentAddedPayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		// entityID is the incident id, and the only thing that ties this
+		// comment to the ladder it might stop — the engine looks the ladder
+		// up by it. An event without one cannot cancel anything, and being
+		// accepted would see it quietly marked handled. CommentID is required
+		// for the execution summary, which records which comment stopped the
+		// ladder.
+		if entityID == "" || p.CommentID == "" {
+			return fmt.Errorf("events: missing required field for %s", t)
+		}
+		// IsPublic is deliberately not validated: false is a legitimate value
+		// (a work note), not an absent one.
+		return nil
+
+	case TypeIncidentPriorityElevated:
+		var p IncidentPriorityElevatedPayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		// Same reasoning as incident.created for entityID; both priorities are
+		// required because the elevation itself is the event.
+		//
+		// Title is deliberately NOT required, unlike incident.created's. It is
+		// display-only (the escalation voice message is built from priority,
+		// account, case id and team), it originates in a nilable ServiceNow
+		// field, and a failure here is not free: an invalid payload is
+		// retried, dead-lettered, retried again and dropped. Rejecting a
+		// genuine escalation trigger because the subject was empty is the
+		// wrong trade.
+		if entityID == "" || p.OldPriority == "" || p.NewPriority == "" {
+			return fmt.Errorf("events: missing required field for %s", t)
+		}
 	case TypeSLATierReached:
 		var p SLATierReachedPayload
 		if err := decodeStrict(raw, &p); err != nil {
@@ -230,6 +289,23 @@ func Validate(entityID string, t Type, raw json.RawMessage) error {
 		case p.Kind == "rejected" && p.Audience == "customer":
 		default:
 			return fmt.Errorf("events: %s has kind %q that does not go with audience %q", t, p.Kind, p.Audience)
+		}
+		if !validRecipients(p.Recipients) {
+			return fmt.Errorf("events: invalid recipients for %s", t)
+		}
+	case TypeOutageNotificationDue, TypeOutageCommunicationDue:
+		var p OutageNoticePayload
+		if err := decodeStrict(raw, &p); err != nil {
+			return err
+		}
+		if p.OutageID == "" || p.Number == "" || p.Subject == "" || p.Body == "" {
+			return fmt.Errorf("events: missing required field for %s", t)
+		}
+		if p.OutageID != entityID {
+			return fmt.Errorf("events: payload outageId %q does not match entityId %q", p.OutageID, entityID)
+		}
+		if !validOutageKind[t][p.Kind] {
+			return fmt.Errorf("events: %s has unknown kind %q", t, p.Kind)
 		}
 		if !validRecipients(p.Recipients) {
 			return fmt.Errorf("events: invalid recipients for %s", t)
@@ -317,4 +393,12 @@ func decodeStrict(raw json.RawMessage, v any) error {
 		return fmt.Errorf("events: unexpected trailing data after payload")
 	}
 	return nil
+}
+
+// validOutageKind is which kinds each outage email can carry: the internal
+// notification has an Update arm between declaration and resolution, the
+// outage communication does not.
+var validOutageKind = map[Type]map[string]bool{
+	TypeOutageNotificationDue:  {"DECLARED": true, "UPDATE": true, "RESOLVED": true},
+	TypeOutageCommunicationDue: {"DECLARED": true, "RESOLVED": true},
 }

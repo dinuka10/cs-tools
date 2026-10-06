@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
@@ -35,6 +36,12 @@ import (
 // — see that function's doc comment for why this runs synchronously rather
 // than detached.
 const publishIncidentCreatedTimeout = 5 * time.Second
+
+// publishIncidentEscalationSignalTimeout bounds the publish calls that start
+// and stop the incident call-escalation ladder. Same reasoning and value as
+// publishIncidentCreatedTimeout: the incident is already updated in
+// ServiceNow by the time either runs, so neither may fail the update.
+const publishIncidentEscalationSignalTimeout = 5 * time.Second
 
 // snIncidentsResponse mirrors the Choreo POST /incidents/search response.
 type snIncidentsResponse struct {
@@ -227,13 +234,28 @@ type snIncidentService struct {
 	// publisher is nil when Event Hub is not configured — every call site
 	// must check before using it. See publishIncidentCreated.
 	publisher EventPublisherService
+	// groupFromService is true for DATA_SOURCE=servicenow, where this is the
+	// whole incident service and so the only place left to set an incident's
+	// assignment group from its service. As the dual-write mirror it is
+	// false: incidentService has already read the group from Postgres, and
+	// reading it again from ServiceNow could give the two sides different
+	// groups.
+	groupFromService bool
 }
 
 // NewServiceNowIncidentService constructs an IncidentService backed by the
 // Choreo API. publisher may be nil (see snIncidentService.publisher's doc
 // comment).
 func NewServiceNowIncidentService(client *integrationservice.Client, publisher EventPublisherService) IncidentService {
-	return &snIncidentService{client: client, publisher: publisher}
+	return &snIncidentService{client: client, publisher: publisher, groupFromService: true}
+}
+
+// NewServiceNowIncidentMirrorService is the ServiceNow side of
+// DATA_SOURCE=postgres-servicenow-dual-write. It sends the assignment group
+// incidentService chose and never chooses one itself, and it publishes
+// nothing (see routes.go for why the mirror's publisher is nil).
+func NewServiceNowIncidentMirrorService(client *integrationservice.Client) IncidentService {
+	return &snIncidentService{client: client}
 }
 
 func (s *snIncidentService) SearchIncidents(ctx context.Context, req domain.SearchIncidentsRequest) (domain.SearchIncidentsResponse, error) {
@@ -699,49 +721,53 @@ type snCreateIncidentResponse struct {
 	} `json:"incident"`
 }
 
-func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+// validateCreateIncidentRequest is the request validation both incident
+// create paths share: the ServiceNow one (before its POST) and the plain
+// Postgres one (before its insert), so the same input is rejected the same
+// way whichever data source is behind the endpoint.
+func validateCreateIncidentRequest(req domain.CreateIncidentRequest) error {
 	// Reject before the ServiceNow call, not after: createIncidentSNFirst
 	// creates the ServiceNow incident first and has no compensating delete,
 	// so a value too long for either ServiceNow's u_enviroment (max 40) or
 	// this service's own environment column (VARCHAR(40)) must fail fast
 	// here rather than leave an orphaned ServiceNow incident behind.
 	if req.Environment != nil && len([]rune(*req.Environment)) > 40 {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{
+		return &apierror.ValidationError{
 			Msg: "environment must not exceed 40 characters",
 		}
 	}
 	if req.Subject == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "subject is required"}
+		return &apierror.ValidationError{Msg: "subject is required"}
 	}
 	if req.CallerID == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "callerId is required"}
+		return &apierror.ValidationError{Msg: "callerId is required"}
 	}
 	if req.Category == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "category is required"}
+		return &apierror.ValidationError{Msg: "category is required"}
 	}
 	if req.ServiceID == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "serviceId is required"}
+		return &apierror.ValidationError{Msg: "serviceId is required"}
 	}
 	if req.Impact == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "impact is required"}
+		return &apierror.ValidationError{Msg: "impact is required"}
 	}
 	if req.Urgency == "" {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "urgency is required"}
+		return &apierror.ValidationError{Msg: "urgency is required"}
 	}
 	if !validIncidentCategory[req.Category] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid category: " + string(req.Category)}
+		return &apierror.ValidationError{Msg: "invalid category: " + string(req.Category)}
 	}
 	if req.Subcategory != nil && !validIncidentSubcategory[*req.Subcategory] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid subcategory: " + string(*req.Subcategory)}
+		return &apierror.ValidationError{Msg: "invalid subcategory: " + string(*req.Subcategory)}
 	}
 	if req.ContactType != nil && !validIncidentContactType[*req.ContactType] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid contactType: " + string(*req.ContactType)}
+		return &apierror.ValidationError{Msg: "invalid contactType: " + string(*req.ContactType)}
 	}
 	if !validIncidentImpact[req.Impact] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid impact: " + string(req.Impact)}
+		return &apierror.ValidationError{Msg: "invalid impact: " + string(req.Impact)}
 	}
 	if !validIncidentUrgency[req.Urgency] {
-		return domain.CreateIncidentResponse{}, &apierror.ValidationError{Msg: "invalid urgency: " + string(req.Urgency)}
+		return &apierror.ValidationError{Msg: "invalid urgency: " + string(req.Urgency)}
 	}
 
 	uuidFields := map[string]string{
@@ -750,7 +776,7 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	}
 	for field, val := range uuidFields {
 		if err := validateUUIDs(field, []string{val}); err != nil {
-			return domain.CreateIncidentResponse{}, err
+			return err
 		}
 	}
 	optionalUUIDs := map[string]*string{
@@ -767,9 +793,16 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	for field, val := range optionalUUIDs {
 		if val != nil {
 			if err := validateUUIDs(field, []string{*val}); err != nil {
-				return domain.CreateIncidentResponse{}, err
+				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.CreateIncidentRequest) (domain.CreateIncidentResponse, error) {
+	if err := validateCreateIncidentRequest(req); err != nil {
+		return domain.CreateIncidentResponse{}, err
 	}
 	token := middleware.UserIDTokenFromContext(ctx)
 
@@ -779,6 +812,14 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	watchList, err := watchListEmails(ctx, s.client, token, "watchList", req.WatchList)
 	if err != nil {
 		return domain.CreateIncidentResponse{}, err
+	}
+
+	if s.groupFromService {
+		group, err := s.supportGroupOfService(ctx, token, req.ServiceID)
+		if err != nil {
+			return domain.CreateIncidentResponse{}, err
+		}
+		req.AssignmentGroupID = group
 	}
 
 	payload := snCreateIncidentPayload{
@@ -854,15 +895,26 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 	resp.Incident.Number = snResp.Incident.Number
 	resp.Incident.CreatedOn = snResp.Incident.CreatedOn
 	resp.Incident.CreatedBy = snResp.Incident.CreatedBy
-	s.publishIncidentCreated(ctx, req, resp.Incident.ID)
+	s.publishIncidentCreated(ctx, req, resp.Incident.ID, resp.Incident.Number, resp.Incident.CreatedOn)
 	return resp, nil
 }
 
 // publishIncidentCreated best-effort publishes an incident.created event for
-// a newly created incident. Unlike publishCaseCreated, no enrichment round
-// trip is needed: Title/ShortDescription come directly from req, which
-// already carries everything the notification needs (Subject, and
-// optionally AdditionalComments) without a follow-up GetIncidentByID call.
+// a newly created incident. Title/ShortDescription come directly from req,
+// and Number/ReportedAt from the create response, so neither needs a read.
+//
+// The escalation fields do need one. The call-escalation ladder is keyed on
+// the incident's PRIORITY, which ServiceNow derives from impact and urgency
+// and which neither req nor the create response carries — and on the assigned
+// team's display name, where req has only a sys_id. So this makes one
+// best-effort GetIncidentByID call to resolve them.
+//
+// That read is deliberately not fatal and not even required: if it fails, the
+// event is published with exactly the fields it carried before the ladder
+// existed, and the consumer's ladder simply does not start (see
+// events.IncidentCreatedPayload). Losing the Chat alert and the direct call —
+// which is what returning early would do — would be a strictly worse outcome
+// than losing the ladder.
 //
 // ShortDescription falls back to req.Subject when req.AdditionalComments is
 // absent — a freshly created incident often has no additional comments yet,
@@ -883,8 +935,26 @@ func (s *snIncidentService) CreateIncident(ctx context.Context, req domain.Creat
 // publishCaseCreated's doc comment for why (same reasoning applies here).
 // Any failure is logged and does not fail CreateIncident itself: the
 // incident already exists in ServiceNow by this point.
-func (s *snIncidentService) publishIncidentCreated(ctx context.Context, req domain.CreateIncidentRequest, incidentID string) {
-	publishIncidentCreatedEvent(ctx, s.publisher, req, incidentID)
+func (s *snIncidentService) publishIncidentCreated(ctx context.Context, req domain.CreateIncidentRequest, incidentID, number, createdOn string) {
+	publishIncidentCreatedEvent(ctx, s.publisher, req, incidentID, number, createdOn, s.GetIncidentByID)
+}
+
+// incidentViewFetcher reads the incident back for the escalation fields
+// neither the create request nor its response carries: ServiceNow derives
+// priority from impact and urgency, and the assigned team arrives as a sys_id.
+// Both data sources have one to give. nil is allowed and is not an error --
+// the event then goes out with exactly the fields it carried before the
+// ladder existed, the same outcome the fetch's own failure path produces.
+type incidentViewFetcher func(ctx context.Context, id string) (domain.IncidentView, error)
+
+// fetchIncidentView applies fetch when there is one. A nil fetcher is reported
+// as an error so the caller's existing "publish without escalation fields"
+// branch handles both cases identically.
+func fetchIncidentView(ctx context.Context, fetch incidentViewFetcher, id string) (domain.IncidentView, error) {
+	if fetch == nil {
+		return domain.IncidentView{}, fmt.Errorf("no incident view fetcher configured")
+	}
+	return fetch(ctx, id)
 }
 
 // publishIncidentCreatedEvent is publishIncidentCreated's actual body,
@@ -899,7 +969,7 @@ func (s *snIncidentService) publishIncidentCreated(ctx context.Context, req doma
 // #1922. publisher may be nil (e.g. the dual-write mirror instance is
 // constructed with publisher=nil specifically so its own CreateIncident
 // never double-publishes -- see routes.go's incident DataSource wiring).
-func publishIncidentCreatedEvent(ctx context.Context, publisher EventPublisherService, req domain.CreateIncidentRequest, incidentID string) {
+func publishIncidentCreatedEvent(ctx context.Context, publisher EventPublisherService, req domain.CreateIncidentRequest, incidentID, number, createdOn string, fetch incidentViewFetcher) {
 	if publisher == nil {
 		return
 	}
@@ -911,10 +981,41 @@ func publishIncidentCreatedEvent(ctx context.Context, publisher EventPublisherSe
 		shortDescription = *req.AdditionalComments
 	}
 
-	payload, err := json.Marshal(events.IncidentCreatedPayload{
+	event := events.IncidentCreatedPayload{
 		Title:            req.Subject,
 		ShortDescription: shortDescription,
-	})
+		Number:           number,
+		ReportedAt:       snTimeToRFC3339(ctx, "sn create incident", "createdOn", createdOn),
+	}
+	// How it was raised, from the request until the view below says otherwise:
+	// it decides whether a monitoring-raised incident climbs the SRE ladder.
+	if req.ContactType != nil {
+		event.ContactType = string(*req.ContactType)
+	}
+	if view, verr := fetchIncidentView(ctx, fetch, incidentID); verr == nil {
+		if view.ContactType != nil && *view.ContactType != "" {
+			event.ContactType = *view.ContactType
+		}
+		if view.Priority != nil {
+			event.Priority = *view.Priority
+		}
+		if view.AssignmentGroup != nil {
+			event.Team = view.AssignmentGroup.Name
+		}
+		// openedOn is the incident's own "when the customer reported this",
+		// which is what the ladder should measure from; createdOn above is
+		// only the fallback for when the read fails.
+		if view.OpenedOn != nil {
+			if opened := snTimeToRFC3339(ctx, "sn create incident", "openedOn", *view.OpenedOn); opened != "" {
+				event.ReportedAt = opened
+			}
+		}
+	} else {
+		slog.WarnContext(ctx, "sn create incident: escalation enrichment fetch failed; publishing without escalation fields",
+			"incidentId", incidentID)
+	}
+
+	payload, err := json.Marshal(event)
 	if err != nil {
 		slog.ErrorContext(ctx, "sn create incident: encode incident.created payload failed", "incidentId", incidentID, "error", err)
 		return
@@ -929,6 +1030,22 @@ func publishIncidentCreatedEvent(ctx context.Context, publisher EventPublisherSe
 		// needs to debug this specific failure.
 		slog.ErrorContext(ctx, "sn create incident: publish incident.created failed", "incidentId", incidentID)
 	}
+}
+
+// snTimeToRFC3339 converts a ServiceNow datetime string to RFC3339, returning
+// "" when it is absent or unparsable. Uses parseSNDateTime so it tolerates
+// both formats ServiceNow is known to return (see that function's own doc
+// comment); an empty result makes the consumer fall back to consume time
+// rather than to a zero timestamp, which would place the whole ladder in 1970.
+func snTimeToRFC3339(ctx context.Context, callSite, field, value string) string {
+	if value == "" {
+		return ""
+	}
+	t, err := parseSNDateTime(ctx, callSite, field, value)
+	if err != nil {
+		return ""
+	}
+	return t.Format(time.RFC3339)
 }
 
 // snIncidentSubcategoryLabelMap maps SN subcategory string values to domain enum strings.
@@ -1463,6 +1580,28 @@ func (s *snIncidentService) UpdateIncident(ctx context.Context, req domain.Updat
 		payload.ResolvedByID = &v
 	}
 
+	// Baseline for the escalation signals below. Fetched only when this update
+	// could actually start or stop a call escalation, so every other PATCH
+	// pays no extra round trip. A failed fetch is not fatal: it leaves
+	// `before` zero-valued, which publishEscalationSignals treats as "no
+	// baseline, publish nothing" rather than guessing.
+	//
+	// Impact and urgency count as priority changes here, because in
+	// ServiceNow they ARE the priority: CreateIncident requires both and
+	// accepts no priority at all — the platform derives it. A PATCH raising
+	// urgency therefore raises the priority just as surely as one naming it,
+	// and gating on req.Priority alone meant that update published nothing
+	// and no ladder ever started.
+	var before domain.IncidentView
+	if s.publisher != nil && incidentUpdateTouchesEscalation(req) {
+		if fetched, ferr := s.GetIncidentByID(ctx, req.ID); ferr == nil {
+			before = fetched
+		} else {
+			slog.WarnContext(ctx, "sn update incident: escalation baseline fetch failed; skipping escalation signals",
+				"incidentId", req.ID)
+		}
+	}
+
 	raw, err := s.client.Patch(ctx, "/incidents/"+uuidToSysid(req.ID), token, payload)
 	if err != nil {
 		return domain.UpdateIncidentResponse{}, err
@@ -1473,10 +1612,239 @@ func (s *snIncidentService) UpdateIncident(ctx context.Context, req domain.Updat
 		return domain.UpdateIncidentResponse{}, fmt.Errorf("sn update incident: parse response: %w", err)
 	}
 
+	view := mapSNIncidentToView(snResp.Incident)
+	s.publishEscalationSignals(ctx, req, before, view)
+
 	return domain.UpdateIncidentResponse{
 		Message:  snResp.Message,
-		Incident: mapSNIncidentToView(snResp.Incident),
+		Incident: view,
 	}, nil
+}
+
+// publishEscalationSignals emits the two events that drive the incident call
+// escalation ladder, comparing the incident as it was before the PATCH
+// against the PATCH response.
+//
+// Both are best-effort and never fail UpdateIncident: the incident is already
+// updated in ServiceNow by the time this runs, exactly as publishIncidentCreated
+// reasons about creation. Both are guarded against a no-op re-PATCH the same
+// way publishSeverityChanged is — a caller re-sending the state it already has
+// must not cancel a live escalation, and re-sending the same priority must not
+// start a second one.
+//
+// before is zero-valued when the pre-PATCH fetch was skipped or failed; with
+// no baseline to compare against, nothing is published rather than guessing at
+// a transition that may not have happened.
+func (s *snIncidentService) publishEscalationSignals(
+	ctx context.Context, req domain.UpdateIncidentRequest, before, after domain.IncidentView,
+) {
+	if s.publisher == nil || before.ID == nil {
+		return
+	}
+
+	if req.State != nil {
+		if prev, next, ok := incidentStateTransition(before, after); ok {
+			s.publishIncidentAcknowledged(ctx, req.ID, prev, next)
+		}
+	}
+	if incidentUpdateTouchesPriority(req) {
+		if oldP, newP, ok := incidentPriorityElevation(before, after); ok {
+			s.publishIncidentPriorityElevated(ctx, req.ID, oldP, newP, after)
+		}
+	}
+	if req.AssignedEngineerID != nil {
+		if assignee, ok := incidentAssignment(before, after); ok {
+			s.publishIncidentAssigned(ctx, req.ID, assignee)
+		}
+	}
+}
+
+// incidentAssignment reports a genuine change of assignee to someone. Clearing
+// the assignee, or re-sending the one already set, acknowledges nothing.
+func incidentAssignment(before, after domain.IncidentView) (domain.EntityRef, bool) {
+	if after.AssignedTo == nil || after.AssignedTo.ID == "" {
+		return domain.EntityRef{}, false
+	}
+	if before.AssignedTo != nil && before.AssignedTo.ID == after.AssignedTo.ID {
+		return domain.EntityRef{}, false
+	}
+	return *after.AssignedTo, true
+}
+
+// publishIncidentAssigned emits the SRE escalation ladder's stop signal: an
+// engineer has taken the incident.
+func (s *snIncidentService) publishIncidentAssigned(ctx context.Context, incidentID string, assignee domain.EntityRef) {
+	publishIncidentAssignedEvent(ctx, s.publisher, incidentID, assignee)
+}
+
+// publishIncidentAssignedEvent is publishIncidentAssigned for any data source, so the Postgres
+// incident update sends the same event. A nil publisher publishes nothing.
+func publishIncidentAssignedEvent(ctx context.Context, publisher EventPublisherService, incidentID string, assignee domain.EntityRef) {
+	if publisher == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, publishIncidentEscalationSignalTimeout)
+	defer cancel()
+
+	payload, err := json.Marshal(events.IncidentAssignedPayload{AssigneeID: assignee.ID, AssigneeName: assignee.Name})
+	if err != nil {
+		slog.ErrorContext(ctx, "update incident: encode incident.assigned payload failed", "incidentId", incidentID, "error", err)
+		return
+	}
+	if err := publisher.Publish(ctx, events.TypeIncidentAssigned, incidentID, payload); err != nil {
+		// Not logging err itself, same reasoning as publishIncidentCreated.
+		slog.ErrorContext(ctx, "update incident: publish incident.assigned failed", "incidentId", incidentID)
+	}
+}
+
+// incidentUpdateTouchesPriority reports whether an update could change the
+// incident's priority — directly, or through the impact and urgency
+// ServiceNow derives it from.
+//
+// The comparison itself is still made against the real before/after
+// priorities (see incidentPriorityElevation), so a change to impact or
+// urgency that leaves the derived priority alone publishes nothing. This only
+// decides whether it is worth looking.
+func incidentUpdateTouchesPriority(req domain.UpdateIncidentRequest) bool {
+	return req.Priority != nil || req.Impact != nil || req.Urgency != nil
+}
+
+// incidentUpdateTouchesEscalation reports whether an update could start or
+// stop a call escalation, and so whether the pre-PATCH baseline is worth
+// fetching.
+func incidentUpdateTouchesEscalation(req domain.UpdateIncidentRequest) bool {
+	return req.State != nil || incidentUpdateTouchesPriority(req) || req.AssignedEngineerID != nil
+}
+
+// incidentStateTransition reports a genuine move out of NEW. Leaving NEW is
+// what the escalation specification means by acknowledgement ("update the
+// ticket status to Work In Progress to stop further notifications"); every
+// other transition, including NEW -> NEW, leaves a running ladder alone.
+func incidentStateTransition(before, after domain.IncidentView) (prev, next string, ok bool) {
+	if before.State == nil || after.State == nil {
+		return "", "", false
+	}
+	prev, next = *before.State, *after.State
+	if prev == next || prev != string(domain.IncidentStateNew) {
+		return "", "", false
+	}
+	return prev, next, true
+}
+
+// incidentPriorityElevation reports a genuine increase in urgency. A downgrade
+// or an unchanged priority starts nothing: the ladder exists to react to an
+// incident becoming more urgent, not less.
+//
+// Urgency ordering comes from snIncidentPriorityKeyMap, the map this service
+// already uses to talk to ServiceNow (CRITICAL=1 … PLANNING=5), rather than a
+// second hand-maintained table that could drift from it. An elevation is
+// therefore a strictly decreasing key. A value outside that map is not treated
+// as an elevation at all: an unrecognised priority is not evidence of anything.
+func incidentPriorityElevation(before, after domain.IncidentView) (oldP, newP string, ok bool) {
+	if before.Priority == nil || after.Priority == nil {
+		return "", "", false
+	}
+	oldP, newP = *before.Priority, *after.Priority
+	if oldP == newP {
+		return "", "", false
+	}
+	oldKey, oldOK := snIncidentPriorityKeyMap[domain.IncidentPriority(oldP)]
+	newKey, newOK := snIncidentPriorityKeyMap[domain.IncidentPriority(newP)]
+	if !oldOK || !newOK || newKey >= oldKey {
+		return "", "", false
+	}
+	return oldP, newP, true
+}
+
+// publishIncidentAcknowledged emits the signal that cancels a running call
+// escalation for this incident.
+func (s *snIncidentService) publishIncidentAcknowledged(ctx context.Context, incidentID, prev, next string) {
+	publishIncidentAcknowledgedEvent(ctx, s.publisher, incidentID, prev, next)
+}
+
+// publishIncidentAcknowledgedEvent is publishIncidentAcknowledged for any data source. A nil
+// publisher publishes nothing.
+func publishIncidentAcknowledgedEvent(ctx context.Context, publisher EventPublisherService, incidentID, prev, next string) {
+	if publisher == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, publishIncidentEscalationSignalTimeout)
+	defer cancel()
+
+	payload, err := json.Marshal(events.IncidentAcknowledgedPayload{
+		PreviousState: prev,
+		NewState:      next,
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "update incident: encode incident.acknowledged payload failed", "incidentId", incidentID, "error", err)
+		return
+	}
+	if err := publisher.Publish(ctx, events.TypeIncidentAcknowledged, incidentID, payload); err != nil {
+		// Not logging err itself, same reasoning as publishIncidentCreated:
+		// it can carry raw Event Hub client detail.
+		slog.ErrorContext(ctx, "update incident: publish incident.acknowledged failed", "incidentId", incidentID)
+	}
+}
+
+// publishIncidentStopSignals sends the two events that stop a running call escalation,
+// incident.acknowledged (it left NEW) and incident.assigned (an engineer took it), from the
+// incident before and after an update -- the Postgres counterpart of publishEscalationSignals'
+// stop half. Without them an incident created in Postgres (an alert-born SRE incident) pages
+// every rung even after somebody has it. before without an ID means no baseline: nothing is sent.
+func publishIncidentStopSignals(ctx context.Context, publisher EventPublisherService, req domain.UpdateIncidentRequest, before, after domain.IncidentView) {
+	if publisher == nil || before.ID == nil {
+		return
+	}
+	if req.State != nil {
+		if prev, next, ok := incidentStateTransition(before, after); ok {
+			publishIncidentAcknowledgedEvent(ctx, publisher, req.ID, prev, next)
+		}
+	}
+	if req.AssignedEngineerID != nil {
+		if assignee, ok := incidentAssignment(before, after); ok {
+			publishIncidentAssignedEvent(ctx, publisher, req.ID, assignee)
+		}
+	}
+}
+
+// publishIncidentPriorityElevated emits the second trigger that starts a call
+// escalation, keyed by the NEW priority — the escalation timings are defined
+// per priority, so the consumer schedules against what the incident is now.
+func (s *snIncidentService) publishIncidentPriorityElevated(
+	ctx context.Context, incidentID, oldP, newP string, after domain.IncidentView,
+) {
+	ctx, cancel := context.WithTimeout(ctx, publishIncidentEscalationSignalTimeout)
+	defer cancel()
+
+	title := ""
+	if after.Subject != nil {
+		title = *after.Subject
+	}
+	event := events.IncidentPriorityElevatedPayload{
+		OldPriority: oldP,
+		NewPriority: newP,
+		Title:       title,
+		// ElevatedAt is "now" rather than a field off the incident: the PATCH
+		// that caused this elevation has just been applied, and this is the
+		// instant the ladder's own offsets should run from. updatedOn would
+		// be the same moment but rendered in ServiceNow's own format, and
+		// depends on the response carrying it.
+		ElevatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	if after.Number != nil {
+		event.Number = *after.Number
+	}
+	if after.AssignmentGroup != nil {
+		event.Team = after.AssignmentGroup.Name
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		slog.ErrorContext(ctx, "sn update incident: encode incident.priority_elevated payload failed", "incidentId", incidentID, "error", err)
+		return
+	}
+	if err := s.publisher.Publish(ctx, events.TypeIncidentPriorityElevated, incidentID, payload); err != nil {
+		slog.ErrorContext(ctx, "sn update incident: publish incident.priority_elevated failed", "incidentId", incidentID)
+	}
 }
 
 // SearchIncidentActivities returns the activity feed for an incident. Confirmed by the
@@ -1629,4 +1997,55 @@ func (s *snIncidentService) HandOffIncidentToSpecialist(ctx context.Context, req
 	}
 
 	return domain.HandOffIncidentToSpecialistResponse{Message: snResp.Message, Handoff: result}, nil
+}
+
+// snServiceScanMaxPages bounds supportGroupOfService's scan at 40 pages of
+// maxLimit (2,000 services).
+const snServiceScanMaxPages = 40
+
+// supportGroupOfService is incidentService.withAssignmentGroupFromService for
+// DATA_SOURCE=servicenow: the service's support group, or nil when it has
+// none.
+//
+// *** IT SCANS, BECAUSE IT HAS TO. *** ServiceNow's POST /services/search
+// filters on `name CONTAINS searchQuery` only -- there is no lookup by sys_id
+// -- so the service is found by paging through cmdb_ci_service and matching
+// the id. It runs once per incident create and stops at the first match.
+//
+// *** ONLY A COMPLETE SCAN MAY CONCLUDE "NO GROUP". *** A short page means
+// ServiceNow has no more services, so a service not seen by then is not
+// listed and the incident is created unassigned, with a warning. Running out
+// of pages proves nothing -- the service may simply be further on -- so that
+// is an error: creating the incident unassigned there would misroute one
+// whose service does have a group.
+func (s *snIncidentService) supportGroupOfService(ctx context.Context, token, serviceID string) (*string, error) {
+	want := uuidToSysid(strings.TrimSpace(serviceID))
+	for page := 0; page < snServiceScanMaxPages; page++ {
+		payload := snITServiceSearchPayload{Pagination: snProjectPagination{Limit: maxLimit, Offset: page * maxLimit}}
+		raw, err := s.client.Post(ctx, "/services/search", token, payload)
+		if err != nil {
+			return nil, fmt.Errorf("looking up the support group of service %s: %w", serviceID, err)
+		}
+		var resp snITServicesResponse
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return nil, fmt.Errorf("sn services: parse response: %w", err)
+		}
+		for _, svc := range resp.Services {
+			if !strings.EqualFold(svc.ID, want) {
+				continue
+			}
+			if svc.SupportGroup == nil || svc.SupportGroup.ID == "" {
+				return nil, nil
+			}
+			group := sysidToUUID(svc.SupportGroup.ID)
+			return &group, nil
+		}
+		if len(resp.Services) < maxLimit {
+			slog.WarnContext(ctx, "incident create: service not in ServiceNow's service list; creating it with no assignment group",
+				"serviceId", serviceID)
+			return nil, nil
+		}
+	}
+	return nil, fmt.Errorf("looking up the support group of service %s: not found in the first %d ServiceNow services; raise snServiceScanMaxPages",
+		serviceID, snServiceScanMaxPages*maxLimit)
 }

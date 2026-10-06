@@ -381,9 +381,9 @@ describe("CsmAnnouncementsPage — Pending tab", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Requests" }));
 
     expect(screen.getByText("Upcoming maintenance")).toBeInTheDocument();
-    // state is the 1st arg of useSearchAnnouncementRequests(state, page, pageSize).
+    // states is the 1st arg of useSearchAnnouncementRequests(states, page, pageSize).
     const lastCall = mockedUseSearchRequests.mock.calls.at(-1)!;
-    expect(lastCall[0]).toBe("pending_approval");
+    expect(lastCall[0]).toEqual(["pending_approval"]);
   });
 
   it("shows a Security chip next to the subject for a security pending request, not for a non-security one", () => {
@@ -471,14 +471,132 @@ describe("CsmAnnouncementsPage — Pending tab", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "Requests" }));
     fireEvent.mouseDown(screen.getByRole("combobox", { name: /state/i }));
-    fireEvent.click(within(screen.getByRole("listbox")).getByRole("option", { name: "Published" }));
+    const listbox = screen.getByRole("listbox");
+    // Multi-select: Published is added to the default Pending approval, so
+    // narrowing to Published alone means unticking Pending approval too.
+    fireEvent.click(within(listbox).getByRole("option", { name: "Pending approval" }));
+    fireEvent.click(within(listbox).getByRole("option", { name: "Published" }));
 
     const lastCall = mockedUseSearchRequests.mock.calls.at(-1)!;
-    expect(lastCall[0]).toBe("published");
+    expect(lastCall[0]).toEqual(["published"]);
     expect(screen.getByText("Already sent maintenance notice")).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("Already sent maintenance notice"));
     expect(screen.getByText(`request dialog: ${publishedRequest.id}`)).toBeInTheDocument();
+  });
+
+  describe("multi-select state filter", () => {
+    const openStateFilter = (): HTMLElement => {
+      fireEvent.click(screen.getByRole("tab", { name: "Requests" }));
+      fireEvent.mouseDown(screen.getByRole("combobox", { name: /state/i }));
+      return screen.getByRole("listbox");
+    };
+
+    beforeEach(() => {
+      mockResult({ data: { rows: [], total: 0, limit: 20, offset: 0, hasMore: false } });
+    });
+
+    it("lets a second state be added to the selection instead of swapping it", () => {
+      render(<CsmAnnouncementsPage />);
+      const listbox = openStateFilter();
+
+      fireEvent.click(within(listbox).getByRole("option", { name: "Approved" }));
+      expect(mockedUseSearchRequests.mock.calls.at(-1)![0]).toEqual(["pending_approval", "approved"]);
+
+      fireEvent.click(within(listbox).getByRole("option", { name: "Draft" }));
+      expect(mockedUseSearchRequests.mock.calls.at(-1)![0]).toEqual([
+        "pending_approval",
+        "approved",
+        "draft",
+      ]);
+    });
+
+    it("can untick a state while others stay selected", () => {
+      render(<CsmAnnouncementsPage />);
+      const listbox = openStateFilter();
+
+      fireEvent.click(within(listbox).getByRole("option", { name: "Approved" }));
+      fireEvent.click(within(listbox).getByRole("option", { name: "Pending approval" }));
+
+      expect(mockedUseSearchRequests.mock.calls.at(-1)![0]).toEqual(["approved"]);
+    });
+
+    it("treats an empty selection as every state, like the Announcements tab filter", () => {
+      render(<CsmAnnouncementsPage />);
+      const listbox = openStateFilter();
+
+      fireEvent.click(within(listbox).getByRole("option", { name: "Pending approval" }));
+
+      expect(mockedUseSearchRequests.mock.calls.at(-1)![0]).toEqual([]);
+      expect(screen.getByText("No requests.")).toBeInTheDocument();
+    });
+
+    it("words the empty state for a multi-state selection", () => {
+      render(<CsmAnnouncementsPage />);
+      const listbox = openStateFilter();
+
+      fireEvent.click(within(listbox).getByRole("option", { name: "Draft" }));
+
+      expect(screen.getByText("No requests in the selected states.")).toBeInTheDocument();
+    });
+
+    it("returns to the first page whenever the selection changes", () => {
+      mockedUseSearchRequests.mockReturnValue({
+        data: { requests: [PENDING_REQUEST], total: 25, limit: 10, offset: 0, hasMore: true },
+        isLoading: false,
+        isFetching: false,
+        isError: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSearchAnnouncementRequests>);
+      render(<CsmAnnouncementsPage />);
+      fireEvent.click(screen.getByRole("tab", { name: "Requests" }));
+
+      fireEvent.click(screen.getByRole("button", { name: /go to next page/i }));
+      // useSearchAnnouncementRequests(states, page, pageSize) -- page is the 2nd arg.
+      expect(mockedUseSearchRequests.mock.calls.at(-1)![1]).toBe(1);
+
+      fireEvent.mouseDown(screen.getByRole("combobox", { name: /state/i }));
+      fireEvent.click(
+        within(screen.getByRole("listbox")).getByRole("option", { name: "Approved" }),
+      );
+
+      expect(mockedUseSearchRequests.mock.calls.at(-1)![1]).toBe(0);
+    });
+
+    it("shows each row's own state, since a merged list mixes states", () => {
+      mockedUseSearchRequests.mockReturnValue({
+        data: {
+          requests: [
+            PENDING_REQUEST,
+            { ...PENDING_REQUEST, id: "req-d", state: "draft", subject: "A draft notice" },
+            { ...PENDING_REQUEST, id: "req-a", state: "approved", subject: "An approved notice" },
+            { ...PENDING_REQUEST, id: "req-p", state: "published", subject: "A published notice" },
+          ],
+          total: 4,
+          limit: 10,
+          offset: 0,
+          hasMore: false,
+        },
+        isLoading: false,
+        isFetching: false,
+        isError: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSearchAnnouncementRequests>);
+      render(<CsmAnnouncementsPage />);
+      fireEvent.click(screen.getByRole("tab", { name: "Requests" }));
+
+      const table = within(screen.getByRole("table"));
+      expect(table.getByRole("columnheader", { name: "State" })).toBeInTheDocument();
+      for (const [subject, chip] of [
+        ["Upcoming maintenance", "Pending approval"],
+        ["A draft notice", "Draft"],
+        ["An approved notice", "Approved"],
+        ["A published notice", "Published"],
+      ]) {
+        const row = table.getByRole("row", { name: new RegExp(`View announcement request: ${subject}`) });
+        expect(within(row).getByText(chip)).toBeInTheDocument();
+      }
+    });
   });
 
   it("lands directly on the Pending tab when opened with ?tab=pending", () => {

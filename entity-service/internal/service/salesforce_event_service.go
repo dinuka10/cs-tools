@@ -89,6 +89,10 @@ type MembershipIngest struct {
 	// Publisher may be nil (Event Hub unconfigured): project_contact.invited
 	// is then not published, the database write still happens.
 	Publisher EventPublisherService
+	// UserCache may be nil (Redis unconfigured). Otherwise every contact and
+	// membership write drops the affected user's cached profile after it
+	// commits.
+	UserCache UserCacheInvalidator
 }
 
 func (m *MembershipIngest) enabled() bool {

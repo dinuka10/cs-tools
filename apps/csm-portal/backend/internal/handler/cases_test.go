@@ -312,6 +312,103 @@ func TestCreateCaseComment(t *testing.T) {
 		}
 	})
 
+	t.Run("worknote_creator-only caller can only ever post type=work_note", func(t *testing.T) {
+		for _, payload := range []string{
+			`{"content":"no type"}`,
+			`{"type":"activity","content":"x"}`,
+			`{"type":"Work_Note","content":"x"}`,
+			`{"type":" work_note","content":"x"}`,
+			`{"type":["work_note"],"content":"x"}`,
+			`{"type":"work_note","type":"comment","content":"x"}`,
+		} {
+			called := false
+			client := &mockEntityCaseClient{
+				createCaseCommentFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+					called = true
+					return []byte(`{}`), nil
+				},
+			}
+			h := NewCaseHandler(client).WithAccessGuard(viewerAccessGuard)
+			r := withWorknoteCreatorUser(httptest.NewRequest(http.MethodPost, "/cases/case-1/comments", strings.NewReader(payload)))
+			r.SetPathValue("id", "case-1")
+			w := httptest.NewRecorder()
+			h.CreateCaseComment(w, r)
+			assertStatus(t, w, http.StatusForbidden)
+			if called {
+				t.Errorf("payload %s: entity CreateCaseComment must not be called for a worknote_creator-only caller", payload)
+			}
+		}
+	})
+
+	t.Run("worknote_creator-only caller with no user row yet is provisioned before the comment is posted", func(t *testing.T) {
+		var createUserCalled, createCommentCalled bool
+		client := &mockEntityCaseClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusNotFound, Body: "not found"}
+			},
+			createUserFn: func(_ context.Context, body []byte) ([]byte, error) {
+				createUserCalled = true
+				var req struct {
+					FirstName string   `json:"firstName"`
+					LastName  string   `json:"lastName"`
+					Email     string   `json:"email"`
+					Roles     []string `json:"roles"`
+				}
+				if err := json.Unmarshal(body, &req); err != nil {
+					t.Fatalf("decode CreateUser body: %v", err)
+				}
+				if req.Email != testWorknoteCreatorUser.Email || len(req.Roles) != 1 || req.Roles[0] != "internal" {
+					t.Errorf("CreateUser body = %+v, want the caller's own email and [\"internal\"]", req)
+				}
+				return []byte(`{"id":"new-id"}`), nil
+			},
+			createCaseCommentFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+				createCommentCalled = true
+				return []byte(`{}`), nil
+			},
+		}
+		h := NewCaseHandler(client).WithAccessGuard(viewerAccessGuard)
+		// work_note: a worknote_creator-only caller may only ever post this
+		// type (see the permission boundary tests above) -- validPayload's
+		// "comment" type would be forbidden before ever reaching provisioning.
+		r := withWorknoteCreatorUser(httptest.NewRequest(http.MethodPost, "/cases/case-1/comments", strings.NewReader(`{"type":"work_note","content":"noted"}`)))
+		r.SetPathValue("id", "case-1")
+		w := httptest.NewRecorder()
+		h.CreateCaseComment(w, r)
+		assertStatus(t, w, http.StatusCreated)
+		if !createUserCalled {
+			t.Error("entity CreateUser was not called for a worknote_creator-only caller with no user row")
+		}
+		if !createCommentCalled {
+			t.Error("entity CreateCaseComment was not called")
+		}
+	})
+
+	t.Run("cs_engineer caller is never provisioned, even with no user row upstream", func(t *testing.T) {
+		client := &mockEntityCaseClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				t.Fatal("GetUserMe should not be called for a cs_engineer posting a work_note")
+				return nil, nil
+			},
+			createUserFn: func(_ context.Context, _ []byte) ([]byte, error) {
+				t.Fatal("CreateUser should not be called for a cs_engineer")
+				return nil, nil
+			},
+			createCaseCommentFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+				return []byte(`{}`), nil
+			},
+		}
+		h := NewCaseHandler(client).WithAccessGuard(viewerAccessGuard)
+		// work_note, not validPayload ("comment"): a cs_engineer posting a
+		// customer-visible comment also runs the state-gate (GetCase), an
+		// unrelated code path this test isn't exercising -- work_note skips it.
+		r := withCsEngineerUser(httptest.NewRequest(http.MethodPost, "/cases/case-1/comments", strings.NewReader(`{"type":"work_note","content":"noted"}`)))
+		r.SetPathValue("id", "case-1")
+		w := httptest.NewRecorder()
+		h.CreateCaseComment(w, r)
+		assertStatus(t, w, http.StatusCreated)
+	})
+
 	// testPlatformUserID is the id GET /users/me resolves for the requesting
 	// user (see helpers_test.go), so this fixture represents that user being
 	// the case's assigned engineer. Note it is NOT testUser.UserID: assignee
@@ -2321,10 +2418,10 @@ func TestCreateCaseEscalation(t *testing.T) {
 				t.Fatal("SearchCaseEscalations should not be called for an ESCALATE action")
 				return nil, nil
 			},
-			getUserMeFn: func(_ context.Context) ([]byte, error) {
-				t.Fatal("GetUserMe should not be called for an ESCALATE action")
-				return nil, nil
-			},
+			// GetUserMe IS called for every escalation now, regardless of
+			// action -- see ensureUserProvisioned. It's the notified-users
+			// gate (SearchCaseEscalations, asserted above) that must stay
+			// ESCALATE-exempt, not GetUserMe itself.
 			createCaseEscalationFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
 				upstreamCalled = true
 				return []byte(`{"id":"e-1","level":"1","action":"ESCALATE"}`), nil
@@ -2338,6 +2435,45 @@ func TestCreateCaseEscalation(t *testing.T) {
 		assertStatus(t, w, http.StatusCreated)
 		if !upstreamCalled {
 			t.Error("upstream CreateCaseEscalation was not called for an ESCALATE action")
+		}
+	})
+
+	t.Run("escalator caller with no user row yet is provisioned before the escalation is created", func(t *testing.T) {
+		var createUserCalled, createEscalationCalled bool
+		client := &mockEntityCaseClient{
+			getUserMeFn: func(_ context.Context) ([]byte, error) {
+				return nil, &apierror.Error{StatusCode: http.StatusNotFound, Body: "not found"}
+			},
+			createUserFn: func(_ context.Context, body []byte) ([]byte, error) {
+				createUserCalled = true
+				var req struct {
+					Email string   `json:"email"`
+					Roles []string `json:"roles"`
+				}
+				if err := json.Unmarshal(body, &req); err != nil {
+					t.Fatalf("decode CreateUser body: %v", err)
+				}
+				if req.Email != testUser.Email || len(req.Roles) != 1 || req.Roles[0] != "internal" {
+					t.Errorf("CreateUser body = %+v, want the caller's own email and [\"internal\"]", req)
+				}
+				return []byte(`{"id":"new-id"}`), nil
+			},
+			createCaseEscalationFn: func(_ context.Context, _ string, _ []byte) ([]byte, error) {
+				createEscalationCalled = true
+				return []byte(`{"id":"e-1","level":"1","action":"ESCALATE"}`), nil
+			},
+		}
+		h := NewCaseHandler(client)
+		r := withUser(httptest.NewRequest(http.MethodPost, "/cases/"+testCaseID+"/escalations", strings.NewReader(`{"reason":"needed","action":"ESCALATE"}`)))
+		r.SetPathValue("id", testCaseID)
+		w := httptest.NewRecorder()
+		h.CreateCaseEscalation(w, r)
+		assertStatus(t, w, http.StatusCreated)
+		if !createUserCalled {
+			t.Error("entity CreateUser was not called for an escalator caller with no user row")
+		}
+		if !createEscalationCalled {
+			t.Error("entity CreateCaseEscalation was not called")
 		}
 	})
 

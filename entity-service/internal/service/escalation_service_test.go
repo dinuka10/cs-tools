@@ -71,8 +71,14 @@ func (f *fakeUserRepoForEscalationService) GetUserByEmail(_ context.Context, ema
 	}
 	return domain.User{}, &apierror.NotFoundError{Msg: "no user found with email: " + email}
 }
+func (f *fakeUserRepoForEscalationService) GetUsersByIDs(context.Context, []string) ([]domain.User, error) {
+	panic("fakeUserRepoForEscalationService.GetUsersByIDs: not expected to be called by these tests")
+}
 func (f *fakeUserRepoForEscalationService) SearchUsers(context.Context, domain.SearchUsersRequest) ([]domain.User, int, error) {
 	panic("fakeUserRepoForEscalationService.SearchUsers: not expected to be called by these tests")
+}
+func (f *fakeUserRepoForEscalationService) GetUsersByIDs(context.Context, []string) ([]domain.User, error) {
+	panic("fakeUserRepoForEscalationService.GetUsersByIDs: not expected to be called by these tests")
 }
 func (f *fakeUserRepoForEscalationService) GetUserRoles(context.Context, string) ([]string, error) {
 	panic("fakeUserRepoForEscalationService.GetUserRoles: not expected to be called by these tests")
@@ -268,5 +274,114 @@ func TestEscalationService_CreateEscalation_InScopeCaseStillWorks(t *testing.T) 
 	}
 	if !repo.called {
 		t.Error("repo.CreateEscalation should have been called for an in-scope case")
+	}
+}
+
+// stubMirrorEscalationService embeds EscalationService (nil) and overrides
+// only CreateEscalation -- same convention as stubMirrorCallRequestService.
+type stubMirrorEscalationService struct {
+	EscalationService
+	createEscalation func(ctx context.Context, req domain.CreateEscalationRequest) (domain.CreateEscalationResponse, error)
+}
+
+func (s *stubMirrorEscalationService) CreateEscalation(ctx context.Context, req domain.CreateEscalationRequest) (domain.CreateEscalationResponse, error) {
+	return s.createEscalation(ctx, req)
+}
+
+// TestEscalationService_CreateEscalation_MirrorsToServiceNow covers the
+// writeback wiring added for fix 2: on a successful Postgres create, the
+// mirror's CreateEscalation is dispatched asynchronously, forwarding req
+// verbatim, and does not block or affect the response.
+func TestEscalationService_CreateEscalation_MirrorsToServiceNow(t *testing.T) {
+	repo := &fakeEscalationRepoForService{createResp: domain.CreatedEscalation{
+		ID:            "escalation-1",
+		PreviousLevel: domain.ChoiceListItem{Label: "0"},
+		CurrentLevel:  domain.ChoiceListItem{Label: "1"},
+	}}
+	userRepo := &fakeUserRepoForEscalationService{
+		knownEmail: "engineer@example.com",
+		user:       domain.User{ID: "user-engineer", Email: "engineer@example.com"},
+	}
+	called := make(chan domain.CreateEscalationRequest, 1)
+	mirror := &stubMirrorEscalationService{
+		createEscalation: func(_ context.Context, mirrorReq domain.CreateEscalationRequest) (domain.CreateEscalationResponse, error) {
+			called <- mirrorReq
+			return domain.CreateEscalationResponse{}, nil
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewEscalationServiceWithSNWriteback(repo, userRepo, caseFoundInScopeRepo(), alwaysUnrestrictedAccess{}, dispatcher, mirror)
+
+	reason := "customer requested management involvement"
+	req := domain.CreateEscalationRequest{CaseID: escalationTestCaseID, Reason: &reason}
+	if _, err := svc.CreateEscalation(contextWithUserIDToken(fakeJWTWithEmail(t, "engineer@example.com")), req); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	select {
+	case got := <-called:
+		if got.CaseID != req.CaseID {
+			t.Errorf("mirror got CaseID %q, want %q", got.CaseID, req.CaseID)
+		}
+		if got.Reason == nil || *got.Reason != reason {
+			t.Errorf("mirror got Reason %v, want %q", got.Reason, reason)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mirror.CreateEscalation was never called")
+	}
+	if got := failures.count(); got != 0 {
+		t.Errorf("expected 0 sn_writeback_failures records for a successful mirror, got %d", got)
+	}
+}
+
+// TestEscalationService_CreateEscalation_MirrorFailureRecordsWritebackFailure
+// covers the failure half: Postgres already succeeded, so the call must
+// still report success, but the mirror error lands in sn_writeback_failures
+// for manual backfill.
+func TestEscalationService_CreateEscalation_MirrorFailureRecordsWritebackFailure(t *testing.T) {
+	repo := &fakeEscalationRepoForService{createResp: domain.CreatedEscalation{
+		ID:            "escalation-2",
+		PreviousLevel: domain.ChoiceListItem{Label: "0"},
+		CurrentLevel:  domain.ChoiceListItem{Label: "1"},
+	}}
+	userRepo := &fakeUserRepoForEscalationService{
+		knownEmail: "engineer@example.com",
+		user:       domain.User{ID: "user-engineer", Email: "engineer@example.com"},
+	}
+	mirror := &stubMirrorEscalationService{
+		createEscalation: func(context.Context, domain.CreateEscalationRequest) (domain.CreateEscalationResponse, error) {
+			return domain.CreateEscalationResponse{}, errors.New("sn downstream unreachable")
+		},
+	}
+	failures := &recordingSNWritebackFailures{}
+	dispatcher := NewSNWritebackDispatcher(failures)
+	svc := NewEscalationServiceWithSNWriteback(repo, userRepo, caseFoundInScopeRepo(), alwaysUnrestrictedAccess{}, dispatcher, mirror)
+
+	reason := "customer requested management involvement"
+	req := domain.CreateEscalationRequest{CaseID: escalationTestCaseID, Reason: &reason}
+	if _, err := svc.CreateEscalation(contextWithUserIDToken(fakeJWTWithEmail(t, "engineer@example.com")), req); err != nil {
+		t.Fatalf("expected the Postgres-side success to be reported despite the mirror failure, got %v", err)
+	}
+
+	waitFor(t, func() bool { return failures.count() == 1 })
+}
+
+// TestEscalationService_CreateEscalation_NoMirrorOnPlainPostgres covers the
+// plain-Postgres (non-dual-write) regression guard: with snWriteback/snMirror
+// both nil (NewEscalationService, not the SNWriteback constructor),
+// CreateEscalation must still succeed and must never touch any mirror.
+func TestEscalationService_CreateEscalation_NoMirrorOnPlainPostgres(t *testing.T) {
+	svc, _ := newTestEscalationService(&fakeEscalationRepoForService{createResp: domain.CreatedEscalation{
+		PreviousLevel: domain.ChoiceListItem{Label: "0"},
+		CurrentLevel:  domain.ChoiceListItem{Label: "1"},
+	}})
+	reason := "customer requested management involvement"
+	_, err := svc.CreateEscalation(contextWithUserIDToken(fakeJWTWithEmail(t, "engineer@example.com")), domain.CreateEscalationRequest{
+		CaseID: escalationTestCaseID,
+		Reason: &reason,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

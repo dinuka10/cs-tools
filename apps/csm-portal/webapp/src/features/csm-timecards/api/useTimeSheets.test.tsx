@@ -95,6 +95,8 @@ function mockApi(page: BeSearchTimeCardsResponse): { api: BackendApi; post: Retu
     patch: vi.fn(),
     put: vi.fn(),
     postEmpty: vi.fn(),
+    // BackendApi carries both: `delete` (void) and `del` (returns a body).
+    delete: vi.fn(),
     del: vi.fn(),
     getBlob: vi.fn(),
   };

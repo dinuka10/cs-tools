@@ -364,10 +364,10 @@ export default function TimelogsReportPage(): JSX.Element {
     // postgresSplReportsClient's own doc comment on the backend -- report
     // case data isn't part of the accounts/projects/cases entity-service
     // merge), so caseSysId is a bare ServiceNow sysid, not entity-service's
-    // own dashed UUID -- sysidToUuid converts it to what SPL's own
-    // /spl/cases/:caseId route (which validates a dashed UUID) needs.
+    // own dashed UUID -- sysidToUuid converts it to what the normal
+    // /cases/:caseId route (which validates a dashed UUID) needs.
     if (rowData?.caseSysId) {
-      window.open(`/spl/cases/${sysidToUuid(rowData.caseSysId)}`, "_blank");
+      window.open(`/cases/${sysidToUuid(rowData.caseSysId)}`, "_blank");
     } else {
       setErrorMessage("Case not found.");
     }

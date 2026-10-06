@@ -42,7 +42,7 @@ import { usePortalAccess } from "@context/current-user/usePortalAccess";
 import ColumnCustomizerButton from "@components/column-customizer/ColumnCustomizerButton";
 import MultiSelectField from "@components/MultiSelectField";
 import QueryErrorState from "@components/QueryErrorState";
-import SemanticChip from "@components/SemanticChip";
+import SemanticChip, { type SemanticRole } from "@components/SemanticChip";
 import AsyncProjectMultiSelect from "@features/csm-cases/components/AsyncProjectMultiSelect";
 import { useCurrentUser } from "@context/current-user/CurrentUserContext";
 import { useIdTokenClaims } from "@hooks/useIdTokenClaims";
@@ -139,12 +139,10 @@ type RegistryTabId = "announcements" | "pending";
  * update"/"Past updates" panel (which only requires `state === "published"`
  * and only ever renders inside this dialog). Kept, not dropped: `published`
  * is now included so that request-level view stays reachable, alongside the
- * case view the Announcements tab already provides. The backend's search
- * only accepts one `state` at a time (no `in` list — see
- * `SearchAnnouncementRequestsPayload`), so this is a single-select rather
- * than the multi-select the Announcements tab's own state filter uses;
- * there's no single call that can show every state merged into one
- * paginated list.
+ * case view the Announcements tab already provides. The filter is a
+ * multi-select: the backend's search takes a `states` list and returns the
+ * matching requests as one merged, paginated list. Like the Announcements
+ * tab's own state filter, an empty selection means every state.
  */
 const PENDING_STATE_OPTIONS: { value: AnnouncementRequestState; label: string }[] = [
   { value: "draft", label: "Draft" },
@@ -153,7 +151,27 @@ const PENDING_STATE_OPTIONS: { value: AnnouncementRequestState; label: string }[
   { value: "published", label: "Published" },
 ];
 
+const REQUEST_STATE_LABEL: Record<AnnouncementRequestState, string> = Object.fromEntries(
+  PENDING_STATE_OPTIONS.map((o) => [o.value, o.label]),
+) as Record<AnnouncementRequestState, string>;
+
+/** Chip colour per request lifecycle state: draft grey, awaiting review amber, approved blue, published green. */
+const REQUEST_STATE_ROLE: Record<AnnouncementRequestState, SemanticRole> = {
+  draft: "default",
+  pending_approval: "warning",
+  approved: "info",
+  published: "success",
+};
+
 const PENDING_ROWS_PER_PAGE = 10;
+const PENDING_COLUMN_COUNT = 6;
+
+/** Empty-table copy for the Requests tab, worded for however many states are selected. */
+function emptyRequestsMessage(states: AnnouncementRequestState[]): string {
+  if (states.length === 0) return "No requests.";
+  if (states.length === 1) return `No ${REQUEST_STATE_LABEL[states[0]].toLowerCase()} requests.`;
+  return "No requests in the selected states.";
+}
 
 function formatDate(value?: string | null): string {
   return (
@@ -253,7 +271,7 @@ export default function CsmAnnouncementsPage(): JSX.Element {
   const registryRows = data?.rows ?? [];
   const total = data?.total ?? 0;
 
-  const [pendingState, setPendingState] = useState<AnnouncementRequestState>("pending_approval");
+  const [pendingStates, setPendingStates] = useState<AnnouncementRequestState[]>(["pending_approval"]);
   const [pendingPage, setPendingPage] = useState(0);
   const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
   // Only ever populated by clicking a batch row below — the registry search
@@ -263,7 +281,7 @@ export default function CsmAnnouncementsPage(): JSX.Element {
   // show" the same way it already does for a legacy published request with
   // no publishedCaseIds at all.
   const [selectedCaseMembers, setSelectedCaseMembers] = useState<AnnouncementRegistryCaseMember[]>([]);
-  const pendingSearch = useSearchAnnouncementRequests(pendingState, pendingPage, PENDING_ROWS_PER_PAGE);
+  const pendingSearch = useSearchAnnouncementRequests(pendingStates, pendingPage, PENDING_ROWS_PER_PAGE);
   const pendingRequests = pendingSearch.data?.requests ?? [];
   const pendingTotal = pendingSearch.data?.total ?? 0;
 
@@ -567,18 +585,13 @@ export default function CsmAnnouncementsPage(): JSX.Element {
               <MultiSelectField
                 id="pending-announcement-requests-filter-state"
                 label="State"
-                values={[pendingState]}
+                values={pendingStates}
                 options={PENDING_STATE_OPTIONS}
-                // Single-select in practice — see PENDING_STATE_OPTIONS' own
-                // doc comment on why the backend can't merge multiple states
-                // into one paginated list. Picking a second value swaps to
-                // it rather than adding to a selection.
+                // Empty selection = every state, same as the Announcements
+                // tab's filter. A new selection always restarts at page one.
                 onChange={(next) => {
-                  const last = next[next.length - 1];
-                  if (last) {
-                    setPendingState(last);
-                    setPendingPage(0);
-                  }
+                  setPendingStates(next);
+                  setPendingPage(0);
                 }}
               />
             </Box>
@@ -596,6 +609,7 @@ export default function CsmAnnouncementsPage(): JSX.Element {
                   <TableRow sx={{ bgcolor: "action.hover" }}>
                     <TableCell sx={{ width: "36%" }}>Subject</TableCell>
                     <TableCell>Kind</TableCell>
+                    <TableCell>State</TableCell>
                     <TableCell>Created by</TableCell>
                     <TableCell>Created</TableCell>
                     <TableCell>Updated</TableCell>
@@ -605,7 +619,7 @@ export default function CsmAnnouncementsPage(): JSX.Element {
                   {pendingSearch.isLoading ? (
                     Array.from({ length: PENDING_ROWS_PER_PAGE }).map((_, i) => (
                       <TableRow key={i}>
-                        {Array.from({ length: 5 }).map((_v, j) => (
+                        {Array.from({ length: PENDING_COLUMN_COUNT }).map((_v, j) => (
                           <TableCell key={j}>
                             <Skeleton variant="rounded" width="80%" height={18} />
                           </TableCell>
@@ -614,7 +628,7 @@ export default function CsmAnnouncementsPage(): JSX.Element {
                     ))
                   ) : pendingSearch.isError ? (
                     <TableRow>
-                      <TableCell colSpan={5} align="center">
+                      <TableCell colSpan={PENDING_COLUMN_COUNT} align="center">
                         <QueryErrorState
                           message={
                             pendingSearch.error instanceof Error && pendingSearch.error.message.trim()
@@ -627,10 +641,9 @@ export default function CsmAnnouncementsPage(): JSX.Element {
                     </TableRow>
                   ) : pendingRequests.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={5} align="center" sx={{ py: 4 }}>
+                      <TableCell colSpan={PENDING_COLUMN_COUNT} align="center" sx={{ py: 4 }}>
                         <Typography variant="body2" color="text.secondary">
-                          No {PENDING_STATE_OPTIONS.find((o) => o.value === pendingState)?.label.toLowerCase()}{" "}
-                          requests.
+                          {emptyRequestsMessage(pendingStates)}
                         </Typography>
                       </TableCell>
                     </TableRow>
@@ -677,6 +690,13 @@ export default function CsmAnnouncementsPage(): JSX.Element {
                           </Box>
                         </TableCell>
                         <TableCell>{r.kind === "eol" ? "EOL" : "Customer"}</TableCell>
+                        <TableCell>
+                          <SemanticChip
+                            role={REQUEST_STATE_ROLE[r.state] ?? "default"}
+                            label={REQUEST_STATE_LABEL[r.state] ?? r.state}
+                            variant="outlined"
+                          />
+                        </TableCell>
                         <TableCell>{r.createdByEmail || r.createdBy || "—"}</TableCell>
                         <TableCell sx={{ whiteSpace: "nowrap" }}>{formatDate(r.createdAt)}</TableCell>
                         <TableCell sx={{ whiteSpace: "nowrap" }}>{formatDate(r.updatedAt)}</TableCell>

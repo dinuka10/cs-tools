@@ -73,6 +73,9 @@ func (unusedReferenceDataRepo) EnumLabels(context.Context, []string) (map[string
 func (unusedReferenceDataRepo) ListTimeZones(context.Context) ([]repository.TimeZoneRow, error) {
 	return nil, nil
 }
+func (unusedReferenceDataRepo) ListSLADurationPolicy(context.Context) ([]repository.SLADurationPolicyRow, error) {
+	return nil, nil
+}
 
 // fakeTimeZoneRepo backs TestGlobalService_GetSystemMetadata_MapsTimeZones --
 // a configurable ListTimeZones alongside the same fixed-empty everything
@@ -92,6 +95,9 @@ func (fakeTimeZoneRepo) EnumLabels(context.Context, []string) (map[string][]stri
 }
 func (f fakeTimeZoneRepo) ListTimeZones(context.Context) ([]repository.TimeZoneRow, error) {
 	return f.timeZones, nil
+}
+func (fakeTimeZoneRepo) ListSLADurationPolicy(context.Context) ([]repository.SLADurationPolicyRow, error) {
+	return nil, nil
 }
 
 // TestGlobalService_GetSystemMetadata_MapsTimeZones is the regression guard

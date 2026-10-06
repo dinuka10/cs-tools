@@ -59,7 +59,7 @@ type slaStatusService struct {
 
 // NewSLAStatusService constructs an SLAStatusService backed by the given
 // repository. access gates every call to internal callers
-// (AUTH_INTERNAL_CLIENT_IDS) -- see requireInternalCaller's own doc comment
+// (an Unrestricted AccessScope) -- see requireInternalCaller's own doc comment
 // for why: unlike every other Postgres-backed read, this endpoint has no
 // per-project/per-case filtering of its own to scope by (it returns every
 // currently-active clock across every case in one bulk list, for its one

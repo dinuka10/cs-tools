@@ -41,8 +41,10 @@ import (
 // instead, and they are the only places this can silently diverge:
 //
 //   - status: derived from end_on, never stored (domain.OutageStatus says so)
-//   - duration: derived from begin/end rather than read, since the mirrored
-//     duration column is only populated for rows csm-sync brought over
+//   - duration: derived from begin/end rather than read, since rows written
+//     before Create/Update kept the column in step may still hold NULL. The
+//     column itself is now written on create and on every begin/end change,
+//     as ServiceNow's "Outage Calculations" rule does, for readers that use it
 //   - publishesToStatusPage / statusPageCloud: resolved from whether the
 //     outage's service offering has a cloud_monitor row, which is the same
 //     join the cloud status sweep uses to decide which dashboard to tell
@@ -71,7 +73,15 @@ type OutageWrite struct {
 	IncidentID            *string
 	ExternalCommunication *string
 	InternalCommunication *string
-	Actor                 string
+	// NotifyInternalStakeholders and OutageCommunication are the email
+	// opt-ins; Impact and State are nil for "not set".
+	NotifyInternalStakeholders bool
+	OutageCommunication        bool
+	Impact                     *string
+	State                      *string
+	// AffectedCIIDs are service offering ids, de-duplicated by the service.
+	AffectedCIIDs []string
+	Actor         string
 }
 
 // OutagePatch carries an update whose timestamps are ALREADY PARSED.
@@ -94,7 +104,16 @@ type OutagePatch struct {
 	ShortDescription  *string
 	ServiceOfferingID *string
 	IncidentID        *string
-	Actor             string
+	// nil leaves a field alone. For Impact and State a non-nil empty string
+	// clears the column (NULL), so the email prints the line blank again.
+	NotifyInternalStakeholders *bool
+	OutageCommunication        *bool
+	Impact                     *string
+	State                      *string
+	// AffectedCIIDs replaces the whole affected set when non-nil (an empty
+	// slice clears it); nil leaves it alone.
+	AffectedCIIDs *[]string
+	Actor         string
 }
 
 // outageRepo runs every statement under the caller's own identity, never a
@@ -133,7 +152,11 @@ SELECT o.id::text,
        o.created_on,
        COALESCE(o.created_by, ''),
        o.updated_on,
-       COALESCE(o.updated_by, '')
+       COALESCE(o.updated_by, ''),
+       COALESCE(o.notify_internal_stakeholders, FALSE),
+       COALESCE(o.outage_communication, FALSE),
+       o.impact,
+       o.state
   FROM outage o
   LEFT JOIN service_offering so ON so.id = o.service_offering_id
   LEFT JOIN LATERAL (
@@ -162,7 +185,8 @@ func scanOutage(row pgx.Row) (domain.Outage, error) {
 	if err := row.Scan(&out.ID, &out.Number, &typ, &begin, &end, &out.ShortDescription,
 		&offeringID, &offeringName, &cloud,
 		&incID, &incNumber, &incShort, &incState,
-		&createdOn, &out.CreatedBy, &updatedOn, &out.UpdatedBy); err != nil {
+		&createdOn, &out.CreatedBy, &updatedOn, &out.UpdatedBy,
+		&out.NotifyInternalStakeholders, &out.OutageCommunication, &out.Impact, &out.State); err != nil {
 		return domain.Outage{}, err
 	}
 
@@ -294,12 +318,17 @@ func insertOutage(ctx context.Context, tx pgx.Tx, in OutageWrite) (string, error
 INSERT INTO outage (id, number, type, start_on, end_on, name,
                     service_offering_id, work_item_id,
                     external_outage_communications, internal_outage_communications,
-                    notify_internal_stakeholders,
+                    notify_internal_stakeholders, outage_communication, impact, state, duration,
                     created_on, created_by, updated_on, updated_by)
 VALUES (gen_random_uuid(),
         'OUT' || LPAD(nextval('outage_number_seq')::text, 7, '0'),
         $1::outage_type_enum, $2, $3, $4,
-        $5::uuid, $6::uuid, $7, $8, FALSE,
+        $5::uuid, $6::uuid, $7, $8, $10, $11, $12, $13,
+        -- ServiceNow's "Outage Calculations" business rule: duration is
+        -- end - begin, and NULL while either is missing. Readers such as the
+        -- outage-communication email take it from this column, so an outage
+        -- created here must carry it like a synced one does.
+        $3::timestamptz - $2::timestamptz,
         NOW(), $9, NOW(), $9)
 RETURNING id::text`
 
@@ -308,6 +337,7 @@ RETURNING id::text`
 		strings.ToUpper(in.Type), in.Begin, in.End, in.ShortDescription,
 		in.ServiceOfferingID, in.IncidentID,
 		in.ExternalCommunication, in.InternalCommunication, in.Actor,
+		in.NotifyInternalStakeholders, in.OutageCommunication, in.Impact, in.State,
 	).Scan(&id); err != nil {
 		return "", fmt.Errorf("create outage: %w", err)
 	}
@@ -325,7 +355,127 @@ RETURNING id::text`
 			return "", err
 		}
 	}
+	if err := replaceAffectedCIs(ctx, tx, id, in.AffectedCIIDs, in.Actor); err != nil {
+		return "", err
+	}
 	return id, nil
+}
+
+// affectedCIsOf reads an outage's affected configuration items. Until this
+// existed the Postgres read returned none at all, so even the affected CIs
+// synced from ServiceNow never reached the portal.
+//
+// An affected CI is usually a service offering, but ServiceNow's list also
+// holds services (cmdb_ci_service), so both are resolved for the name.
+func affectedCIsOf(ctx context.Context, db rowsQuerier, outageID string) ([]domain.OutageConfigurationItemRef, error) {
+	rows, err := db.Query(ctx, `
+SELECT a.ci_id::text,
+       COALESCE(so.name, s.name, ''),
+       CASE WHEN so.id IS NOT NULL THEN 'service_offering'
+            WHEN s.id  IS NOT NULL THEN 'cmdb_ci_service'
+            ELSE '' END
+  FROM outage_affected_ci a
+  LEFT JOIN service_offering so ON so.id = a.ci_id
+  LEFT JOIN service s ON s.id = a.ci_id
+ WHERE a.outage_id = $1::uuid AND a.ci_id IS NOT NULL
+ ORDER BY 2, 1`, outageID)
+	if err != nil {
+		return nil, fmt.Errorf("affected configuration items: %w", err)
+	}
+	defer rows.Close()
+	out := []domain.OutageConfigurationItemRef{}
+	for rows.Next() {
+		var ref domain.OutageConfigurationItemRef
+		if err := rows.Scan(&ref.ID, &ref.Name, &ref.ClassName); err != nil {
+			return nil, fmt.Errorf("scan affected configuration item: %w", err)
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
+// replaceAffectedCIs makes the outage's affected configuration items exactly
+// ids: rows for ids not yet present are inserted, rows for ids no longer
+// wanted are deleted, and rows already there are left untouched.
+//
+// Inserting fires outage_affected_ci's outbox trigger, so the cloud status
+// drainer turns the new CIs' monitors and records an outage_begin for any new
+// cloud -- the same path ServiceNow's "Cloud Status ... - Affected CI" flow
+// takes when an affected CI is added.
+//
+// *** DELETING HAS NO TRIGGER, SO THE MONITOR IS RESET HERE. *** The drainer
+// only ever sets the monitors of CIs still on the outage, so a CI removed from
+// an ongoing outage would otherwise stay red on the status page indefinitely.
+// Its monitor goes back to OPERATIONAL -- unless another ongoing outage still
+// lists that CI, which would then rightly keep it red. Once the outage has
+// ended its end already reset every affected monitor, so nothing is touched.
+func replaceAffectedCIs(ctx context.Context, tx pgx.Tx, outageID string, ids []string, actor string) error {
+	if ids == nil {
+		ids = []string{}
+	}
+	// A NEW affected CI must be a service offering -- what the portal's picker
+	// offers and what the status page and availability key on. One already on
+	// the outage is kept whatever it is: ServiceNow's list also holds services,
+	// and re-saving such an outage must not fail on rows it did not touch.
+	var unknown int
+	if err := tx.QueryRow(ctx, `
+SELECT COUNT(*) FROM unnest($1::uuid[]) AS want(id)
+ WHERE NOT EXISTS (SELECT 1 FROM service_offering so WHERE so.id = want.id)
+   AND NOT EXISTS (SELECT 1 FROM outage_affected_ci a WHERE a.outage_id = $2::uuid AND a.ci_id = want.id)`,
+		ids, outageID).Scan(&unknown); err != nil {
+		return fmt.Errorf("check affected configuration items: %w", err)
+	}
+	if unknown > 0 {
+		return &apierror.ValidationError{Msg: "affectedConfigurationItemIds: a newly added item must be an existing service offering"}
+	}
+
+	rows, err := tx.Query(ctx, `
+DELETE FROM outage_affected_ci
+ WHERE outage_id = $1::uuid AND NOT (ci_id = ANY($2::uuid[]))
+RETURNING ci_id::text`, outageID, ids)
+	if err != nil {
+		return fmt.Errorf("remove affected configuration items: %w", err)
+	}
+	var removed []string
+	for rows.Next() {
+		var ci string
+		if err := rows.Scan(&ci); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan removed affected configuration item: %w", err)
+		}
+		removed = append(removed, ci)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("remove affected configuration items: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, `
+INSERT INTO outage_affected_ci (id, outage_id, ci_id, created_on, updated_on, created_by, updated_by)
+SELECT gen_random_uuid(), $1::uuid, want.id, NOW(), NOW(), $3, $3
+  FROM unnest($2::uuid[]) AS want(id)
+ WHERE NOT EXISTS (SELECT 1 FROM outage_affected_ci a
+                    WHERE a.outage_id = $1::uuid AND a.ci_id = want.id)`, outageID, ids, actor); err != nil {
+		return fmt.Errorf("add affected configuration items: %w", err)
+	}
+
+	if len(removed) > 0 {
+		if _, err := tx.Exec(ctx, `
+UPDATE cloud_monitor m
+   SET status = 'OPERATIONAL', updated_on = NOW(), updated_by = $3
+ WHERE m.service_offering_id = ANY($2::uuid[])
+   AND m.status <> 'OPERATIONAL'
+   AND EXISTS (SELECT 1 FROM outage o WHERE o.id = $1::uuid AND o.end_on IS NULL)
+   AND NOT EXISTS (
+        SELECT 1 FROM outage_affected_ci a
+          JOIN outage o2 ON o2.id = a.outage_id
+         WHERE a.ci_id = m.service_offering_id
+           AND o2.id <> $1::uuid
+           AND o2.start_on IS NOT NULL AND o2.end_on IS NULL)`, outageID, removed, actor); err != nil {
+			return fmt.Errorf("reset monitors of removed affected configuration items: %w", err)
+		}
+	}
+	return nil
 }
 
 // GetByID returns one outage plus its per-channel journal counts.
@@ -339,6 +489,12 @@ func (r *outageRepo) GetByID(ctx context.Context, id string) (domain.OutageDetai
 	}
 
 	detail := domain.OutageDetail{Outage: out}
+	affected, err := affectedCIsOf(ctx, r.db, id)
+	if err != nil {
+		return domain.OutageDetail{}, err
+	}
+	detail.Outage.AffectedConfigurationItems = affected
+
 	const countSQL = `
 SELECT channel, COUNT(*) FROM outage_communication
  WHERE outage_id = $1::uuid GROUP BY channel`
@@ -483,8 +639,13 @@ func (r *outageRepo) Update(ctx context.Context, patch OutagePatch) (domain.Outa
 	if patch.Type != nil {
 		set("type = $%d::outage_type_enum", strings.ToUpper(*patch.Type))
 	}
+	// beginExpr/endExpr are the values start_on/end_on will hold AFTER this
+	// update. In an UPDATE's SET list a column name reads the OLD value, so
+	// recomputing duration from the columns would use the pre-patch times.
+	beginExpr, endExpr := "start_on", "end_on"
 	if patch.Begin != nil {
 		set("start_on = $%d", *patch.Begin)
+		beginExpr = fmt.Sprintf("$%d::timestamptz", len(args))
 	}
 	// End is pointer-to-pointer on purpose: omitted leaves it alone, explicit
 	// null REOPENS the outage, a value closes it. Collapsing those two is how
@@ -492,9 +653,18 @@ func (r *outageRepo) Update(ctx context.Context, patch OutagePatch) (domain.Outa
 	if patch.End != nil {
 		if *patch.End == nil {
 			sets = append(sets, "end_on = NULL")
+			endExpr = "NULL::timestamptz"
 		} else {
 			set("end_on = $%d", **patch.End)
+			endExpr = fmt.Sprintf("$%d::timestamptz", len(args))
 		}
+	}
+	// ServiceNow's "Outage Calculations" rule (before insert/update): duration
+	// = end - begin, NULL if either is missing. Without it an outage closed
+	// here keeps a NULL duration and the resolution email prints a blank
+	// "Outage Duration:".
+	if patch.Begin != nil || patch.End != nil {
+		sets = append(sets, fmt.Sprintf("duration = %s - %s", endExpr, beginExpr))
 	}
 	if patch.ShortDescription != nil {
 		set("name = $%d", *patch.ShortDescription)
@@ -505,25 +675,63 @@ func (r *outageRepo) Update(ctx context.Context, patch OutagePatch) (domain.Outa
 	if patch.IncidentID != nil {
 		set("work_item_id = $%d::uuid", *patch.IncidentID)
 	}
+	if patch.NotifyInternalStakeholders != nil {
+		set("notify_internal_stakeholders = $%d", *patch.NotifyInternalStakeholders)
+	}
+	if patch.OutageCommunication != nil {
+		set("outage_communication = $%d", *patch.OutageCommunication)
+	}
+	// NULLIF: an empty string is "clear it", stored as NULL like ServiceNow's
+	// unset value rather than as a blank the email would print identically.
+	if patch.Impact != nil {
+		set("impact = NULLIF($%d, '')", *patch.Impact)
+	}
+	if patch.State != nil {
+		set("state = NULLIF($%d, '')", *patch.State)
+	}
 
-	if len(sets) == 0 {
+	if len(sets) == 0 && patch.AffectedCIIDs == nil {
 		return domain.Outage{}, &apierror.ValidationError{Msg: "at least one field must be provided"}
 	}
 
-	args = append(args, patch.Actor)
-	sets = append(sets, fmt.Sprintf("updated_by = $%d", len(args)))
-	sets = append(sets, "updated_on = NOW()")
-
-	args = append(args, patch.ID)
-	q := fmt.Sprintf("UPDATE outage SET %s WHERE id = $%d::uuid RETURNING id::text",
-		strings.Join(sets, ", "), len(args))
-
-	var id string
-	if err := r.db.QueryRow(ctx, q, args...).Scan(&id); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.Outage{}, &apierror.NotFoundError{Msg: "outage not found"}
+	// One transaction: a field change and an affected-CI change from the same
+	// save must land together or not at all.
+	id, err := InTxReturning(ctx, r.db, func(tx pgx.Tx) (string, error) {
+		var id string
+		if len(sets) > 0 {
+			args = append(args, patch.Actor)
+			sets = append(sets, fmt.Sprintf("updated_by = $%d", len(args)))
+			sets = append(sets, "updated_on = NOW()")
+			args = append(args, patch.ID)
+			q := fmt.Sprintf("UPDATE outage SET %s WHERE id = $%d::uuid RETURNING id::text",
+				strings.Join(sets, ", "), len(args))
+			if err := tx.QueryRow(ctx, q, args...).Scan(&id); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return "", &apierror.NotFoundError{Msg: "outage not found"}
+				}
+				return "", fmt.Errorf("update outage: %w", err)
+			}
+		} else {
+			// Only the affected CIs change. The outage row itself is not
+			// touched -- as in ServiceNow, where they are a separate related
+			// list -- so its updated_on does not move and no "Update"
+			// notification is owed for it.
+			if err := tx.QueryRow(ctx, "SELECT id::text FROM outage WHERE id = $1::uuid FOR UPDATE", patch.ID).Scan(&id); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return "", &apierror.NotFoundError{Msg: "outage not found"}
+				}
+				return "", fmt.Errorf("lock outage: %w", err)
+			}
 		}
-		return domain.Outage{}, fmt.Errorf("update outage: %w", err)
+		if patch.AffectedCIIDs != nil {
+			if err := replaceAffectedCIs(ctx, tx, id, *patch.AffectedCIIDs, patch.Actor); err != nil {
+				return "", err
+			}
+		}
+		return id, nil
+	})
+	if err != nil {
+		return domain.Outage{}, err
 	}
 
 	detail, err := r.GetByID(ctx, id)

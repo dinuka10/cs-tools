@@ -19,12 +19,15 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/apierror"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/auth"
 	"github.com/wso2-open-operations/cs-tools/entity-service/internal/domain"
+	"github.com/wso2-open-operations/cs-tools/entity-service/internal/repository"
 )
 
 // stubChangeRequestRepo is a minimal repository.ChangeRequestRepository
@@ -36,6 +39,24 @@ type stubChangeRequestRepo struct {
 	patchChangeRequest                func(ctx context.Context, id string, req domain.PatchChangeRequestRequest, email string) (domain.ChangeRequest, error)
 	getChangeRequestApprovals         func(ctx context.Context, id string) (domain.ChangeRequestApprovals, error)
 	decideChangeRequestApproval       func(ctx context.Context, id, approverUserID, decision, actorEmail string) (string, error)
+	validateChangeRequestLinks        func(ctx context.Context, sel domain.ChangeRequestLinkSelection) (domain.ChangeRequestLinkSet, error)
+	getChangeRequestLinkOptions       func(ctx context.Context, req domain.ChangeRequestLinkOptionsRequest) (domain.ChangeRequestLinkOptionsResponse, error)
+}
+
+// ValidateChangeRequestLinks defaults to accepting everything: most tests do
+// not exercise the customer-scope fields.
+func (s *stubChangeRequestRepo) ValidateChangeRequestLinks(ctx context.Context, sel domain.ChangeRequestLinkSelection) (domain.ChangeRequestLinkSet, error) {
+	if s.validateChangeRequestLinks != nil {
+		return s.validateChangeRequestLinks(ctx, sel)
+	}
+	return domain.ChangeRequestLinkSet{}, nil
+}
+
+func (s *stubChangeRequestRepo) GetChangeRequestLinkOptions(ctx context.Context, req domain.ChangeRequestLinkOptionsRequest) (domain.ChangeRequestLinkOptionsResponse, error) {
+	if s.getChangeRequestLinkOptions != nil {
+		return s.getChangeRequestLinkOptions(ctx, req)
+	}
+	panic("not implemented")
 }
 
 func (s *stubChangeRequestRepo) GetChangeRequestApprovals(ctx context.Context, id string) (domain.ChangeRequestApprovals, error) {
@@ -107,7 +128,57 @@ func (s *stubMirrorChangeRequestService) PatchChangeRequest(ctx context.Context,
 }
 
 func validCreateChangeRequestRequest() domain.CreateChangeRequestRequest {
-	return domain.CreateChangeRequestRequest{Subject: "subject"}
+	normal := domain.ChangeRequestTypeNormal
+	return domain.CreateChangeRequestRequest{Subject: "subject", Type: &normal}
+}
+
+// TestChangeRequestService_CreateChangeRequest_RequiresType: a change request
+// must be created as standard, normal or emergency -- the type decides its
+// whole approval flow. A missing or other type is refused before ServiceNow
+// (dual-write) or Postgres (plain) is touched.
+func TestChangeRequestService_CreateChangeRequest_RequiresType(t *testing.T) {
+	azure := domain.ChangeRequestTypeAzure
+	empty := domain.ChangeRequestType("")
+	cases := map[string]*domain.ChangeRequestType{"missing": nil, "empty": &empty, "azure": &azure}
+	for name, typ := range cases {
+		t.Run("dual-write/"+name, func(t *testing.T) {
+			mirror := &stubMirrorChangeRequestService{
+				createChangeRequest: func(context.Context, domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+					t.Fatal("ServiceNow must never be called without a valid type")
+					return domain.CreateChangeRequestResponse{}, nil
+				},
+			}
+			svc := NewChangeRequestServiceWithSNMirror(&stubChangeRequestRepo{}, stubUserRepo{}, mirror)
+			_, err := svc.CreateChangeRequest(context.Background(), domain.CreateChangeRequestRequest{Subject: "subject", Type: typ})
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+			}
+			if !strings.Contains(ve.Msg, "standard, normal or emergency") {
+				t.Errorf("message %q should name the three allowed types", ve.Msg)
+			}
+		})
+		t.Run("postgres/"+name, func(t *testing.T) {
+			svc := NewChangeRequestService(&stubChangeRequestRepo{}, stubUserRepo{})
+			_, err := svc.CreateChangeRequest(contextWithUserIDToken(fakeJWTWithEmail(t, "a@example.com")), domain.CreateChangeRequestRequest{Subject: "subject", Type: typ})
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+			}
+		})
+	}
+	for _, ok := range domain.ChangeRequestCreatableTypes {
+		ok := ok
+		t.Run("accepts/"+string(ok), func(t *testing.T) {
+			repo := &stubChangeRequestRepo{createChangeRequest: func(_ context.Context, req domain.CreateChangeRequestRequest, _ string) (domain.CreateChangeRequestResponse, error) {
+				return domain.CreateChangeRequestResponse{Message: "ok"}, nil
+			}}
+			svc := NewChangeRequestService(repo, stubUserRepo{})
+			if _, err := svc.CreateChangeRequest(contextWithUserIDToken(fakeJWTWithEmail(t, "a@example.com")), domain.CreateChangeRequestRequest{Subject: "subject", Type: &ok}); err != nil {
+				t.Fatalf("type %s: %v", ok, err)
+			}
+		})
+	}
 }
 
 // TestChangeRequestService_CreateChangeRequest_SNFailureLeavesPostgresUntouched
@@ -440,6 +511,87 @@ func TestChangeRequestService_DecideChangeRequestApproval_NoWritebackWhenSnWrite
 	}
 }
 
+// TestChangeRequestService_DecideChangeRequestApproval_NonMemberRefusalPropagates:
+// a caller outside the customer group of a change waiting on its customer
+// stage gets the repository's readable ForbiddenError unchanged, and nothing
+// is mirrored to ServiceNow for a decision that was never recorded.
+func TestChangeRequestService_DecideChangeRequestApproval_NonMemberRefusalPropagates(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "outsider@example.com"))
+	const msg = `only members of the customer group "Artemis Customers" can approve or reject the customer's approval of this change request`
+	mirrorCalled := make(chan struct{}, 1)
+	mirror := &stubMirrorChangeRequestService{
+		decideChangeRequestApproval: func(context.Context, string, string) (domain.ChangeRequestApprovalDecisionResponse, error) {
+			mirrorCalled <- struct{}{}
+			return domain.ChangeRequestApprovalDecisionResponse{}, nil
+		},
+	}
+	repo := &stubChangeRequestRepo{
+		decideChangeRequestApproval: func(context.Context, string, string, string, string) (string, error) {
+			return "", &apierror.ForbiddenError{Msg: msg}
+		},
+	}
+	svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) {
+			return domain.User{ID: testUUID, Email: "outsider@example.com"}, nil
+		},
+	}, mirror, NewSNWritebackDispatcher(&recordingSNWritebackFailures{}))
+
+	_, err := svc.DecideChangeRequestApproval(ctx, testUUID, "approved")
+	var fe *apierror.ForbiddenError
+	if !errors.As(err, &fe) || fe.Msg != msg {
+		t.Fatalf("err = %v, want the repository's ForbiddenError %q", err, msg)
+	}
+	select {
+	case <-mirrorCalled:
+		t.Fatal("a refused decision was mirrored to ServiceNow")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestChangeRequestService_DecideChangeRequestApproval_ExternalUserRefusalPropagates:
+// a customer holding a row on an internal stage (approver pools are
+// INTERNAL-only) gets the repository's readable ForbiddenError unchanged -- the
+// service adds no mapping of its own, so the 403 and its reason reach the
+// caller -- and nothing is mirrored to ServiceNow for a decision that was never
+// recorded.
+func TestChangeRequestService_DecideChangeRequestApproval_ExternalUserRefusalPropagates(t *testing.T) {
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "dave.mendis@example.com"))
+	const msg = "only active internal (WSO2) users can approve or reject the Peer Approval stage of a change request; external/customer users cannot"
+	mirrorCalled := make(chan struct{}, 1)
+	mirror := &stubMirrorChangeRequestService{
+		decideChangeRequestApproval: func(context.Context, string, string) (domain.ChangeRequestApprovalDecisionResponse, error) {
+			mirrorCalled <- struct{}{}
+			return domain.ChangeRequestApprovalDecisionResponse{}, nil
+		},
+	}
+	repo := &stubChangeRequestRepo{
+		decideChangeRequestApproval: func(_ context.Context, _, approverUserID, _, actorEmail string) (string, error) {
+			if approverUserID != testUUID || actorEmail != "dave.mendis@example.com" {
+				t.Errorf("repo got approver %q / actor %q, want the caller", approverUserID, actorEmail)
+			}
+			return "", &apierror.ForbiddenError{Msg: msg}
+		},
+	}
+	svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{
+		getUserByEmail: func(context.Context, string) (domain.User, error) {
+			return domain.User{ID: testUUID, Email: "dave.mendis@example.com"}, nil
+		},
+	}, mirror, NewSNWritebackDispatcher(&recordingSNWritebackFailures{}))
+
+	for _, decision := range []string{"approved", "rejected"} {
+		_, err := svc.DecideChangeRequestApproval(ctx, testUUID, decision)
+		var fe *apierror.ForbiddenError
+		if !errors.As(err, &fe) || fe.Msg != msg {
+			t.Fatalf("%s: err = %v, want the repository's ForbiddenError %q", decision, err, msg)
+		}
+	}
+	select {
+	case <-mirrorCalled:
+		t.Fatal("a refused decision was mirrored to ServiceNow")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
 // TestChangeRequestService_DecideChangeRequestApproval_MirrorsToServiceNow
 // covers the writeback wiring: on a successful Postgres decide, the
 // mirror's DecideChangeRequestApproval is dispatched asynchronously and
@@ -552,8 +704,8 @@ func TestChangeRequestService_DecideChangeRequestApproval_RepoNotFoundPropagates
 // TestChangeRequestService_PatchChangeRequest_AcceptsFieldParityFieldsAlone
 // proves a request carrying only one of the field-parity fields (previously
 // rejected with "at least one field must be provided") reaches the
-// repository, and that fields with no Postgres backing are rejected rather
-// than silently dropped.
+// repository, and that durationInput, the one field with no Postgres backing,
+// is rejected rather than silently dropped.
 func TestChangeRequestService_PatchChangeRequest_AcceptsFieldParityFieldsAlone(t *testing.T) {
 	text := "2 hours"
 	ptr := &text
@@ -574,10 +726,536 @@ func TestChangeRequestService_PatchChangeRequest_AcceptsFieldParityFieldsAlone(t
 		t.Fatal("repository never saw RollbackDurationText")
 	}
 
-	comment := "hello"
-	_, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{Comment: &comment})
+	// durationInput is the one field with no Postgres backing left.
+	d := 60
+	dd := &d
+	_, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{DurationInput: &dd})
 	var ve *apierror.ValidationError
 	if !asValidationError(err, &ve) {
-		t.Fatalf("comment: expected ValidationError, got %T: %v", err, err)
+		t.Fatalf("durationInput: expected ValidationError, got %T: %v", err, err)
+	}
+}
+
+// TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsAlone: the
+// creation form's two checkboxes (customerApprovalRequired /
+// customerReviewRequired) are a patch on their own -- not rejected as "at least
+// one field must be provided" -- and reach the repository unchanged.
+func TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsAlone(t *testing.T) {
+	yes, no := true, false
+	for name, req := range map[string]domain.PatchChangeRequestRequest{
+		"customerApprovalRequired": {CustomerApprovalRequired: &yes},
+		"customerReviewRequired":   {CustomerReviewRequired: &no},
+		"both":                     {CustomerApprovalRequired: &no, CustomerReviewRequired: &yes},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got domain.PatchChangeRequestRequest
+			repo := &stubChangeRequestRepo{
+				patchChangeRequest: func(_ context.Context, id string, r domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+					got = r
+					return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+				},
+			}
+			svc := NewChangeRequestService(repo, stubUserRepo{})
+			ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+			if _, err := svc.PatchChangeRequest(ctx, testUUID, req); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.CustomerApprovalRequired != req.CustomerApprovalRequired || got.CustomerReviewRequired != req.CustomerReviewRequired {
+				t.Fatalf("repository saw %+v/%+v, want the request's own flags", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+			}
+		})
+	}
+}
+
+// TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsStayOutOfTheMirror:
+// ServiceNow's change request API has no field the service can name for the
+// two checkboxes, so they are stripped from the dual-write mirror; a PATCH that
+// carried nothing else is not mirrored at all (an empty ServiceNow PATCH would
+// only record a writeback failure).
+func TestChangeRequestService_PatchChangeRequest_CustomerGateFlagsStayOutOfTheMirror(t *testing.T) {
+	yes := true
+	title := "new title"
+	repo := &stubChangeRequestRepo{
+		patchChangeRequest: func(_ context.Context, id string, _ domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+			return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+		},
+	}
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+
+	t.Run("mixed with other fields: flags stripped, rest mirrored", func(t *testing.T) {
+		called := make(chan domain.PatchChangeRequestRequest, 1)
+		mirror := &stubMirrorChangeRequestService{
+			patchChangeRequest: func(_ context.Context, _ string, r domain.PatchChangeRequestRequest) (domain.PatchChangeRequestResponse, error) {
+				called <- r
+				return domain.PatchChangeRequestResponse{}, nil
+			},
+		}
+		svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{}, mirror, NewSNWritebackDispatcher(&recordingSNWritebackFailures{}))
+		if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{Title: &title, CustomerApprovalRequired: &yes, CustomerReviewRequired: &yes}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		select {
+		case got := <-called:
+			if got.Title == nil || *got.Title != title {
+				t.Errorf("mirror title = %v, want %q", got.Title, title)
+			}
+			if got.CustomerApprovalRequired != nil || got.CustomerReviewRequired != nil {
+				t.Errorf("mirror saw the Postgres-only flags: %v/%v", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("mirror.PatchChangeRequest was never called")
+		}
+	})
+
+	t.Run("flags alone: nothing to mirror", func(t *testing.T) {
+		mirror := &stubMirrorChangeRequestService{
+			patchChangeRequest: func(context.Context, string, domain.PatchChangeRequestRequest) (domain.PatchChangeRequestResponse, error) {
+				t.Error("mirror was called for a PATCH that only carried the Postgres-only flags")
+				return domain.PatchChangeRequestResponse{}, nil
+			},
+		}
+		failures := &recordingSNWritebackFailures{}
+		svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{}, mirror, NewSNWritebackDispatcher(failures))
+		if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{CustomerApprovalRequired: &yes}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		time.Sleep(150 * time.Millisecond) // the dispatch is asynchronous; give a wrongly-fired one time to show
+		if got := failures.count(); got != 0 {
+			t.Errorf("writeback failures = %d, want 0", got)
+		}
+	})
+}
+
+// TestChangeRequestService_CreateChangeRequest_PassesCustomerGateFlags: both
+// Postgres create paths (plain and ServiceNow-first) hand the checkboxes to the
+// repository untouched.
+func TestChangeRequestService_CreateChangeRequest_PassesCustomerGateFlags(t *testing.T) {
+	yes, no := true, false
+	want := validCreateChangeRequestRequest()
+	want.CustomerApprovalRequired, want.CustomerReviewRequired = &yes, &no
+	ok := func() domain.CreateChangeRequestResponse {
+		resp := domain.CreateChangeRequestResponse{Message: "ok"}
+		resp.ChangeRequest.ID = testUUID
+		return resp
+	}
+
+	t.Run("plain", func(t *testing.T) {
+		var got domain.CreateChangeRequestRequest
+		repo := &stubChangeRequestRepo{
+			createChangeRequest: func(_ context.Context, r domain.CreateChangeRequestRequest, _ string) (domain.CreateChangeRequestResponse, error) {
+				got = r
+				return ok(), nil
+			},
+		}
+		svc := NewChangeRequestService(repo, stubUserRepo{})
+		ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+		if _, err := svc.CreateChangeRequest(ctx, want); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.CustomerApprovalRequired == nil || !*got.CustomerApprovalRequired || got.CustomerReviewRequired == nil || *got.CustomerReviewRequired {
+			t.Fatalf("repository saw %v/%v, want true/false", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+		}
+	})
+
+	t.Run("servicenow-first", func(t *testing.T) {
+		var got domain.CreateChangeRequestRequest
+		mirror := &stubMirrorChangeRequestService{
+			createChangeRequest: func(context.Context, domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+				return ok(), nil
+			},
+		}
+		repo := &stubChangeRequestRepo{
+			createChangeRequestFromServiceNow: func(_ context.Context, r domain.CreateChangeRequestRequest, _, _, _ string) (domain.CreateChangeRequestResponse, error) {
+				got = r
+				return ok(), nil
+			},
+		}
+		svc := NewChangeRequestServiceWithSNMirror(repo, stubUserRepo{}, mirror)
+		if _, err := svc.CreateChangeRequest(context.Background(), want); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got.CustomerApprovalRequired == nil || !*got.CustomerApprovalRequired || got.CustomerReviewRequired == nil || *got.CustomerReviewRequired {
+			t.Fatalf("repository saw %v/%v, want true/false", got.CustomerApprovalRequired, got.CustomerReviewRequired)
+		}
+	})
+}
+
+// TestChangeRequestService_GetChangeRequestApprovals_StampsViewerEmail is the
+// regression guard for "Approve/Reject disabled for the approver themselves":
+// an internal user resolved from the user token alone comes back from
+// AccessService.ResolveScope Unrestricted with an EMPTY ViewerEmail, and the
+// repository's markCanDecide leaves every canDecide false without one. The
+// service must therefore hand the repo an identity naming the caller (taken
+// from the same x-user-id-token DecideChangeRequestApproval uses). The scope
+// here is produced by the REAL AccessService, exactly as
+// callerIdentityMiddleware stamps it on the HTTP path.
+func TestChangeRequestService_GetChangeRequestApprovals_StampsViewerEmail(t *testing.T) {
+	const email = "jane.doe@example.com"
+
+	var seen repository.SearchScope
+	var seenOK bool
+	repo := &stubChangeRequestRepo{
+		getChangeRequestApprovals: func(ctx context.Context, _ string) (domain.ChangeRequestApprovals, error) {
+			seen, seenOK = repository.CallerIdentityFromContext(ctx)
+			return domain.ChangeRequestApprovals{}, nil
+		},
+	}
+	svc := NewChangeRequestService(repo, stubUserRepo{})
+
+	// The HTTP path: auth.Middleware validates the token, the identity
+	// middleware resolves + stamps the scope, the handler calls the service.
+	httpCtx := func(t *testing.T, access AccessService) context.Context {
+		t.Helper()
+		ctx := auth.WithIdentity(contextWithUserIDToken(fakeJWTWithEmail(t, email)), auth.Identity{Validated: true, UserEmail: email})
+		scope, err := access.ResolveScope(ctx)
+		if err != nil {
+			t.Fatalf("ResolveScope: %v", err)
+		}
+		return repository.WithCallerIdentity(ctx, scope)
+	}
+
+	t.Run("internal user resolved from the user token (no CSM-portal client config)", func(t *testing.T) {
+		access := NewAccessService(&fakeAccessRepo{users: []repository.AccessUser{userOf("INTERNAL", true)}}, AccessClientConfig{})
+		ctx := httpCtx(t, access)
+		if pre, _ := repository.CallerIdentityFromContext(ctx); pre.ViewerEmail != "" {
+			t.Fatalf("precondition: ResolveScope now sets ViewerEmail (%q); this regression test needs revisiting", pre.ViewerEmail)
+		}
+		seen, seenOK = repository.SearchScope{}, false
+		if _, err := svc.GetChangeRequestApprovals(ctx, testUUID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !seenOK || seen.ViewerEmail != email || !seen.Unrestricted {
+			t.Errorf("repo saw identity %+v (present=%v), want Unrestricted with ViewerEmail %q", seen, seenOK, email)
+		}
+	})
+
+	t.Run("an identity that already names the viewer is left alone", func(t *testing.T) {
+		ctx := repository.WithCallerIdentity(contextWithUserIDToken(fakeJWTWithEmail(t, "someone.else@example.com")),
+			repository.SearchScope{Unrestricted: true, ViewerEmail: email})
+		seen, seenOK = repository.SearchScope{}, false
+		if _, err := svc.GetChangeRequestApprovals(ctx, testUUID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if seen.ViewerEmail != email {
+			t.Errorf("ViewerEmail = %q, want it kept as %q", seen.ViewerEmail, email)
+		}
+	})
+
+	t.Run("no caller identity on ctx stays absent (fails closed, nothing invented)", func(t *testing.T) {
+		seen, seenOK = repository.SearchScope{}, true
+		if _, err := svc.GetChangeRequestApprovals(contextWithUserIDToken(fakeJWTWithEmail(t, email)), testUUID); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if seenOK {
+			t.Errorf("repo saw an identity %+v, want none", seen)
+		}
+	})
+}
+
+const (
+	scopeTestProjectID    = "11111111-2222-3333-4444-555555555555"
+	scopeTestDeploymentID = "66666666-7777-8888-9999-aaaaaaaaaaaa"
+)
+
+// The customer-scope fields are shape-checked (UUIDs, bounded) before anything
+// is written or sent anywhere, on create (plain and ServiceNow-first) and PATCH.
+func TestChangeRequestService_ScopeFields_ShapeValidation(t *testing.T) {
+	many := make([]string, maxChangeRequestScopeIDs+1)
+	for i := range many {
+		many[i] = scopeTestDeploymentID
+	}
+	bad := "not-a-uuid"
+	creates := map[string]func(*domain.CreateChangeRequestRequest){
+		"projectId":            func(r *domain.CreateChangeRequestRequest) { r.ProjectID = &bad },
+		"deploymentIds":        func(r *domain.CreateChangeRequestRequest) { r.DeploymentIDs = []string{bad} },
+		"deploymentProductIds": func(r *domain.CreateChangeRequestRequest) { r.DeploymentProductIDs = []string{bad} },
+		"too many":             func(r *domain.CreateChangeRequestRequest) { r.DeploymentIDs = many },
+	}
+	for name, mod := range creates {
+		mod := mod
+		t.Run("create/"+name, func(t *testing.T) {
+			req := validCreateChangeRequestRequest()
+			mod(&req)
+			mirror := &stubMirrorChangeRequestService{createChangeRequest: func(context.Context, domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+				t.Fatal("ServiceNow was called for an invalid request")
+				return domain.CreateChangeRequestResponse{}, nil
+			}}
+			for label, svc := range map[string]ChangeRequestService{
+				"plain":            NewChangeRequestService(&stubChangeRequestRepo{}, stubUserRepo{}),
+				"servicenow-first": NewChangeRequestServiceWithSNMirror(&stubChangeRequestRepo{}, stubUserRepo{}, mirror),
+			} {
+				_, err := svc.CreateChangeRequest(contextWithUserIDToken(fakeJWTWithEmail(t, "a@example.com")), req)
+				var ve *apierror.ValidationError
+				if !asValidationError(err, &ve) {
+					t.Fatalf("%s: expected *apierror.ValidationError, got %T: %v", label, err, err)
+				}
+			}
+		})
+	}
+
+	patches := map[string]domain.PatchChangeRequestRequest{
+		"projectId":            {ProjectID: &bad},
+		"deploymentIds":        {DeploymentIDs: &[]string{bad}},
+		"deploymentProductIds": {DeploymentProductIDs: &[]string{bad}},
+		"too many":             {DeploymentIDs: &many},
+		"blank comment":        {Comment: func() *string { s := "  "; return &s }()},
+		"blank work note":      {WorkNote: func() *string { s := ""; return &s }()},
+	}
+	for name, req := range patches {
+		req := req
+		t.Run("patch/"+name, func(t *testing.T) {
+			svc := NewChangeRequestService(&stubChangeRequestRepo{}, stubUserRepo{}) // repo panics if reached
+			_, err := svc.PatchChangeRequest(contextWithUserIDToken(fakeJWTWithEmail(t, "a@example.com")), testUUID, req)
+			var ve *apierror.ValidationError
+			if !asValidationError(err, &ve) {
+				t.Fatalf("expected *apierror.ValidationError, got %T: %v", err, err)
+			}
+		})
+	}
+}
+
+// PATCH accepts the scope fields and the journal entries (alone), hands them to
+// the repository untouched, and rejects only durationInput.
+func TestChangeRequestService_PatchChangeRequest_ScopeFieldsReachTheRepository(t *testing.T) {
+	var got domain.PatchChangeRequestRequest
+	repo := &stubChangeRequestRepo{patchChangeRequest: func(_ context.Context, id string, req domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+		got = req
+		return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+	}}
+	svc := NewChangeRequestService(repo, stubUserRepo{})
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	comment, note := "hello", "internal"
+	for name, req := range map[string]domain.PatchChangeRequestRequest{
+		"deploymentIds":        {DeploymentIDs: &[]string{scopeTestDeploymentID}},
+		"empty deploymentIds":  {DeploymentIDs: &[]string{}},
+		"deploymentProductIds": {DeploymentProductIDs: &[]string{scopeTestDeploymentID}},
+		"comment":              {Comment: &comment},
+		"workNote":             {WorkNote: &note},
+		"projectId":            {ProjectID: func() *string { s := scopeTestProjectID; return &s }()},
+	} {
+		got = domain.PatchChangeRequestRequest{}
+		if _, err := svc.PatchChangeRequest(ctx, testUUID, req); err != nil {
+			t.Fatalf("%s alone: %v", name, err)
+		}
+		if got.DeploymentIDs != req.DeploymentIDs || got.DeploymentProductIDs != req.DeploymentProductIDs ||
+			got.Comment != req.Comment || got.WorkNote != req.WorkNote || got.ProjectID != req.ProjectID {
+			t.Fatalf("%s: the repository saw a different request", name)
+		}
+	}
+}
+
+// The dual-write mirror gets only what ServiceNow models: projectId on PATCH,
+// comment and workNote go through; deploymentIds and deploymentProductIds
+// (Postgres-derived) are stripped; a
+// PATCH carrying only those has nothing to mirror.
+func TestChangeRequestService_PatchChangeRequest_ScopeFieldsStayOutOfTheMirror(t *testing.T) {
+	repo := &stubChangeRequestRepo{patchChangeRequest: func(_ context.Context, id string, _ domain.PatchChangeRequestRequest, _ string) (domain.ChangeRequest, error) {
+		return domain.ChangeRequest{SearchChangeRequestView: domain.SearchChangeRequestView{ID: id}}, nil
+	}}
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "jane.doe@example.com"))
+	project, comment := scopeTestProjectID, "mirrored comment"
+
+	t.Run("mixed: scope lists stripped, project and journal mirrored", func(t *testing.T) {
+		called := make(chan domain.PatchChangeRequestRequest, 1)
+		mirror := &stubMirrorChangeRequestService{patchChangeRequest: func(_ context.Context, _ string, r domain.PatchChangeRequestRequest) (domain.PatchChangeRequestResponse, error) {
+			called <- r
+			return domain.PatchChangeRequestResponse{}, nil
+		}}
+		svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{}, mirror, NewSNWritebackDispatcher(&recordingSNWritebackFailures{}))
+		ids := []string{scopeTestDeploymentID}
+		if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{
+			ProjectID: &project, Comment: &comment, DeploymentIDs: &ids, DeploymentProductIDs: &ids,
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		select {
+		case got := <-called:
+			if got.DeploymentIDs != nil || got.DeploymentProductIDs != nil {
+				t.Errorf("mirror saw the Postgres-only lists: %v/%v", got.DeploymentIDs, got.DeploymentProductIDs)
+			}
+			if got.ProjectID == nil || *got.ProjectID != project || got.Comment == nil || *got.Comment != comment {
+				t.Errorf("mirror lost projectId/comment: %v/%v", got.ProjectID, got.Comment)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("mirror.PatchChangeRequest was never called")
+		}
+	})
+
+	t.Run("scope lists alone: nothing to mirror", func(t *testing.T) {
+		mirror := &stubMirrorChangeRequestService{patchChangeRequest: func(context.Context, string, domain.PatchChangeRequestRequest) (domain.PatchChangeRequestResponse, error) {
+			t.Error("mirror was called for a PATCH that only carried Postgres-only scope lists")
+			return domain.PatchChangeRequestResponse{}, nil
+		}}
+		svc := NewChangeRequestServiceWithSNWriteback(repo, stubUserRepo{}, mirror, NewSNWritebackDispatcher(&recordingSNWritebackFailures{}))
+		ids := []string{scopeTestDeploymentID}
+		if _, err := svc.PatchChangeRequest(ctx, testUUID, domain.PatchChangeRequestRequest{DeploymentIDs: &ids}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		time.Sleep(150 * time.Millisecond)
+	})
+}
+
+// ServiceNow-first create: the scope selection is validated against PostgreSQL
+// BEFORE ServiceNow is called (a refusal afterwards would strand the change
+// request in ServiceNow); ServiceNow then receives the request without the
+// fields it cannot model, while PostgreSQL receives all of them.
+func TestChangeRequestService_CreateChangeRequest_ScopeValidatedBeforeSNAndStrippedFromIt(t *testing.T) {
+	project := scopeTestProjectID
+	category, comment, note := domain.ChangeRequestCategoryDevOps, "c", "w"
+	req := validCreateChangeRequestRequest()
+	req.ProjectID, req.DeploymentIDs = &project, []string{scopeTestDeploymentID}
+	req.DeploymentProductIDs = []string{scopeTestDeploymentID}
+	req.Category, req.Comment, req.WorkNote = &category, &comment, &note
+
+	t.Run("refused by PostgreSQL: ServiceNow never called", func(t *testing.T) {
+		mirror := &stubMirrorChangeRequestService{createChangeRequest: func(context.Context, domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+			t.Fatal("ServiceNow was called although the scope selection is invalid")
+			return domain.CreateChangeRequestResponse{}, nil
+		}}
+		repo := &stubChangeRequestRepo{validateChangeRequestLinks: func(context.Context, domain.ChangeRequestLinkSelection) (domain.ChangeRequestLinkSet, error) {
+			return domain.ChangeRequestLinkSet{}, &apierror.ValidationError{Msg: "deploymentIds contains a deployment that does not belong to the selected project: x"}
+		}}
+		svc := NewChangeRequestServiceWithSNMirror(repo, stubUserRepo{}, mirror)
+		_, err := svc.CreateChangeRequest(context.Background(), req)
+		var ve *apierror.ValidationError
+		if !asValidationError(err, &ve) || !strings.Contains(ve.Msg, "does not belong to the selected project") {
+			t.Fatalf("err = %v, want the repository's ValidationError", err)
+		}
+	})
+
+	t.Run("customerGroupId / environmentIds: refused before anything else, ServiceNow never called", func(t *testing.T) {
+		mirror := &stubMirrorChangeRequestService{createChangeRequest: func(context.Context, domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+			t.Fatal("ServiceNow was called although a removed field was sent")
+			return domain.CreateChangeRequestResponse{}, nil
+		}}
+		repo := &stubChangeRequestRepo{validateChangeRequestLinks: func(context.Context, domain.ChangeRequestLinkSelection) (domain.ChangeRequestLinkSet, error) {
+			t.Fatal("the repository was consulted for a request carrying a removed field")
+			return domain.ChangeRequestLinkSet{}, nil
+		}}
+		for name, tc := range map[string]struct {
+			mod  func(*domain.CreateChangeRequestRequest)
+			want string
+		}{
+			"customerGroupId": {func(r *domain.CreateChangeRequestRequest) { g := scopeTestProjectID; r.CustomerGroupID = &g },
+				"customerGroupId is no longer accepted: the customer group is derived from the customer project's registered contacts"},
+			"environmentIds": {func(r *domain.CreateChangeRequestRequest) { r.EnvironmentIDs = []string{scopeTestDeploymentID} },
+				"environmentIds is no longer supported: deployments carry the environment"},
+		} {
+			r := req
+			tc.mod(&r)
+			for label, svc := range map[string]ChangeRequestService{
+				"plain":            NewChangeRequestService(repo, stubUserRepo{}),
+				"servicenow-first": NewChangeRequestServiceWithSNMirror(repo, stubUserRepo{}, mirror),
+			} {
+				_, err := svc.CreateChangeRequest(context.Background(), r)
+				var ve *apierror.ValidationError
+				if !asValidationError(err, &ve) || ve.Msg != tc.want {
+					t.Fatalf("%s/%s: err = %v, want ValidationError %q", name, label, err, tc.want)
+				}
+			}
+		}
+	})
+
+	t.Run("accepted: ServiceNow gets the modelled fields only, PostgreSQL gets everything", func(t *testing.T) {
+		var sawSel domain.ChangeRequestLinkSelection
+		var toSN, toPG domain.CreateChangeRequestRequest
+		mirror := &stubMirrorChangeRequestService{createChangeRequest: func(_ context.Context, r domain.CreateChangeRequestRequest) (domain.CreateChangeRequestResponse, error) {
+			toSN = r
+			resp := domain.CreateChangeRequestResponse{}
+			resp.ChangeRequest.ID = testUUID
+			return resp, nil
+		}}
+		repo := &stubChangeRequestRepo{
+			validateChangeRequestLinks: func(_ context.Context, sel domain.ChangeRequestLinkSelection) (domain.ChangeRequestLinkSet, error) {
+				sawSel = sel
+				return domain.ChangeRequestLinkSet{}, nil
+			},
+			createChangeRequestFromServiceNow: func(_ context.Context, r domain.CreateChangeRequestRequest, id, _, _ string) (domain.CreateChangeRequestResponse, error) {
+				toPG = r
+				resp := domain.CreateChangeRequestResponse{}
+				resp.ChangeRequest.ID = id
+				return resp, nil
+			},
+		}
+		svc := NewChangeRequestServiceWithSNMirror(repo, stubUserRepo{}, mirror)
+		if _, err := svc.CreateChangeRequest(context.Background(), req); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if sawSel.ProjectID == nil || *sawSel.ProjectID != project || len(sawSel.DeploymentIDs) != 1 || len(sawSel.DeploymentProductIDs) != 1 {
+			t.Errorf("validated selection = %+v", sawSel)
+		}
+		if toSN.ProjectID != nil || toSN.DeploymentIDs != nil || toSN.DeploymentProductIDs != nil {
+			t.Errorf("ServiceNow saw the Postgres-only scope: %+v", toSN)
+		}
+		if toSN.Category == nil || toSN.Comment == nil || toSN.WorkNote == nil {
+			t.Errorf("ServiceNow lost category/comment/workNote: %+v", toSN)
+		}
+		if toPG.ProjectID == nil || len(toPG.DeploymentIDs) != 1 || len(toPG.DeploymentProductIDs) != 1 || toPG.Comment == nil || toPG.WorkNote == nil {
+			t.Errorf("PostgreSQL did not get the full request: %+v", toPG)
+		}
+	})
+}
+
+// The form's lookup validates its input and is Postgres-only.
+func TestChangeRequestService_GetChangeRequestLinkOptions(t *testing.T) {
+	var got domain.ChangeRequestLinkOptionsRequest
+	repo := &stubChangeRequestRepo{getChangeRequestLinkOptions: func(_ context.Context, r domain.ChangeRequestLinkOptionsRequest) (domain.ChangeRequestLinkOptionsResponse, error) {
+		got = r
+		return domain.ChangeRequestLinkOptionsResponse{
+			Deployments:      []domain.ChangeRequestDeploymentOption{{ID: "d"}},
+			CustomerContacts: []domain.ChangeRequestCustomerContact{{ID: "c", Name: "Jane Doe", Email: "jane@example.com"}},
+		}, nil
+	}}
+	svc := NewChangeRequestService(repo, stubUserRepo{})
+	resp, err := svc.GetChangeRequestLinkOptions(context.Background(), domain.ChangeRequestLinkOptionsRequest{ProjectID: scopeTestProjectID, DeploymentIDs: []string{scopeTestDeploymentID}})
+	if err == nil && (len(resp.CustomerContacts) != 1 || resp.CustomerContacts[0].ID != "c") {
+		t.Fatalf("customerContacts not passed through: %+v", resp.CustomerContacts)
+	}
+	if err != nil || len(resp.Deployments) != 1 || got.ProjectID != scopeTestProjectID || len(got.DeploymentIDs) != 1 {
+		t.Fatalf("valid request: resp=%+v err=%v got=%+v", resp, err, got)
+	}
+	for name, req := range map[string]domain.ChangeRequestLinkOptionsRequest{
+		"missing projectId":   {},
+		"bad projectId":       {ProjectID: "nope"},
+		"bad deploymentIds":   {ProjectID: scopeTestProjectID, DeploymentIDs: []string{"nope"}},
+		"too many deployment": {ProjectID: scopeTestProjectID, DeploymentIDs: make([]string, maxChangeRequestScopeIDs+1)},
+	} {
+		_, err := svc.GetChangeRequestLinkOptions(context.Background(), req)
+		var ve *apierror.ValidationError
+		if !asValidationError(err, &ve) {
+			t.Fatalf("%s: expected *apierror.ValidationError, got %T: %v", name, err, err)
+		}
+	}
+	// The ServiceNow-only service refuses.
+	_, err = (&snChangeRequestService{}).GetChangeRequestLinkOptions(context.Background(), domain.ChangeRequestLinkOptionsRequest{ProjectID: scopeTestProjectID})
+	var ve *apierror.ValidationError
+	if !asValidationError(err, &ve) {
+		t.Fatalf("servicenow data source: expected *apierror.ValidationError, got %T: %v", err, err)
+	}
+}
+
+// customerGroupId / environmentIds on PATCH are refused with a clear 400 before
+// the repository is reached (and so before anything is mirrored to ServiceNow),
+// whatever else the request carries.
+func TestChangeRequestService_PatchChangeRequest_RefusesRemovedFields(t *testing.T) {
+	svc := NewChangeRequestService(&stubChangeRequestRepo{}, stubUserRepo{}) // repo panics if reached
+	ctx := contextWithUserIDToken(fakeJWTWithEmail(t, "a@example.com"))
+	title := "t"
+	group := scopeTestProjectID
+	var none *string
+	groupPtr := &group
+	for name, tc := range map[string]struct {
+		req  domain.PatchChangeRequestRequest
+		want string
+	}{
+		"customerGroupId":      {domain.PatchChangeRequestRequest{Title: &title, CustomerGroupID: &groupPtr}, "customerGroupId is no longer accepted: the customer group is derived from the customer project's registered contacts"},
+		"customerGroupId null": {domain.PatchChangeRequestRequest{CustomerGroupID: &none}, "customerGroupId is no longer accepted: the customer group is derived from the customer project's registered contacts"},
+		"environmentIds":       {domain.PatchChangeRequestRequest{Title: &title, EnvironmentIDs: &[]string{scopeTestDeploymentID}}, "environmentIds is no longer supported: deployments carry the environment"},
+	} {
+		_, err := svc.PatchChangeRequest(ctx, testUUID, tc.req)
+		var ve *apierror.ValidationError
+		if !asValidationError(err, &ve) || ve.Msg != tc.want {
+			t.Fatalf("%s: err = %v, want ValidationError %q", name, err, tc.want)
+		}
 	}
 }

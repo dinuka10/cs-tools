@@ -19,7 +19,7 @@
 import { useMemo, type JSX, type ReactNode } from "react";
 import type { ScheduleTeam } from "../types";
 import { teamColour } from "./rotaHues";
-import { TeamColourContext } from "./teamColourContext";
+import { TeamColourContext, TeamNameContext } from "./teamColourContext";
 
 /** Gives everything below it the colour for a team. See TeamColourContext. */
 export function TeamColourProvider({
@@ -35,5 +35,14 @@ export function TeamColourProvider({
     return (teamKey: string): string => teamColour(order.get(teamKey.toLowerCase()));
   }, [teams]);
 
-  return <TeamColourContext.Provider value={colourOf}>{children}</TeamColourContext.Provider>;
+    const nameOf = useMemo(() => {
+    const byKey = new Map(teams.map((t) => [t.key.toLowerCase(), t.name]));
+    return (teamKey: string): string => byKey.get(teamKey.toLowerCase()) ?? teamKey;
+  }, [teams]);
+
+  return (
+    <TeamColourContext.Provider value={colourOf}>
+      <TeamNameContext.Provider value={nameOf}>{children}</TeamNameContext.Provider>
+    </TeamColourContext.Provider>
+  );
 }

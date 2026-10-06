@@ -40,6 +40,8 @@ type fakeContactRepo struct {
 	deactivateStates []domain.UpsertSalesforceIngestStateRequest
 	deactivateFound  bool
 	deactivateErr    error
+	// deactivateAffected is the users the DELETED path reports deactivating.
+	deactivateAffected []domain.AffectedUser
 }
 
 func (f *fakeContactRepo) Upsert(_ context.Context, in domain.SalesforceContactUpsert, state domain.UpsertSalesforceIngestStateRequest) (domain.SalesforceContactUpsertResult, error) {
@@ -51,10 +53,13 @@ func (f *fakeContactRepo) Upsert(_ context.Context, in domain.SalesforceContactU
 	return domain.SalesforceContactUpsertResult{UserID: "user-1", AccountContactID: "ac-1", CreatedUser: true, CreatedAccountContact: true}, nil
 }
 
-func (f *fakeContactRepo) DeactivateBySfID(_ context.Context, id string, state domain.UpsertSalesforceIngestStateRequest) (bool, error) {
+func (f *fakeContactRepo) DeactivateBySfID(_ context.Context, id string, state domain.UpsertSalesforceIngestStateRequest) (bool, []domain.AffectedUser, error) {
 	f.deactivated = append(f.deactivated, id)
 	f.deactivateStates = append(f.deactivateStates, state)
-	return f.deactivateFound, f.deactivateErr
+	if f.deactivateErr != nil {
+		return false, nil, f.deactivateErr
+	}
+	return f.deactivateFound, f.deactivateAffected, nil
 }
 
 // ---- fixtures ------------------------------------------------------------

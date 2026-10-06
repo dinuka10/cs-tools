@@ -82,6 +82,53 @@ type caseService struct {
 	// (unconfigured) means this can never be confirmed, so that hook skips
 	// entirely rather than guessing.
 	csEngineerRole string
+	// referenceDataRepo/deployedProductRepo back CreateCase's own project-type
+	// product-category allow-list enforcement
+	// (validateDeployedProductCategoryForType) -- both nil unless wired via
+	// WithProductCategoryEnforcement, same optional-dependency posture as
+	// publisher/snMirror above. Wired only for the plain-Postgres and
+	// dual-write data sources (routes.go); DATA_SOURCE=servicenow has no
+	// route to either, by explicit product decision -- see
+	// WithProductCategoryEnforcement's own doc comment.
+	referenceDataRepo   repository.ReferenceDataRepository
+	deployedProductRepo repository.DeployedProductRepository
+}
+
+// WithProductCategoryEnforcement attaches the optional project-type
+// category-allow-list check CreateCase applies at creation time (see
+// validateDeployedProductCategoryForType) to an already-constructed
+// CaseService. A separate wiring step rather than extending
+// NewCaseService/NewCaseServiceWithSNWriteback's own signatures -- those
+// constructors' doc comments already establish the precedent this follows:
+// every existing call site (every test, every other DataSource branch in
+// routes.go) keeps working completely unchanged, since this capability is
+// optional and nil-safe to omit. A no-op (returns svc unchanged) if svc is
+// not a *caseService -- defensive; every real construction path is.
+func WithProductCategoryEnforcement(svc CaseService, referenceDataRepo repository.ReferenceDataRepository, deployedProductRepo repository.DeployedProductRepository) CaseService {
+	if cs, ok := svc.(*caseService); ok {
+		cs.referenceDataRepo = referenceDataRepo
+		cs.deployedProductRepo = deployedProductRepo
+	}
+	return svc
+}
+
+// WithCSEngineerRole attaches CS_ENGINEER_ROLE to an already-constructed
+// CaseService built via the plain NewCaseService (which has no
+// csEngineerRole parameter at all -- unlike NewCaseServiceWithSNWriteback,
+// which already takes one). Without this, isSupportEngineerAuthor always
+// returns false on that path, so a comment's author can never be confirmed
+// as a support engineer: the response-SLA early-completion signal and
+// events.CommentAddedPayload.IsSupportEngineerResponse both silently stay
+// unset for every plain DATA_SOURCE=postgres deployment. Same post-
+// construction wiring shape as WithProductCategoryEnforcement, for the same
+// reason -- NewCaseService already has 60+ call sites (every test, every
+// other DataSource branch in routes.go), and a signature change would touch
+// all of them for a capability that's optional and nil-safe to omit.
+func WithCSEngineerRole(svc CaseService, csEngineerRole string) CaseService {
+	if cs, ok := svc.(*caseService); ok {
+		cs.csEngineerRole = csEngineerRole
+	}
+	return svc
 }
 
 // caseResolutionFields carries the resolution data that accompanies a
@@ -419,6 +466,85 @@ func validateCreateCaseRequest(req *domain.CreateCaseRequest) error {
 	return nil
 }
 
+// validateDeployedProductCategoryForType enforces a project type's own
+// Default Case/SR Creation Product Category allow-list
+// (project_type.default_case_product_categories for req.Type == "case",
+// project_type.sr_product_categories for "service_request" -- migration
+// 0130_project_type_feature_entitlement.sql,
+// ReferenceDataRepository.GetProjectByID) at CreateCase time. Closes a real
+// gap: these allow-lists were previously only advisory, surfaced read-only
+// via GET /projects/{id}/features for the frontend's own product dropdown
+// to filter against (see SearchDeployedProducts' fail-open ProductCategories
+// handling) -- nothing ever stopped a caller from creating a case/SR against
+// a deployed product whose category didn't match the project type's
+// configured requirement at all.
+//
+// Only "case"/"service_request" are restricted (the two types the matrix
+// actually names); every other type is unaffected. A project type with no
+// allow-list configured for the request's own type ("N/A" in the matrix --
+// an empty/nil slice) is unrestricted, exactly as before this check
+// existed, as is a project with no project_type linked at all.
+//
+// A deployed product with NO category set (the majority of real rows
+// today) FAILS this check once a project type restricts the request's
+// type -- fail-closed, by deliberate product decision: the whole point of
+// this gate is to make categorizing a deployed product matter, and the CSM
+// Portal's own Create/Edit Deployed Product dialogs are what let staff set
+// one. This is a stricter posture than SearchDeployedProducts' own
+// fail-open NULL-category read-side filter, and deliberately so -- that
+// filter exists to avoid hiding products from a list; this exists to
+// enforce a real creation-time requirement.
+//
+// Nil-safe: a caseService with neither referenceDataRepo nor
+// deployedProductRepo wired (see WithProductCategoryEnforcement) skips this
+// entirely, the same posture as every other optional dependency on this
+// struct (publisher, snMirror, ...) -- including on
+// DATA_SOURCE=servicenow, which has no route to either Postgres-only
+// repository at all.
+func (s *caseService) validateDeployedProductCategoryForType(ctx context.Context, req domain.CreateCaseRequest) error {
+	if s.referenceDataRepo == nil || s.deployedProductRepo == nil {
+		return nil
+	}
+	if req.Type != "case" && req.Type != "service_request" {
+		return nil
+	}
+
+	found, projectType, err := s.referenceDataRepo.GetProjectByID(ctx, req.ProjectID)
+	if err != nil {
+		return err
+	}
+	if !found || projectType == nil {
+		return nil
+	}
+
+	allowed := projectType.DefaultCaseProductCategories
+	fieldLabel := "case"
+	if req.Type == "service_request" {
+		allowed = projectType.SrProductCategories
+		fieldLabel = "service request"
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	allowedLower := lowercaseAll(allowed)
+
+	category, err := s.deployedProductRepo.GetDeployedProductCategory(ctx, req.DeployedProductID)
+	if err != nil {
+		return err
+	}
+	if category != nil {
+		for _, a := range allowedLower {
+			if a == *category {
+				return nil
+			}
+		}
+	}
+	return &apierror.ValidationError{Msg: fmt.Sprintf(
+		"deployedProductId must reference a product categorized as one of [%s] for %s creation under this project's type",
+		strings.Join(allowedLower, ", "), fieldLabel,
+	)}
+}
+
 // CreateCase implements CaseService.
 //
 // Under DATA_SOURCE=postgres-servicenow-dual-write (snMirror != nil), this
@@ -456,6 +582,9 @@ func (s *caseService) CreateCase(ctx context.Context, req domain.CreateCaseReque
 		if err := validateUUIDs("deployedProductId", []string{req.DeployedProductID}); err != nil {
 			return domain.CreateCaseResponse{}, err
 		}
+	}
+	if err := s.validateDeployedProductCategoryForType(ctx, req); err != nil {
+		return domain.CreateCaseResponse{}, err
 	}
 
 	if s.snMirror != nil {
@@ -726,7 +855,14 @@ func (s *caseService) mirrorInitialSNComments(ctx context.Context, caseID string
 		// run. SearchCaseComments orders by created_on DESC, so stamping
 		// NOW() here instead would misorder mirrored comments relative to
 		// their real ServiceNow chronology (caught in review on PR #2204).
-		if _, err := s.repo.CreateCaseComment(ctx, domain.CreateCaseCommentRequest{
+		//
+		// Written as the system (CreateCaseCommentAsSystem): ServiceNow's
+		// initial comments can include WORK_NOTE rows, which an external
+		// caller may not write (migration 0191), and the customer who just
+		// created this case is the caller here. The case was created under that
+		// caller's identity, so only this mirror of ServiceNow's own rows is
+		// elevated.
+		if _, err := s.repo.CreateCaseCommentAsSystem(ctx, domain.CreateCaseCommentRequest{
 			CaseID:    caseID,
 			Type:      c.Type,
 			Content:   c.Content,
@@ -995,6 +1131,11 @@ func (s *caseService) AccountDefaultWatcherEmails(ctx context.Context, projectID
 	return s.repo.AccountDefaultWatcherEmails(ctx, projectID)
 }
 
+// ProjectOnboardingInfo implements CaseService.
+func (s *caseService) ProjectOnboardingInfo(ctx context.Context, projectID string) (string, bool, error) {
+	return s.repo.ProjectOnboardingInfo(ctx, projectID)
+}
+
 // GetCaseEtaSharedOn implements CaseService.
 func (s *caseService) GetCaseEtaSharedOn(ctx context.Context, caseID string) (*time.Time, error) {
 	return s.repo.GetCaseEtaSharedOn(ctx, caseID)
@@ -1006,45 +1147,65 @@ var validCommentType = map[domain.CommentType]bool{
 	domain.CommentTypeActivity: true,
 }
 
-// CreateCaseComment implements CaseService.
-func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
+// commentAuthor resolves who is writing from the x-user-id-token: their email
+// and display name.
+func (s *caseService) commentAuthor(ctx context.Context) (email, name string, err error) {
 	token := middleware.UserIDTokenFromContext(ctx)
 	if token == "" {
-		return domain.CreateCaseCommentResponse{}, &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
+		return "", "", &apierror.UnauthorizedError{Msg: "x-user-id-token header is required"}
 	}
-	email, err := emailFromJWT(token)
+	email, err = emailFromJWT(token)
 	if err != nil {
-		return domain.CreateCaseCommentResponse{}, &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
+		return "", "", &apierror.ValidationError{Msg: "x-user-id-token: " + err.Error()}
 	}
 	user, err := s.userRepo.GetUserByEmail(ctx, email)
 	if err != nil {
+		return "", "", err
+	}
+	name = strings.TrimSpace(user.FirstName + " " + user.LastName)
+	if name == "" {
+		name = user.Email
+	}
+	return user.Email, name, nil
+}
+
+// CreateCaseComment implements CaseService.
+func (s *caseService) CreateCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
+	email, name, err := s.commentAuthor(ctx)
+	if err != nil {
 		return domain.CreateCaseCommentResponse{}, err
 	}
-	authorName := strings.TrimSpace(user.FirstName + " " + user.LastName)
-	if authorName == "" {
-		authorName = user.Email
+	return s.createCaseCommentAs(ctx, req, email, name, false)
+}
+
+// CreateInternalCaseComment implements CaseService: CreateCaseComment with the
+// row itself written as the system identity (see the interface comment).
+func (s *caseService) CreateInternalCaseComment(ctx context.Context, req domain.CreateCaseCommentRequest) (domain.CreateCaseCommentResponse, error) {
+	email, name, err := s.commentAuthor(ctx)
+	if err != nil {
+		return domain.CreateCaseCommentResponse{}, err
 	}
-	return s.createCaseCommentAs(ctx, req, user.Email, authorName)
+	return s.createCaseCommentAs(ctx, req, email, name, true)
 }
 
 // CreateCaseCommentAs implements CaseService for a caller that already knows
 // the acting email and has no x-user-id-token to resolve one from -- see the
 // CaseService interface's own doc comment on this method. Mirrors
-// AddCaseTagAs/addCaseTagAs: no GetUserByEmail lookup happens here, since
-// the configured M2M service-account email (config.Config.
-// M2MTrustedActorEmails) is not guaranteed to be a provisioned sys_user-
-// equivalent row -- actorEmail is used directly for both created_by and the
-// published event's author name rather than risking a hard failure over a
-// service account that was never expected to exist as a real user.
+// AddCaseTagAs/addCaseTagAs: no GetUserByEmail lookup happens here, since the
+// actorEmail an M2M caller trusted via config.Config.M2MClientIDs claims is
+// not guaranteed to be a provisioned sys_user-equivalent row -- actorEmail is
+// used directly for both created_by and the published event's author name
+// rather than risking a hard failure over a service account that was never
+// expected to exist as a real user.
 func (s *caseService) CreateCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail string) (domain.CreateCaseCommentResponse, error) {
-	return s.createCaseCommentAs(ctx, req, actorEmail, actorEmail)
+	return s.createCaseCommentAs(ctx, req, actorEmail, actorEmail, false)
 }
 
 // createCaseCommentAs is the shared validation/create logic behind both
 // CreateCaseComment (token-resolved actor) and CreateCaseCommentAs (caller-
 // supplied actor) -- everything past actor resolution is identical between
 // the two.
-func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail, authorName string) (domain.CreateCaseCommentResponse, error) {
+func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.CreateCaseCommentRequest, actorEmail, authorName string, asSystem bool) (domain.CreateCaseCommentResponse, error) {
 	if err := validateUUIDs("caseId", []string{req.CaseID}); err != nil {
 		return domain.CreateCaseCommentResponse{}, err
 	}
@@ -1057,9 +1218,26 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 	// comment.created_by (migration 0040) is a free-text VARCHAR, not a
 	// UUID FK -- see CaseRepository.CreateCaseComment's own doc comment.
 	req.CreatedBy = actorEmail
-	c, err := s.repo.CreateCaseComment(ctx, req, nil)
+	var c domain.CaseComment
+	var err error
+	if asSystem {
+		c, err = s.repo.CreateCaseCommentAsSystem(ctx, req, nil)
+	} else {
+		c, err = s.repo.CreateCaseComment(ctx, req, nil)
+	}
 	if err != nil {
 		return domain.CreateCaseCommentResponse{}, err
+	}
+
+	// Computed once, used by both the SLA-engine hook and the published
+	// event's own IsSupportEngineerResponse flag below -- see
+	// isSupportEngineerAuthor's own doc comment. Only resolved when at
+	// least one of them is actually configured, so a deployment with
+	// neither the native SLA engine nor Event Hub publishing enabled pays
+	// no extra lookup on every comment.
+	var isSupportEngineerResponse bool
+	if req.Type == domain.CommentTypeComment && (s.slaEngine != nil || s.publisher != nil) {
+		isSupportEngineerResponse = s.isSupportEngineerAuthor(ctx, req.CaseID, actorEmail)
 	}
 
 	// Best-effort, in-process only -- deliberately not gated on s.publisher
@@ -1068,7 +1246,7 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 	// its own, separate ServiceNow-mode hook: a deployment without Event
 	// Hub configured must not lose SLA tracking as a side effect either.
 	if req.Type == domain.CommentTypeComment {
-		s.completeResponseSLAOnComment(ctx, req.CaseID, actorEmail)
+		s.completeResponseSLAOnComment(ctx, req.CaseID, isSupportEngineerResponse)
 	}
 
 	// Event publishing follows the write, not DATA_SOURCE -- see
@@ -1082,7 +1260,7 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 			slog.ErrorContext(ctx, "create comment: enrich case for case.comment_added publish failed", "caseId", req.CaseID)
 		} else {
 			cv.WatchList = s.filterActiveWatchListUsers(ctx, cv, cv.WatchList)
-			publishCommentAddedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, cv, req, c.ID, authorName)
+			publishCommentAddedEvent(ctx, s.publisher, s.AccountDefaultWatcherEmails, s.ProjectOnboardingInfo, cv, req, c.ID, authorName, actorEmail, isSupportEngineerResponse)
 		}
 	}
 
@@ -1135,40 +1313,54 @@ func (s *caseService) createCaseCommentAs(ctx context.Context, req domain.Create
 // completeResponseSLAOnComment best-effort marks the case's CSM-native
 // "response" SLA clock complete (SLAEngineService.CompleteResponseClock,
 // idempotent -- see repository.SLAEngineRepository.CompleteClock's own doc
-// comment) when actorEmail holds s.csEngineerRole. This is caseService's
-// own equivalent of snCaseService.applyResponseSLAOnComment, which caseService
-// never reached before now -- a real, live-observed gap: a support
-// engineer's reply never stopped the response clock on this path, so it
-// kept running to breach regardless of how quickly the case was actually
-// answered. Shares the one CS_ENGINEER_ROLE config with that hook --
+// comment) when isSupportEngineerResponse is true (see
+// isSupportEngineerAuthor below for how that's decided). This is
+// caseService's own equivalent of snCaseService.applyResponseSLAOnComment,
+// which caseService never reached before now -- a real, live-observed gap: a
+// support engineer's reply never stopped the response clock on this path,
+// so it kept running to breach regardless of how quickly the case was
+// actually answered. Shares the one CS_ENGINEER_ROLE config with that hook --
 // "CS engineer" and "support engineer" are the same real-world role, just
 // checked here via a different lookup (GetUserRoles) than snCaseService's
 // own.
 //
-// Skips entirely, rather than guessing, when: s.slaEngine or
-// s.csEngineerRole is unset (no database, or the role name isn't
-// configured); actorEmail doesn't resolve to a real user row (the M2M
-// CreateCaseCommentAs path deliberately has none -- see that method's own
-// doc comment, "no GetUserByEmail lookup happens here"); or the role lookup
-// itself fails. None of these fail the comment creation itself -- the
-// comment has already been written by the time this runs.
-func (s *caseService) completeResponseSLAOnComment(ctx context.Context, caseID, actorEmail string) {
-	if s.slaEngine == nil || s.csEngineerRole == "" {
-		return
-	}
-	user, err := s.userRepo.GetUserByEmail(ctx, actorEmail)
-	if err != nil {
-		return
-	}
-	roles, err := s.userRepo.GetUserRoles(ctx, user.ID)
-	if err != nil {
-		slog.ErrorContext(ctx, "create comment: response SLA not evaluated, user role lookup failed", "caseId", caseID)
-		return
-	}
-	if !slices.Contains(roles, s.csEngineerRole) {
+// Skips entirely, rather than guessing, when s.slaEngine is unset (no
+// database) or isSupportEngineerResponse is false -- the latter already
+// covers every reason isSupportEngineerAuthor itself can't confirm
+// authorship (s.csEngineerRole unset, actorEmail not resolving to a real
+// user row, or the role lookup failing). None of these fail the comment
+// creation itself -- the comment has already been written by the time this
+// runs.
+func (s *caseService) completeResponseSLAOnComment(ctx context.Context, caseID string, isSupportEngineerResponse bool) {
+	if s.slaEngine == nil || !isSupportEngineerResponse {
 		return
 	}
 	s.slaEngine.CompleteResponseClock(ctx, caseID)
+}
+
+// isSupportEngineerAuthor resolves whether actorEmail belongs to a user
+// holding s.csEngineerRole -- shared by completeResponseSLAOnComment (the
+// CSM-native SLA engine's own response-clock completion, above) and the
+// published case.comment_added event's own IsSupportEngineerResponse flag,
+// computed once per comment rather than twice. s.csEngineerRole unset (no
+// database, or the role name isn't configured), an actorEmail that doesn't
+// resolve to a real user row (the M2M CreateCaseCommentAs path deliberately
+// has none -- see that method's own doc comment), or a failed role lookup
+// all answer false -- can't confirm, not an error.
+func (s *caseService) isSupportEngineerAuthor(ctx context.Context, caseID, actorEmail string) bool {
+	if s.csEngineerRole == "" {
+		return false
+	}
+	user, err := s.userRepo.GetUserByEmail(ctx, actorEmail)
+	if err != nil {
+		return false
+	}
+	roles, err := s.userRepo.GetUserRoles(ctx, user.ID)
+	if err != nil {
+		slog.ErrorContext(ctx, "create comment: support-engineer role lookup failed", "caseId", caseID)
+		return false
+	}
+	return slices.Contains(roles, s.csEngineerRole)
 }
 
 // SearchCaseComments implements CaseService.
@@ -2830,6 +3022,18 @@ func (s *caseService) ConfirmCaseAttachment(ctx context.Context, id string) (dom
 // SearchCaseAttachments implements CaseService for the CSM-native (Postgres)
 // data source.
 //
+// referenceType "case" reads case_attachment (unchanged). "change_request",
+// "incident" and "conversation" are work_item subtypes and read the generic
+// work_item_attachment table via CaseRepository.SearchWorkItemAttachments;
+// "deployment" is not a work_item subtype and has no attachment table on
+// plain Postgres, where it is rejected with a validation error. Metadata
+// only: a work item with no attachments is a successful empty result.
+//
+// Stopgap: under DATA_SOURCE=postgres-servicenow-dual-write (s.snMirror !=
+// nil) a "deployment" search is delegated to the mirrored data source and its
+// response or error is returned as-is, until a Postgres-native deployment
+// attachment store exists. Every other reference type is unaffected.
+//
 // Read-path status decision: the underlying repository query filters out
 // 'pending' rows entirely (see caseRepo.SearchCaseAttachments), so a case's
 // attachment list never shows a still-uploading placeholder to other users.
@@ -2845,14 +3049,35 @@ func (s *caseService) SearchCaseAttachments(ctx context.Context, req domain.Sear
 	if err := validateUUIDs("referenceId", []string{req.ReferenceID}); err != nil {
 		return domain.SearchAttachmentsResponse{}, err
 	}
-	if req.ReferenceType != domain.ReferenceTypeCase {
-		return domain.SearchAttachmentsResponse{}, &apierror.ValidationError{Msg: "referenceType must be 'case' for this data source"}
+	if req.ReferenceType == domain.ReferenceTypeDeployment && s.snMirror != nil {
+		// No Postgres deployment attachment table yet: serve from the
+		// mirrored data source (SN) in dual-write mode. Plain Postgres mode
+		// (snMirror == nil) falls through to the validation error below.
+		return s.snMirror.SearchCaseAttachments(ctx, req)
+	}
+	isCase := req.ReferenceType == domain.ReferenceTypeCase
+	if !isCase {
+		// Non-case work items (change_request, incident, conversation) are
+		// backed by work_item_attachment; "deployment" is not a work_item
+		// subtype and has no attachment table on this data source.
+		if _, ok := repository.ReferenceTypeToWorkItemType[req.ReferenceType]; !ok {
+			return domain.SearchAttachmentsResponse{}, &apierror.ValidationError{Msg: fmt.Sprintf("referenceType %q is not supported for this data source: must be one of 'case', 'change_request', 'conversation', 'incident'", req.ReferenceType)}
+		}
 	}
 	if err := normalizePagination(&req.Pagination); err != nil {
 		return domain.SearchAttachmentsResponse{}, err
 	}
 
-	attachments, total, err := s.repo.SearchCaseAttachments(ctx, req.ReferenceID, req.Pagination)
+	var (
+		attachments []domain.Attachment
+		total       int
+		err         error
+	)
+	if isCase {
+		attachments, total, err = s.repo.SearchCaseAttachments(ctx, req.ReferenceID, req.Pagination)
+	} else {
+		attachments, total, err = s.repo.SearchWorkItemAttachments(ctx, req.ReferenceID, req.ReferenceType, req.Pagination)
+	}
 	if err != nil {
 		return domain.SearchAttachmentsResponse{}, err
 	}

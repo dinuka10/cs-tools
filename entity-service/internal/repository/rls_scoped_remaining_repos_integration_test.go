@@ -423,9 +423,9 @@ func TestRLSScopedRemaining_MembershipRepoUnderRLS(t *testing.T) {
 	repo := repository.NewProjectMembershipRepository(repository.NewScoped(pool))
 
 	t.Run("deactivating an unknown membership is a no-op on a context with no identity", func(t *testing.T) {
-		found, err := repo.DeactivateBySfID(context.Background(), "a0RSCOPED-NO-SUCH-MEMBERSHIP", nil)
-		if err != nil || found {
-			t.Errorf("DeactivateBySfID = %v, %v; want false, nil", found, err)
+		found, affected, err := repo.DeactivateBySfID(context.Background(), "a0RSCOPED-NO-SUCH-MEMBERSHIP", nil)
+		if err != nil || found || len(affected) != 0 {
+			t.Errorf("DeactivateBySfID = %v, %v, %v; want false, none, nil", found, affected, err)
 		}
 	})
 

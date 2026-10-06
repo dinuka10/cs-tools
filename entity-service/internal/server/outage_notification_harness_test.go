@@ -69,7 +69,7 @@ func TestServeOutageNotifyHarness(t *testing.T) {
 	// not run, so it injects the equivalent below.
 	const harnessClientID = "outage-notify-harness"
 	accessSvc := service.NewAccessService(repository.NewAccessRepository(pool),
-		map[string]bool{harnessClientID: true})
+		service.AccessClientConfig{M2MClientIDs: map[string]bool{harnessClientID: true}})
 	h := handler.NewOutageNotificationHandler(
 		service.NewOutageNotificationService(
 			repository.NewOutageNotificationRepository(pool), accessSvc))

@@ -36,6 +36,9 @@ type OutageNotificationRepository interface {
 	// notification whose notification is not finished, oldest first. Returns
 	// no rows — not an error — when the mirrored outage columns are absent.
 	PendingOutages(ctx context.Context, limit int) ([]domain.OutageForNotification, error)
+	// TryLockSweep makes sweeps take turns across replicas and callers; see
+	// tryAdvisoryLock. ok is false when another sweep is running.
+	TryLockSweep(ctx context.Context) (release func(), ok bool, err error)
 	// RecordSent stores the outcome of one email. phaseChanged is false for
 	// the update arm, which advances no phase.
 	RecordSent(ctx context.Context, outageID string, kind domain.OutageNotificationKind,
@@ -98,6 +101,11 @@ SELECT o.id::text,
    AND (n.phase IS NULL OR n.phase <> 'RESOLVED')
  ORDER BY COALESCE(n.updated_on, o.created_on), o.id
  LIMIT $1`
+
+// TryLockSweep takes the internal-notification sweep lock.
+func (r *outageNotificationRepo) TryLockSweep(ctx context.Context) (func(), bool, error) {
+	return tryAdvisoryLock(ctx, r.db, outageNotificationSweepLockKey)
+}
 
 func (r *outageNotificationRepo) PendingOutages(ctx context.Context, limit int) ([]domain.OutageForNotification, error) {
 	rows, err := r.db.Query(ctx, pendingOutagesSQL, limit)

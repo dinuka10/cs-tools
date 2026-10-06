@@ -19,6 +19,7 @@ import {
   compareByCreatedOnThenId,
   convertCodeTagsToHtml,
   extractInlineImageRefId,
+  isInlineImageRefSrc,
   hasSingleCodeWrapper,
   hasSubmittableEditorContent,
   linkifyBareUrls,
@@ -151,5 +152,60 @@ describe("toUtcEndOfDay", () => {
   it("formats a normal 4-digit year unchanged", () => {
     const date = new Date(2026, 0, 10);
     expect(toUtcEndOfDay(date)).toBe("2026-01-11T00:00:00Z");
+  });
+});
+
+// Content migrated from the legacy data source carries inline images as a bare
+// attachment id (`<img src="/<uuid>">`) with no `.iix` suffix.
+describe("bare attachment-id srcs (migrated content)", () => {
+  const UUID = "0f15cbcc-c36b-8310-af2f-404599013196";
+  const HEX = UUID.replace(/-/g, "");
+
+  it.each([
+    ["hyphenated uuid with leading slash", `/${UUID}`, HEX],
+    ["hyphenated uuid without leading slash", UUID, HEX],
+    ["uppercase hyphenated uuid", `/${UUID.toUpperCase()}`, HEX],
+    ["hyphenated uuid with .iix", `/${UUID}.iix`, HEX],
+    ["32-hex id with leading slash", `/${HEX}`, HEX],
+    ["32-hex id without leading slash", HEX, HEX],
+    ["surrounding whitespace", `  /${UUID} `, HEX],
+  ])("treats %s as an attachment reference", (_name, src, id) => {
+    expect(isInlineImageRefSrc(src)).toBe(true);
+    expect(extractInlineImageRefId(src)).toBe(id);
+  });
+
+  it("keeps existing .iix behaviour unchanged", () => {
+    expect(isInlineImageRefSrc(`/${HEX}.iix`)).toBe(true);
+    expect(extractInlineImageRefId(`/${HEX}.iix`)).toBe(HEX);
+    expect(extractInlineImageRefId(`https://host/${HEX}.iix`)).toBe(HEX);
+    expect(isInlineImageRefSrc("/no-match.iix")).toBe(true);
+  });
+
+  it.each([
+    ["query string", `/${UUID}?x=1`],
+    ["extra path segment", `/images/${UUID}`],
+    ["absolute url", `https://host/${UUID}`],
+    ["protocol-relative", `//${UUID}`],
+    ["double leading slash", `//${HEX}`],
+    ["other extension", `/${UUID}.png`],
+    ["data uri", "data:image/png;base64,AAAA"],
+    ["short hex", "/abc123"],
+    ["malformed uuid", "/0f15cbcc-c36b-8310-af2f-40459901319"],
+  ])("does not treat %s as an attachment reference", (_name, src) => {
+    expect(isInlineImageRefSrc(src)).toBe(false);
+  });
+
+  it("replaces a bare-uuid src when the attachment id is the 32-hex form", () => {
+    const out = replaceInlineImageSources(`<p><img src="/${UUID}"><br></p>`, [
+      { id: HEX, previewUrl: "data:image/png;base64,AAA" },
+    ]);
+    expect(out).toContain('src="data:image/png;base64,AAA"');
+  });
+
+  it("leaves a bare-uuid src untouched when no attachment matches", () => {
+    const out = replaceInlineImageSources(`<img src="/${UUID}">`, [
+      { id: "ffffffffffffffffffffffffffffffff", previewUrl: "data:x" },
+    ]);
+    expect(out).toContain(`src="/${UUID}"`);
   });
 });

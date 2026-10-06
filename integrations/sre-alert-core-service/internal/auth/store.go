@@ -22,35 +22,42 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gocql/gocql"
-	"github.com/scylladb/gocqlx/v2"
-	"github.com/scylladb/gocqlx/v2/qb"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ErrUserNotFound marks a lookup for a username with no row in integration_users.
 var ErrUserNotFound = errors.New("internal user not found")
 
+// userColumns excludes "id": new rows get one from the column default (gen_random_uuid()),
+// existing rows keep theirs untouched since Upsert's ON CONFLICT clause never sets it.
 var userColumns = []string{
-	"username", "id", "secret_hash", "salt", "iterations", "enabled",
-	"created_at", "created_by", "updated_at", "secret_rotated_at", "last_used_at", "expires_at",
+	"username", "secret_hash", "salt", "iterations", "enabled",
+	"created_at", "created_by", "updated_at", "secret_rotated_at", "last_used_at",
 }
+
+var allUserColumns = append([]string{"id"}, userColumns...)
 
 // UserRepo owns the integration_users table.
 type UserRepo struct {
-	session gocqlx.Session
+	pool *pgxpool.Pool
 }
 
-// NewUserRepo wraps session for internal-user reads and provisioning.
-func NewUserRepo(session *gocql.Session) *UserRepo {
-	return &UserRepo{session: gocqlx.NewSession(session)}
+// NewUserRepo wraps pool for internal-user reads and provisioning.
+func NewUserRepo(pool *pgxpool.Pool) *UserRepo {
+	return &UserRepo{pool: pool}
 }
 
 // Get reads a user by username; returns ErrUserNotFound if no row exists.
 func (r *UserRepo) Get(ctx context.Context, username string) (User, error) {
-	stmt, names := qb.Select("integration_users").Columns(userColumns...).Where(qb.Eq("username")).ToCql()
-	var u User
-	if err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{"username": username}).GetRelease(&u); err != nil {
-		if errors.Is(err, gocql.ErrNotFound) {
+	query := fmt.Sprintf(`SELECT %s FROM integration_users WHERE username = $1`, columnList(allUserColumns))
+	rows, err := r.pool.Query(ctx, query, username)
+	if err != nil {
+		return User{}, fmt.Errorf("read internal user %s: %w", username, err)
+	}
+	u, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[User])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return User{}, fmt.Errorf("read internal user %s: %w", username, ErrUserNotFound)
 		}
 		return User{}, fmt.Errorf("read internal user %s: %w", username, err)
@@ -58,10 +65,20 @@ func (r *UserRepo) Get(ctx context.Context, username string) (User, error) {
 	return u, nil
 }
 
-// Upsert inserts or replaces a user row; used by the createuser CLI tool to provision accounts.
+// Upsert inserts a new user (id defaults via gen_random_uuid()) or, for an existing username,
+// replaces every column except id/created_at; used by the createuser CLI tool.
 func (r *UserRepo) Upsert(ctx context.Context, u User) error {
-	stmt, names := qb.Insert("integration_users").Columns(userColumns...).ToCql()
-	if err := r.session.Query(stmt, names).WithContext(ctx).BindStruct(u).ExecRelease(); err != nil {
+	query := fmt.Sprintf(`INSERT INTO integration_users (%s) VALUES (%s)
+		ON CONFLICT (username) DO UPDATE SET
+			secret_hash = EXCLUDED.secret_hash, salt = EXCLUDED.salt, iterations = EXCLUDED.iterations,
+			enabled = EXCLUDED.enabled, created_by = EXCLUDED.created_by, updated_at = EXCLUDED.updated_at,
+			secret_rotated_at = EXCLUDED.secret_rotated_at, last_used_at = EXCLUDED.last_used_at`,
+		columnList(userColumns), placeholders(len(userColumns)))
+	args := []any{
+		u.Username, u.SecretHash, u.Salt, u.Iterations, u.Enabled,
+		u.CreatedAt, u.CreatedBy, u.UpdatedAt, u.SecretRotatedAt, u.LastUsedAt,
+	}
+	if _, err := r.pool.Exec(ctx, query, args...); err != nil {
 		return fmt.Errorf("upsert internal user %s: %w", u.Username, err)
 	}
 	return nil
@@ -69,9 +86,13 @@ func (r *UserRepo) Upsert(ctx context.Context, u User) error {
 
 // List reads every row in integration_users; the table is small (service accounts only), so a full scan is fine.
 func (r *UserRepo) List(ctx context.Context) ([]User, error) {
-	stmt, names := qb.Select("integration_users").Columns(userColumns...).ToCql()
-	var users []User
-	if err := r.session.Query(stmt, names).WithContext(ctx).SelectRelease(&users); err != nil {
+	query := fmt.Sprintf(`SELECT %s FROM integration_users`, columnList(allUserColumns))
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("list internal users: %w", err)
+	}
+	users, err := pgx.CollectRows(rows, pgx.RowToStructByName[User])
+	if err != nil {
 		return nil, fmt.Errorf("list internal users: %w", err)
 	}
 	return users, nil
@@ -79,9 +100,34 @@ func (r *UserRepo) List(ctx context.Context) ([]User, error) {
 
 // SetEnabled flips a user's enabled flag and bumps updated_at; used to disable/re-enable an account without deleting its row.
 func (r *UserRepo) SetEnabled(ctx context.Context, username string, enabled bool) error {
-	stmt, names := qb.Update("integration_users").Set("enabled", "updated_at").Where(qb.Eq("username")).ToCql()
-	if err := r.session.Query(stmt, names).WithContext(ctx).BindMap(qb.M{"username": username, "enabled": enabled, "updated_at": time.Now().UTC()}).ExecRelease(); err != nil {
+	_, err := r.pool.Exec(ctx,
+		`UPDATE integration_users SET enabled = $1, updated_at = $2 WHERE username = $3`,
+		enabled, time.Now().UTC(), username,
+	)
+	if err != nil {
 		return fmt.Errorf("set enabled=%t for internal user %s: %w", enabled, username, err)
 	}
 	return nil
+}
+
+func columnList(cols []string) string {
+	s := ""
+	for i, c := range cols {
+		if i > 0 {
+			s += ", "
+		}
+		s += c
+	}
+	return s
+}
+
+func placeholders(n int) string {
+	s := ""
+	for i := 1; i <= n; i++ {
+		if i > 1 {
+			s += ","
+		}
+		s += fmt.Sprintf("$%d", i)
+	}
+	return s
 }

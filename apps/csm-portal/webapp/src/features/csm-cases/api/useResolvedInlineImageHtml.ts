@@ -91,8 +91,11 @@ function blobToDataUrl(blob: Blob): Promise<string | null> {
  * mitigation, not a real confidentiality fix (the bytes already reached the
  * browser by the time this runs).
  *
- * @param html - Sanitized HTML that may contain `.iix` `<img>` src references
- * or raw base64-embedded images.
+ * Bare attachment-id `<img>` srcs (`/<uuid>`, as found in content migrated
+ * from the legacy data source) are treated exactly like `.iix` references.
+ *
+ * @param html - Sanitized HTML that may contain `.iix` or bare-id `<img>` src
+ * references, or raw base64-embedded images.
  */
 export function useResolvedInlineImageHtml(html: string): {
   resolvedHtml: string;

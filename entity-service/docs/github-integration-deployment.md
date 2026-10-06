@@ -46,7 +46,7 @@ an error, which is the single most confusing failure mode here.
 | `GITHUB_TOKEN` | yes | Needs **`repo` scope** — outbound calls `POST /repos/{owner}/{repo}/dispatches`. |
 | `GITHUB_INTEGRATION_LOGIN` | yes | The login this service raises issues under, from a case. **Not** `github-actions[bot]` — see §3. |
 | `CSM_PORTAL_BASE_URL` | yes | **Must be the Postgres-backed portal.** Every outbound comment embeds a link built from this; a host backed by another database cannot resolve the record id. |
-| `AUTH_INTERNAL_CLIENT_IDS` | yes* | Must include any client calling `POST /github/service-requests`; that endpoint rejects everything else. |
+| `M2M_CLIENT_IDS` | yes* | Must include any client calling `POST /github/service-requests`; that endpoint rejects everything else. |
 | `GITHUB_OUTBOUND_INTERVAL` | no | Worker poll interval, default **15s**. |
 | `GITHUB_LABEL_*`, `GITHUB_LABELS_CLASS` | no | Label overrides; defaults match `labels.yml`. An override that does not parse, or whose class value is outside *Normal / Standard / Emergency Change*, is a **startup error**, never a silent fallback. |
 

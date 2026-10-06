@@ -84,6 +84,12 @@ function StubCaseDetailPage() {
   );
 }
 
+// useCurrentLocationTab (the pinned tab) reads the portal view; the real hook
+// pulls in the signed-in-user context, which needs backend config this test
+// doesn't set up. The CS view is what every test here exercises.
+vi.mock("@context/current-user/usePortalView", () => ({
+  usePortalView: () => "cs-abt",
+}));
 vi.mock("@features/case-tabs/tabPageRegistry", () => ({
   pageComponentForKind: () => StubCaseDetailPage,
 }));

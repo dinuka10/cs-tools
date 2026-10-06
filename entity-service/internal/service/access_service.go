@@ -38,17 +38,28 @@ type AccessScope = repository.SearchScope
 // actually been wired up so far.
 type AccessService interface {
 	// ResolveScope decides what the caller of ctx may see, in this order:
-	//   1. Authorization: Bearer names a client id in AUTH_INTERNAL_CLIENT_IDS:
-	//      unrestricted, full stop -- an internal caller is trusted
-	//      unconditionally, regardless of any x-user-id-token it also
-	//      carries. Every caller configured here is itself an already-trusted
-	//      internal service, so a user token from one of them (if present at
-	//      all) is used only for attribution elsewhere, never for scoping.
-	//   2. Otherwise, resolved purely from x-user-id-token: INTERNAL user_type
+	//   1. Authorization: Bearer names CustomerPortalBackendClientID: ALWAYS resolved
+	//      from x-user-id-token (step 4), never unconditionally trusted --
+	//      checked first, and deliberately not overridable by this client id
+	//      also appearing in M2MClientIDs or equaling CSMPortalBackendClientID by
+	//      mistake (see AccessClientConfig's own doc comment).
+	//   2. Otherwise, Bearer names CSMPortalBackendClientID: unrestricted ONLY if
+	//      x-user-id-token's email also ends in CSMPortalUserDomain
+	//      (case-insensitive); otherwise refused (403) outright, not
+	//      resolved some other way -- this client id's traffic is expected
+	//      to always be that domain, so a mismatch means something upstream
+	//      (the IdP, SCIM provisioning) already got the caller's identity
+	//      wrong.
+	//   3. Otherwise, Bearer names a client id in M2MClientIDs: unrestricted,
+	//      full stop, regardless of any x-user-id-token it also carries --
+	//      every caller configured here is pure machine-to-machine, so a
+	//      user token from one of them (if present at all) is used only for
+	//      attribution elsewhere, never for scoping.
+	//   4. Otherwise, resolved purely from x-user-id-token: INTERNAL user_type
 	//      sees everything, EXTERNAL (customer) sees only projects they are a
 	//      REGISTERED project_contact of, and any other user type, an
 	//      inactive user, or an unknown email is refused.
-	//   3. No user token and not an internal client: refused (401) -- there's
+	//   5. No user token and none of 1-3 matched: refused (401) -- there's
 	//      no legitimate caller to resolve.
 	// Refused too if the identity itself isn't validated (only possible if
 	// the auth middleware was left out of the chain -- a bug, not a
@@ -56,15 +67,33 @@ type AccessService interface {
 	ResolveScope(ctx context.Context) (AccessScope, error)
 }
 
-type accessService struct {
-	repo              repository.AccessRepository
-	internalClientIDs map[string]bool
+// AccessClientConfig is the subset of config.Config ResolveScope needs to
+// classify a client-credentials caller. Grouped into its own type (rather
+// than three/four constructor parameters) so a new field here can't silently
+// land in the wrong positional slot at the call site.
+type AccessClientConfig struct {
+	// M2MClientIDs is config.Config.M2MClientIDs: pure machine-to-machine
+	// callers, unconditionally unrestricted, no human/domain check.
+	M2MClientIDs map[string]bool
+	// CSMPortalBackendClientID/CSMPortalUserDomain are config.Config's fields of
+	// the same name: apps/csm-portal/backend's client id is unrestricted
+	// only if the forwarded user token's email also matches this domain.
+	CSMPortalBackendClientID string
+	CSMPortalUserDomain      string
+	// CustomerPortalBackendClientID is config.Config.CustomerPortalBackendClientID:
+	// checked first and always resolved from the forwarded user token,
+	// never unconditionally trusted -- see ResolveScope.
+	CustomerPortalBackendClientID string
 }
 
-// NewAccessService constructs an AccessService. internalClientIDs is
-// config.Config.AuthInternalClientIDs.
-func NewAccessService(repo repository.AccessRepository, internalClientIDs map[string]bool) AccessService {
-	return &accessService{repo: repo, internalClientIDs: internalClientIDs}
+type accessService struct {
+	repo   repository.AccessRepository
+	client AccessClientConfig
+}
+
+// NewAccessService constructs an AccessService.
+func NewAccessService(repo repository.AccessRepository, client AccessClientConfig) AccessService {
+	return &accessService{repo: repo, client: client}
 }
 
 // ResolveScope implements AccessService.
@@ -102,14 +131,42 @@ func (s *accessService) ResolveScope(ctx context.Context) (AccessScope, error) {
 		return AccessScope{}, &apierror.ServiceUnavailableError{Msg: "results cannot be scoped to the caller: no verified identity on this request"}
 	}
 
-	if id.ClientID != "" && s.internalClientIDs[id.ClientID] {
-		return AccessScope{Unrestricted: true}, nil
+	if id.ClientID != "" {
+		switch {
+		// Checked first, and unconditionally: this client id must never
+		// reach the unrestricted branches below, regardless of what else
+		// it might also be (mis)configured into.
+		case s.client.CustomerPortalBackendClientID != "" && id.ClientID == s.client.CustomerPortalBackendClientID:
+			if id.UserEmail == "" {
+				return AccessScope{}, &apierror.UnauthorizedError{Msg: "a user token (x-user-id-token) is required for this client"}
+			}
+			return s.scopeForUser(ctx, id.UserEmail)
+		case s.client.CSMPortalBackendClientID != "" && id.ClientID == s.client.CSMPortalBackendClientID:
+			if id.UserEmail != "" && s.isCSMPortalUserDomain(id.UserEmail) {
+				return AccessScope{Unrestricted: true, ViewerEmail: id.UserEmail, HasInternalAccess: true}, nil
+			}
+			return AccessScope{}, &apierror.ForbiddenError{Msg: "csm portal caller's user email is not in an authorized domain"}
+		case s.client.M2MClientIDs[id.ClientID]:
+			return AccessScope{Unrestricted: true}, nil
+		}
 	}
 
 	if id.UserEmail == "" {
 		return AccessScope{}, &apierror.UnauthorizedError{Msg: "a user token (x-user-id-token) or an authorized internal client credential is required"}
 	}
 	return s.scopeForUser(ctx, id.UserEmail)
+}
+
+// isCSMPortalUserDomain reports whether email ends in
+// "@"+AccessClientConfig.CSMPortalUserDomain, case-insensitively -- matching
+// the suffix on "@domain" rather than bare "domain" so e.g. "evilwso2.com"
+// cannot pass a "wso2.com" check (mirrors sn_case_service.go's wso2EmailDomain
+// pattern).
+func (s *accessService) isCSMPortalUserDomain(email string) bool {
+	if s.client.CSMPortalUserDomain == "" {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(email), "@"+strings.ToLower(s.client.CSMPortalUserDomain))
 }
 
 // scopeForUser maps a user's type to a scope. user.email is not unique, so the

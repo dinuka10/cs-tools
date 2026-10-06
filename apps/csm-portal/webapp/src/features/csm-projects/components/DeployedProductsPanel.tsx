@@ -43,7 +43,10 @@ import { useState, type JSX } from "react";
 import { useSearchDeployedProducts } from "@features/csm-projects/api/useSearchDeployedProducts";
 import { useCreateDeployedProduct } from "@features/csm-projects/api/useCreateDeployedProduct";
 import { useUpdateDeployedProduct } from "@features/csm-projects/api/useUpdateDeployedProduct";
-import { formatDeploymentDate } from "@features/csm-projects/utils/deployments";
+import {
+  deployedProductCategoryLabel,
+  formatDeploymentDate,
+} from "@features/csm-projects/utils/deployments";
 import type {
   BeDeployedProduct,
   BeDeployedProductCreatePayload,
@@ -273,7 +276,7 @@ export default function DeployedProductsPanel({
                 <TableCell>{formatDeploymentDate(p.version?.supportEoLDate)}</TableCell>
                 <TableCell align="right">{sizingValue(p.cores)}</TableCell>
                 <TableCell align="right">{sizingValue(p.tps)}</TableCell>
-                <TableCell>{p.category ?? "—"}</TableCell>
+                <TableCell>{deployedProductCategoryLabel(p.category)}</TableCell>
                 <TableCell align="right">
                   {canWrite && (
                     <Tooltip title="Product actions">

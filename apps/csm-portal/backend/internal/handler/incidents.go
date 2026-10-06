@@ -106,7 +106,6 @@ type createIncidentRequest struct {
 	ContactType         string   `json:"contactType"`
 	Impact              string   `json:"impact"`
 	Urgency             string   `json:"urgency"`
-	AssignmentGroupID   string   `json:"assignmentGroupId"`
 	AssignedEngineerID  string   `json:"assignedEngineerId"`
 	Subject             string   `json:"subject"`
 	WatchList           []string `json:"watchList"`
@@ -150,9 +149,6 @@ func validateCreateIncidentBody(body []byte) bool {
 		return false
 	}
 	if !validIncidentUrgencies[req.Urgency] {
-		return false
-	}
-	if req.AssignmentGroupID != "" && !uuidRe.MatchString(req.AssignmentGroupID) {
 		return false
 	}
 	if req.AssignedEngineerID != "" && !uuidRe.MatchString(req.AssignedEngineerID) {

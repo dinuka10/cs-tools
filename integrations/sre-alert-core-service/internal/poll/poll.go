@@ -14,296 +14,313 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Package poll discovers new alerts by comparing alert_seq against alert_cursor; ping wakes it early, a ticker is the backstop.
+// Package poll claims alerts with SELECT ... FOR UPDATE SKIP LOCKED and folds them through a continuous fingerprint-sharded pipeline; every replica runs its own Poller, no leader election.
 package poll
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"hash/fnv"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/gocql/gocql"
-	"golang.org/x/sync/errgroup"
-
-	"alert-core-service/internal/cassandra"
 	"alert-core-service/internal/engine"
 	"alert-core-service/internal/model"
+	"alert-core-service/internal/store"
 )
+
+// Settings tunes a Poller's cadence, claim size, and concurrency.
+type Settings struct {
+	// Interval is the backstop cadence; a ping (POST /alertz) normally wakes the poller sooner.
+	Interval time.Duration
+	// Concurrency is the number of fingerprint-sharded workers; one fingerprint always lands on one worker.
+	Concurrency int
+	// MaxBatch caps the seed rows of one claim; siblings sharing a seed's fingerprint can add as many again.
+	MaxBatch int
+	// ClaimTTL bounds how long a claimed-but-unfinished alert is held before any replica may reclaim it.
+	ClaimTTL time.Duration
+	// DeliverySweepInterval is the longest delivery waits when nothing triggers it, which bounds retry latency.
+	DeliverySweepInterval time.Duration
+}
+
+// AlertStore is the claim queue; *store.AlertRepo implements it.
+type AlertStore interface {
+	Claim(ctx context.Context, owner string, limit int, claimTTL time.Duration) ([]store.ClaimedAlert, error)
+	MarkProcessed(ctx context.Context, ids []string) error
+	Release(ctx context.Context, ids []string) error
+}
+
+// Engine is what the poller needs from *engine.Engine.
+type Engine interface {
+	Normalize(alert model.Alert) model.Alert
+	HandleGroup(ctx context.Context, fp string, items []engine.Item) error
+	DeliverDue(ctx context.Context)
+}
 
 const (
-	alertSeqTable = "alert_seq"
-	cursorTable   = "alert_cursor"
-	alertIDPrefix = "ALT"
-	alertIDWidth  = 9
+	// ackBatch and ackEvery bound how long finished ids wait before one MarkProcessed/Release statement covers them.
+	ackBatch = 500
+	ackEvery = 20 * time.Millisecond
+	// ackTimeout bounds a final acknowledgement written after shutdown cancelled the poller's context.
+	ackTimeout = 5 * time.Second
 )
 
-// Leader reports whether this replica may process alerts, preventing duplicate incident notifications across replicas.
-type Leader interface {
-	IsLeader() bool
+// identity names this replica for the claimed_by column; purely diagnostic.
+func identity() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "pod"
+	}
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return host + "-" + hex.EncodeToString(b[:])
 }
 
-// Settings tunes a Poller's cadence and per-cycle concurrency.
-type Settings struct {
-	// Interval is the backstop cadence between cycles; a ping normally wakes the poller sooner.
-	Interval time.Duration
-	// Concurrency is the number of fingerprint-sharded workers handling alerts in parallel.
-	Concurrency int
-	// ReadConcurrency bounds the parallel alert-row reads at the start of each cycle.
-	ReadConcurrency int
-	// MaxWindow caps how many alert ids one window processes, bounding memory under large bursts.
-	MaxWindow int
-	// NotifySweepInterval is the retry cadence for unconfirmed CSM/Chat notifications, independent of and concurrent-safe with the alert cycle.
-	NotifySweepInterval time.Duration
-	// GapTimeout is how long an alert id may stay missing before it's skipped; a whole gap is skipped together after one GapTimeout, zero disables skipping.
-	GapTimeout time.Duration
+type group struct {
+	fp    string
+	items []engine.Item
 }
 
-// Poller periodically (and on demand) processes every alert id issued since its last confirmed position.
+type ack struct {
+	done  []string
+	retry []string
+}
+
+// Poller claims and folds alerts for one replica.
 type Poller struct {
 	logger   *slog.Logger
-	session  *gocql.Session
-	engine   *engine.Engine
-	leader   Leader
+	alerts   AlertStore
+	engine   Engine
+	identity string
 	settings Settings
+	// capacity is the most alerts in flight at once; a claim tops up to it.
+	capacity int
+	inflight atomic.Int64
 	wake     chan struct{}
-	sweeping atomic.Bool
-	// wg tracks in-flight sweep goroutines so Run doesn't return, and callers don't see it drained, mid-sweep.
-	wg sync.WaitGroup
-	// gaps backs GapTimeout; only touched from the single goroutine running cycle, so it needs no lock.
-	gaps gapTracker
+	space    chan struct{}
+	deliver  chan struct{}
+	shards   []chan group
+	acks     chan ack
 }
 
-// New seeds alert_seq and cursor rows so a fresh deployment's first cycle doesn't fail with "not found" forever.
-func New(logger *slog.Logger, session *gocql.Session, e *engine.Engine, leader Leader, settings Settings) (*Poller, error) {
-	if err := cassandra.SeedSeq(context.Background(), session, alertSeqTable); err != nil {
-		return nil, err
-	}
-	if err := cassandra.SeedSeq(context.Background(), session, cursorTable); err != nil {
-		return nil, err
-	}
-	return &Poller{
+// New returns a Poller that claims from alerts and folds through e.
+func New(logger *slog.Logger, alerts AlertStore, e Engine, settings Settings) *Poller {
+	capacity := 2 * settings.MaxBatch
+	p := &Poller{
 		logger:   logger,
-		session:  session,
+		alerts:   alerts,
 		engine:   e,
-		leader:   leader,
+		identity: identity(),
 		settings: settings,
+		capacity: capacity,
 		wake:     make(chan struct{}, 1),
-		gaps:     gapTracker{},
-	}, nil
+		space:    make(chan struct{}, 1),
+		deliver:  make(chan struct{}, 1),
+		shards:   make([]chan group, settings.Concurrency),
+		acks:     make(chan ack, settings.Concurrency),
+	}
+	for i := range p.shards {
+		// A claim adds at most 2 x MaxBatch groups and capacity caps everything in flight, so sends never block.
+		p.shards[i] = make(chan group, 2*capacity)
+	}
+	return p
 }
 
-// Wake nudges the poller to run now instead of waiting; non-blocking, so a ping burst collapses into one cycle.
-func (p *Poller) Wake() {
+func signal(ch chan struct{}) {
 	select {
-	case p.wake <- struct{}{}:
+	case ch <- struct{}{}:
 	default:
 	}
 }
 
-// Run processes alerts on ping/interval until ctx cancels, and doesn't return until launched RetrySweep goroutines finish too.
+// Wake nudges the poller to claim now; a ping burst collapses into one claim.
+func (p *Poller) Wake() { signal(p.wake) }
+
+// Run claims until ctx ends, then releases unstarted work, acknowledges what finished, and returns.
 func (p *Poller) Run(ctx context.Context) {
+	var workers sync.WaitGroup
+	for _, shard := range p.shards {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			p.work(ctx, shard)
+		}()
+	}
+	ackerDone := make(chan struct{})
+	go func() {
+		defer close(ackerDone)
+		p.ackLoop(ctx)
+	}()
+	deliveryDone := make(chan struct{})
+	go func() {
+		defer close(deliveryDone)
+		p.deliveryLoop(ctx)
+	}()
+
+	p.claimLoop(ctx)
+
+	for _, shard := range p.shards {
+		close(shard)
+	}
+	workers.Wait()
+	close(p.acks)
+	<-ackerDone
+	<-deliveryDone
+}
+
+// claimLoop tops the pipeline up to capacity whenever it is woken, ticks, or frees space.
+func (p *Poller) claimLoop(ctx context.Context) {
 	ticker := time.NewTicker(p.settings.Interval)
 	defer ticker.Stop()
-	notifyTicker := time.NewTicker(p.settings.NotifySweepInterval)
-	defer notifyTicker.Stop()
-	defer p.wg.Wait()
+	for {
+		p.fill(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-p.wake:
+		case <-p.space:
+		}
+	}
+}
 
-	p.cycle(ctx)
+// fill claims back-to-back while at least half a batch of room is free and the queue keeps returning work.
+func (p *Poller) fill(ctx context.Context) {
+	for ctx.Err() == nil {
+		free := p.capacity - int(p.inflight.Load())
+		limit := min(p.settings.MaxBatch, free/2)
+		if limit < max(p.settings.MaxBatch/4, 1) {
+			return // wait for the acker to free space instead of issuing tiny claims.
+		}
+		claimed, err := p.alerts.Claim(ctx, p.identity, limit, p.settings.ClaimTTL)
+		if err != nil {
+			if ctx.Err() == nil {
+				p.logger.Error("failed to claim alerts", "error", err)
+			}
+			return
+		}
+		if len(claimed) == 0 {
+			return
+		}
+		p.inflight.Add(int64(len(claimed)))
+		p.dispatch(claimed)
+		if len(claimed) < limit {
+			return
+		}
+	}
+}
+
+// dispatch decodes claimed rows, groups them by fingerprint and sends each group to its shard; undecodable rows are acknowledged as done.
+func (p *Poller) dispatch(claimed []store.ClaimedAlert) {
+	groups := map[string]*group{}
+	var order []*group
+	var bad []string
+	for _, c := range claimed {
+		var a model.Alert
+		if err := json.Unmarshal(c.Alert, &a); err != nil {
+			p.logger.Error("alert unprocessable, marking done without processing", "alert_id", c.ID, "error", err)
+			bad = append(bad, c.ID)
+			continue
+		}
+		a = p.engine.Normalize(a)
+		a.ReceivedAt = c.ReceivedAt
+		fp := model.Fingerprint(a.Source, a.Service, a.MetricName, a.Environment, a.UniqueIdentifier)
+		g, ok := groups[fp]
+		if !ok {
+			g = &group{fp: fp}
+			groups[fp] = g
+			order = append(order, g)
+		}
+		g.items = append(g.items, engine.Item{ID: c.ID, Alert: a})
+	}
+	if len(bad) > 0 {
+		p.acks <- ack{done: bad}
+	}
+	for _, g := range order {
+		p.shards[shard(g.fp, len(p.shards))] <- *g
+	}
+}
+
+// work folds this shard's groups in order; after shutdown it releases what it didn't start.
+func (p *Poller) work(ctx context.Context, shard chan group) {
+	for g := range shard {
+		ids := make([]string, len(g.items))
+		for i, it := range g.items {
+			ids[i] = it.ID
+		}
+		if ctx.Err() != nil || p.engine.HandleGroup(ctx, g.fp, g.items) != nil {
+			p.acks <- ack{retry: ids}
+			continue
+		}
+		p.acks <- ack{done: ids}
+	}
+}
+
+// ackLoop batches finished ids into one MarkProcessed and one Release per flush, then frees pipeline space and triggers delivery.
+func (p *Poller) ackLoop(ctx context.Context) {
+	ticker := time.NewTicker(ackEvery)
+	defer ticker.Stop()
+	var done, retry []string
+	flush := func() {
+		if len(done) == 0 && len(retry) == 0 {
+			return
+		}
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+		if len(done) > 0 {
+			// A failed mark only delays the ids until their claim expires; reprocessing them is a no-op.
+			if err := p.alerts.MarkProcessed(actx, done); err != nil {
+				p.logger.Error("failed to mark alerts processed; they will be reclaimed after claim_ttl", "alerts", len(done), "error", err)
+			}
+		}
+		if len(retry) > 0 {
+			if err := p.alerts.Release(actx, retry); err != nil {
+				p.logger.Error("failed to release alert claims; they will be reclaimed after claim_ttl", "alerts", len(retry), "error", err)
+			}
+		}
+		cancel()
+		p.inflight.Add(-int64(len(done) + len(retry)))
+		if len(done) > 0 {
+			signal(p.deliver)
+		}
+		done, retry = done[:0], retry[:0]
+		signal(p.space)
+	}
+	for {
+		select {
+		case a, ok := <-p.acks:
+			if !ok {
+				flush()
+				return
+			}
+			done = append(done, a.done...)
+			retry = append(retry, a.retry...)
+			if len(done)+len(retry) >= ackBatch {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+// deliveryLoop runs DeliverDue after folds and at least every DeliverySweepInterval, so CSM/Chat latency never slows claiming.
+func (p *Poller) deliveryLoop(ctx context.Context) {
+	ticker := time.NewTicker(p.settings.DeliverySweepInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			p.cycle(ctx)
-		case <-p.wake:
-			p.cycle(ctx)
-		case <-notifyTicker.C:
-			if p.leader.IsLeader() && p.sweeping.CompareAndSwap(false, true) {
-				// Runs in a separate goroutine so a slow CSM/Chat outage never delays cycle(); guard prevents overlapping sweeps.
-				p.wg.Add(1)
-				go func() {
-					defer p.wg.Done()
-					defer p.sweeping.Store(false)
-					p.engine.RetrySweep(ctx, p.leader.IsLeader)
-				}()
-			}
+		case <-p.deliver:
 		}
+		p.engine.DeliverDue(ctx)
 	}
-}
-
-// cycle drains alert ids from cursor to latest in bounded windows, advancing the durable cursor after each completed prefix.
-func (p *Poller) cycle(ctx context.Context) {
-	if !p.leader.IsLeader() {
-		clear(p.gaps) // timers only mean something for the leader that saw the ids missing
-		return
-	}
-
-	latest, err := cassandra.ReadSeq(ctx, p.session, alertSeqTable)
-	if err != nil {
-		p.logger.Error("failed to read alert_seq", "error", err)
-		return
-	}
-	cursor, err := cassandra.ReadSeq(ctx, p.session, cursorTable)
-	if err != nil {
-		p.logger.Error("failed to read cursor", "error", err)
-		return
-	}
-
-	for cursor < latest {
-		if !p.leader.IsLeader() {
-			p.logger.Warn("lost leadership mid-cycle, stopping", "cursor", cursor)
-			clear(p.gaps)
-			return
-		}
-		next := p.processWindow(ctx, cursor, latest)
-		p.gaps.pruneThrough(max(next, cursor))
-		if next <= cursor {
-			// No progress: window head not visible yet, or cursor moved elsewhere; wait for next tick/ping.
-			return
-		}
-		cursor = next
-	}
-}
-
-// processWindow handles one window of alert ids and returns the new cursor; never blocks on an unready id, deferring it.
-func (p *Poller) processWindow(ctx context.Context, cursor, latest int64) int64 {
-	base := cursor + 1
-	end := min(latest, cursor+int64(p.settings.MaxWindow))
-	n := int(end - base + 1)
-
-	// Stage 1: read + normalize every id in the window concurrently, into disjoint slots.
-	slots := p.readWindow(ctx, base, n)
-
-	// Stage 2: decide per id, skipping terminal/GapTimeout-expired ids, stopping at a newer missing id or read error.
-	d := decideWindow(slots, base, time.Now(), p.settings.GapTimeout, p.gaps)
-	if len(d.skipped) > 0 {
-		p.logSkipped(d.skipped)
-	}
-	outcomes := d.outcomes
-
-	p.handleSharded(ctx, base, slots, outcomes, d.readStop)
-
-	// Advance across the leading run of completed ids (Processed/Failed), stopping at the first Retry.
-	completed := contiguousCompleted(outcomes)
-	if completed == 0 {
-		return cursor
-	}
-	target := base + int64(completed) - 1
-
-	applied, err := cassandra.AdvanceSeqTo(ctx, p.session, cursorTable, cursor, target)
-	if err != nil {
-		p.logger.Error("failed to advance cursor", "from", cursor, "to", target, "error", err)
-		return cursor
-	}
-	if !applied {
-		p.logger.Warn("cursor advanced concurrently, stopping cycle")
-		return cursor
-	}
-	p.logger.Info("processed alert window", "from", base, "to", target, "count", completed)
-	return target
-}
-
-// maxLoggedSkips bounds the id list in the skipped-gap log line.
-const maxLoggedSkips = 50
-
-// logSkipped reports one window's skipped ids in a single line.
-func (p *Poller) logSkipped(skipped []int64) {
-	ids := make([]string, 0, min(len(skipped), maxLoggedSkips))
-	for _, seq := range skipped[:min(len(skipped), maxLoggedSkips)] {
-		ids = append(ids, cassandra.FormatSeq(alertIDPrefix, alertIDWidth, seq))
-	}
-	p.logger.Error("alert ids missing beyond gap timeout, skipping to unblock the pipeline",
-		"count", len(skipped),
-		"first_id", cassandra.FormatSeq(alertIDPrefix, alertIDWidth, skipped[0]),
-		"last_id", cassandra.FormatSeq(alertIDPrefix, alertIDWidth, skipped[len(skipped)-1]),
-		"ids", ids, "gap_timeout", p.settings.GapTimeout)
-}
-
-// prepared holds the result of reading and normalizing one alert id; notFound is only meaningful when !ready.
-type prepared struct {
-	alert    model.Alert
-	fp       string
-	outcome  engine.Outcome
-	ready    bool
-	notFound bool
-}
-
-// readWindow reads n alert ids starting at base concurrently, bounded by ReadConcurrency; Prepare never errors itself, so g.Wait()'s error is always nil.
-func (p *Poller) readWindow(ctx context.Context, base int64, n int) []prepared {
-	slots := make([]prepared, n)
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(p.settings.ReadConcurrency)
-	for i := range n {
-		g.Go(func() error {
-			id := cassandra.FormatSeq(alertIDPrefix, alertIDWidth, base+int64(i))
-			alert, fp, outcome, ready, notFound := p.engine.Prepare(gctx, id)
-			slots[i] = prepared{alert: alert, fp: fp, outcome: outcome, ready: ready, notFound: notFound}
-			return nil
-		})
-	}
-	_ = g.Wait()
-	return slots
-}
-
-// handleSharded processes ready ids on a fingerprint-sharded pool and blocks until done, so the caller can safely advance the cursor.
-func (p *Poller) handleSharded(ctx context.Context, base int64, slots []prepared, outcomes []engine.Outcome, readStop int) {
-	workers := min(p.settings.Concurrency, readStop)
-	if workers <= 0 {
-		return // nothing ready to handle
-	}
-
-	// Size each worker's queue to exactly its assignment count so dispatch never blocks.
-	shardOf := make([]int, readStop)
-	counts := make([]int, workers)
-	for i := range readStop {
-		if !slots[i].ready {
-			continue
-		}
-		s := shard(slots[i].fp, workers)
-		shardOf[i] = s
-		counts[s]++
-	}
-
-	type task struct {
-		idx int
-		id  string
-	}
-	queues := make([]chan task, workers)
-	var wg sync.WaitGroup
-	for w := range workers {
-		queues[w] = make(chan task, counts[w])
-		wg.Add(1)
-		go func(q chan task) {
-			defer wg.Done()
-			for t := range q {
-				outcomes[t.idx] = p.engine.Handle(ctx, t.id, slots[t.idx].alert)
-			}
-		}(queues[w])
-	}
-	for i := range readStop {
-		if !slots[i].ready {
-			continue
-		}
-		id := cassandra.FormatSeq(alertIDPrefix, alertIDWidth, base+int64(i))
-		queues[shardOf[i]] <- task{idx: i, id: id}
-	}
-	for w := range workers {
-		close(queues[w])
-	}
-	wg.Wait()
-}
-
-// contiguousCompleted returns the leading run length of completed outcomes, stopping at the first Retry, for advancing the cursor.
-func contiguousCompleted(outcomes []engine.Outcome) int {
-	for i, o := range outcomes {
-		if o == engine.Retry {
-			return i
-		}
-	}
-	return len(outcomes)
 }
 
 // shard maps a fingerprint to a worker index via FNV-1a so an incident's alerts land on the same worker.

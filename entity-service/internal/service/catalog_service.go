@@ -27,19 +27,32 @@ import (
 type catalogService struct {
 	repo repository.CatalogRepository
 	// snMirror is set only under DATA_SOURCE=postgres-servicenow-dual-write
-	// (see NewCatalogServiceWithSNFallback). Only SearchCatalogs reads from it
-	// when non-nil -- GetCatalogItemVariables always reads repo (see its own
-	// doc comment below for why that split exists). sr_category/catalog_item
-	// exist and are populated in Postgres (99/312 rows respectively, checked
-	// live), but SearchCatalogs' own availability check requires a matching
-	// sr_category_routing_rule row (0 rows) and, more fundamentally, the
+	// (see NewCatalogServiceWithSNFallback). Both SearchCatalogs and
+	// GetCatalogItemVariables read from it when non-nil -- they have to agree
+	// on where a catalog item comes from, since the id a caller passes to
+	// GetCatalogItemVariables is always one SearchCatalogs itself just
+	// returned. sr_category/catalog_item exist and are populated in Postgres
+	// (99/312 rows respectively, checked live), but SearchCatalogs' own
+	// availability check requires a matching sr_category_routing_rule row
+	// (0 rows, checked live) and catalog_item_category (also 0 rows) to link
+	// an item to a catalog at all, and, more fundamentally, the
 	// deployed_product row itself: a deployed product that predates
 	// dual-write (or was never touched through this service's own SN-first
 	// write paths) has no row in Postgres' deployed_product table at all --
 	// the same "Postgres was never backfilled with ServiceNow's existing
 	// history" gap documented on deploymentService.SearchDeployments,
 	// causing SearchCatalogs' own existence check to fail outright with
-	// NotFoundError before the catalog data is even considered.
+	// NotFoundError before the catalog data is even considered. This is why
+	// SearchCatalogs falls back to ServiceNow under dual-write -- but
+	// GetCatalogItemVariables used to stay on Postgres regardless, so every
+	// catalog item SearchCatalogs returned (sourced from ServiceNow, with no
+	// Postgres catalog_item_category row to match) 404'd the instant a
+	// caller asked for its variables ("catalog item not found in this
+	// catalog") -- confirmed live: SR creation's request-type step was
+	// 100% broken under dual-write, not incidentally from missing data but
+	// systematically, because the two methods disagreed about which system
+	// is the source of truth for the same catalog item. Now both follow the
+	// same source under dual-write.
 	snMirror CatalogService
 }
 
@@ -88,14 +101,23 @@ func (s *catalogService) SearchCatalogs(ctx context.Context, req domain.SearchCa
 
 // GetCatalogItemVariables implements CatalogService.
 //
-// Unlike SearchCatalogs, this always reads repo (Postgres) even under
-// DATA_SOURCE=postgres-servicenow-dual-write: catalog_variable's extra fields
+// Mirrors SearchCatalogs' own snMirror -- see the snMirror field's own doc
+// comment for why: under DATA_SOURCE=postgres-servicenow-dual-write, a
+// catalog item id only ever came from this same service's own SearchCatalogs
+// call, which is itself ServiceNow-sourced in that mode, so this has to read
+// the same system or every item 404s. On the plain `postgres` data source
+// (snMirror nil), catalog_variable's extra fields
 // (read_only/hidden/reference_table/max_length/validation) and the sibling
-// catalog_variable_choice table (migration 0125) are now kept current by a
-// separate sync service, so Postgres is trusted for this read. This does not
-// change the plain `servicenow` data source, which still calls ServiceNow
-// live.
+// catalog_variable_choice table (migration 0125) are kept current by a
+// separate sync service, so Postgres is trusted for this read there -- and
+// SearchCatalogs is Postgres-only in that mode too, so the two methods still
+// agree. The plain `servicenow` data source is unaffected either way: it
+// never constructs this type at all.
 func (s *catalogService) GetCatalogItemVariables(ctx context.Context, catalogID, catalogItemID string) (domain.GetCatalogItemVariablesResponse, error) {
+	if s.snMirror != nil {
+		return s.snMirror.GetCatalogItemVariables(ctx, catalogID, catalogItemID)
+	}
+
 	if catalogID == "" {
 		return domain.GetCatalogItemVariablesResponse{}, &apierror.ValidationError{Msg: "catalogId is required"}
 	}

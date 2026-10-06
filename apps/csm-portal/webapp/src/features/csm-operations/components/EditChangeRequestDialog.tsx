@@ -19,27 +19,38 @@ import {
   Alert,
   Box,
   Button,
+  Checkbox,
   DatePickers,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
+  FormControl,
   FormControlLabel,
   FormHelperText,
+  InputLabel,
+  MenuItem,
+  Select,
   Switch,
   TextField,
+  Tooltip,
   Typography,
 } from "@wso2/oxygen-ui";
 import { useCallback, useMemo, useState, type JSX } from "react";
 import { useSearchGroups } from "@api/useSearchGroups";
 import { useSearchInternalUsersByName } from "@api/useSearchUsersByName";
 import type {
+  BeChangeRequestCategory,
   BeChangeRequestDetail,
   BeGroup,
   BePatchChangeRequestPayload,
   BeUser,
 } from "@api/backend/types";
 import AsyncEntitySelect from "@components/AsyncEntitySelect";
+import ChangeRequestScopeFields, {
+  ChangeRequestCustomerGroupField,
+} from "@features/csm-operations/components/ChangeRequestScopeFields";
+import { useChangeRequestScope } from "@features/csm-operations/hooks/useChangeRequestScope";
 import Editor from "@components/rich-text-editor/Editor";
 import {
   backendUtcToZonedInput,
@@ -50,6 +61,13 @@ import {
 } from "@utils/dateTime";
 import { isBlankHtml, sanitizeRichTextHtml } from "@utils/sanitizeHtml";
 import { userLabel } from "@features/csm-operations/utils/incidentFormOptions";
+import {
+  CHANGE_REQUEST_CATEGORY_OPTIONS,
+  changeRequestCategoryValue,
+  changeRequestScopeLockedReason,
+  customerApprovalLockedReason,
+  customerReviewLockedReason,
+} from "@features/csm-operations/utils/changeRequests";
 
 const { DateTimePicker, LocalizationProvider } = DatePickers;
 
@@ -67,6 +85,11 @@ interface EditChangeRequestDialogProps {
   onClose: () => void;
   /** Submit only the changed fields (`PATCH /change-requests/{id}`). */
   onSave: (patch: BePatchChangeRequestPayload) => void;
+}
+
+/** Same members, order ignored. */
+function sameIds(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((id) => b.includes(id));
 }
 
 /** One long-form plan field, edited as rich text. */
@@ -147,14 +170,19 @@ function useRichTextPlanField(storedHtml?: string | null): RichTextPlanField {
  * Only changed fields are sent, and the BE requires at least one, so Save is
  * disabled until something differs.
  *
+ * Customer Project / Deployments / Deployment products and Category are
+ * editable too. The scope fields cascade exactly like the create form
+ * (project -> deployments, with deployment products derived and read-only) and
+ * are locked once the change request reaches Implement, because the backend
+ * refuses the edit from there on. The Customer Group is shown read-only: it is
+ * the chosen project's registered contacts, so changing the project changes it
+ * and nothing about it is ever sent.
+ *
  * Deliberately NOT here, even though the backend's write contract accepts
- * them: `categoryKey` (never gets an editable control — see
- * `BeChangeRequestDetail.category`'s doc comment), `priorityKey` (no
- * metadata endpoint yet for the picker), `environmentIds`/
- * `deploymentProductIds` (no search endpoint exists at this BFF to build a
- * picker against), `comment`/`workNote` (the existing CR comments feature
- * already covers that surface), and `durationInput` (only succeeds against
- * an exact-match validation rule not worth half-implementing here — see
+ * them: `priorityKey` (no metadata endpoint yet for the picker),
+ * `comment`/`workNote` (these append journal entries, which the Comments tab
+ * already covers), and `durationInput` (only succeeds against an exact-match
+ * validation rule not worth half-implementing here — see
  * `BePatchChangeRequestPayload`'s doc comment for the full reasoning on each).
  *
  * `isCustomerApproved`/`isCustomerReviewed` are deliberately NOT exposed here
@@ -191,19 +219,43 @@ export default function EditChangeRequestDialog({
   );
   const initialAssignedTeamId = cr.assignedTeam?.id ?? "";
   const initialAssignedEngineerId = cr.assignedEngineer?.id ?? "";
-  const initialCustomerGroupId = cr.customerGroup?.id ?? "";
   const initialRequestedById = cr.requestedBy?.id ?? "";
   const initialRollbackDurationText = cr.rollbackDurationText ?? "";
   const initialIsPlanningVisibleToCustomers = cr.isPlanningVisibleToCustomers ?? false;
+  const initialCustomerApprovalRequired = cr.customerApprovalRequired ?? false;
+  const initialCustomerReviewRequired = cr.customerReviewRequired ?? false;
+  // Once the gate a checkbox controls has passed the backend refuses the edit
+  // (400), so the control is disabled up front with the reason.
+  const customerApprovalLocked = customerApprovalLockedReason(cr.state);
+  const customerReviewLocked = customerReviewLockedReason(cr.state);
   const [plannedStart, setPlannedStart] = useState(initialPlannedStart);
   const [plannedEnd, setPlannedEnd] = useState(initialPlannedEnd);
   const [assignedTeamId, setAssignedTeamId] = useState(initialAssignedTeamId);
   const [assignedEngineerId, setAssignedEngineerId] = useState(initialAssignedEngineerId);
-  const [customerGroupId, setCustomerGroupId] = useState(initialCustomerGroupId);
+  const initialProjectId = cr.project?.id ?? "";
+  const initialDeploymentIds = useMemo(() => cr.deployments?.map((d) => d.id) ?? [], [cr.deployments]);
+  const initialCategory = changeRequestCategoryValue(cr.category);
+  const [category, setCategory] = useState<string>(initialCategory);
+  // Customer Project / Deployments / Deployment products,
+  // seeded from the record. Locked (like the customer checkboxes) once the
+  // backend would refuse the edit.
+  const scopeLocked = changeRequestScopeLockedReason(cr.state);
+  const scope = useChangeRequestScope({
+    projectId: cr.project?.id,
+    projectLabel: cr.project?.name,
+    deployments: cr.deployments?.map((d) => ({ id: d.id, label: d.name })),
+    deploymentProducts: cr.deploymentProducts?.map((p) => ({ id: p.id, label: p.name })),
+  });
   const [requestedById, setRequestedById] = useState(initialRequestedById);
   const [rollbackDurationText, setRollbackDurationText] = useState(initialRollbackDurationText);
   const [isPlanningVisibleToCustomers, setIsPlanningVisibleToCustomers] = useState(
     initialIsPlanningVisibleToCustomers,
+  );
+  const [customerApprovalRequired, setCustomerApprovalRequired] = useState(
+    initialCustomerApprovalRequired,
+  );
+  const [customerReviewRequired, setCustomerReviewRequired] = useState(
+    initialCustomerReviewRequired,
   );
   const rollbackPlan = useRichTextPlanField(cr.rollbackPlan);
   const testPlan = useRichTextPlanField(cr.testPlan);
@@ -250,14 +302,32 @@ export default function EditChangeRequestDialog({
     if (rollbackDurationText !== initialRollbackDurationText) {
       next.rollbackDurationText = rollbackDurationText;
     }
-    if (customerGroupId !== initialCustomerGroupId && customerGroupId) {
-      next.customerGroupId = customerGroupId;
+    if (category !== initialCategory && category) {
+      next.category = category as BeChangeRequestCategory;
+    }
+    // The scope fields are validated by the backend as a unit, so when any of
+    // them changed the whole set goes out together (see BePatchChangeRequestPayload).
+    // Deployment products are derived: sent only once the lookup has settled.
+    const scopeChanged =
+      !scopeLocked &&
+      !!scope.projectId &&
+      (scope.projectId !== initialProjectId || !sameIds(scope.deploymentIds, initialDeploymentIds));
+    if (scopeChanged) {
+      next.projectId = scope.projectId;
+      next.deploymentIds = scope.deploymentIds;
+      if (scope.productsReady) next.deploymentProductIds = scope.deploymentProductIds;
     }
     if (requestedById !== initialRequestedById && requestedById) {
       next.requestedById = requestedById;
     }
     if (isPlanningVisibleToCustomers !== initialIsPlanningVisibleToCustomers) {
       next.isPlanningVisibleToCustomers = isPlanningVisibleToCustomers;
+    }
+    if (!customerApprovalLocked && customerApprovalRequired !== initialCustomerApprovalRequired) {
+      next.customerApprovalRequired = customerApprovalRequired;
+    }
+    if (!customerReviewLocked && customerReviewRequired !== initialCustomerReviewRequired) {
+      next.customerReviewRequired = customerReviewRequired;
     }
     return next;
   }, [
@@ -281,12 +351,25 @@ export default function EditChangeRequestDialog({
     affectedComponentsText.outgoing,
     rollbackDurationText,
     initialRollbackDurationText,
-    customerGroupId,
-    initialCustomerGroupId,
+    category,
+    initialCategory,
+    scopeLocked,
+    scope.projectId,
+    scope.deploymentIds,
+    scope.deploymentProductIds,
+    scope.productsReady,
+    initialProjectId,
+    initialDeploymentIds,
     requestedById,
     initialRequestedById,
     isPlanningVisibleToCustomers,
     initialIsPlanningVisibleToCustomers,
+    customerApprovalRequired,
+    initialCustomerApprovalRequired,
+    customerApprovalLocked,
+    customerReviewRequired,
+    initialCustomerReviewRequired,
+    customerReviewLocked,
   ]);
 
   const hasChanges = Object.keys(patch).length > 0;
@@ -327,6 +410,51 @@ export default function EditChangeRequestDialog({
       <FormHelperText id={`${id}-help`}>{helperText}</FormHelperText>
     </Box>
   );
+
+  // One of the two customer-step checkboxes. When locked it is disabled and
+  // the lock reason replaces the helper line (which the input references via
+  // aria-describedby, so assistive tech announces it) and also rides on a
+  // tooltip for pointer users.
+  const renderCustomerStepCheckbox = (
+    id: string,
+    label: string,
+    helperText: string,
+    checked: boolean,
+    onChange: (next: boolean) => void,
+    lockedReason: string | null,
+  ): JSX.Element => {
+    const control = (
+      <FormControlLabel
+        sx={{ alignItems: "flex-start", m: 0 }}
+        disabled={isSaving || !!lockedReason}
+        control={
+          <Checkbox
+            size="small"
+            checked={checked}
+            onChange={(e) => onChange(e.target.checked)}
+            inputProps={{ "aria-label": label, "aria-describedby": `${id}-desc` }}
+          />
+        }
+        label={
+          <Box>
+            <Typography variant="body1">{label}</Typography>
+            <Typography id={`${id}-desc`} variant="body2" color="text.secondary">
+              {lockedReason ?? helperText}
+            </Typography>
+          </Box>
+        }
+      />
+    );
+    return lockedReason ? (
+      <Tooltip title={lockedReason}>
+        <Box component="span" sx={{ display: "block" }}>
+          {control}
+        </Box>
+      </Tooltip>
+    ) : (
+      control
+    );
+  };
 
   return (
     <Dialog open onClose={onClose} maxWidth="sm" fullWidth>
@@ -426,18 +554,61 @@ export default function EditChangeRequestDialog({
             getLabel={userLabel}
             knownLabel={cr.requestedBy?.name}
           />
-          <AsyncEntitySelect<BeGroup>
-            id="cr-edit-customer-group"
-            label="Customer group"
-            placeholder="Search groups…"
-            value={customerGroupId}
-            onChange={setCustomerGroupId}
-            disabled={isSaving}
-            useSearch={useSearchGroups}
-            getId={(g) => g.id}
-            getLabel={(g) => g.name}
-            knownLabel={cr.customerGroup?.name}
-          />
+          <Box
+            role="group"
+            aria-label="Customer project and deployments"
+            sx={{ display: "flex", flexDirection: "column", gap: 1 }}
+          >
+            {scopeLocked && <Alert severity="info">{scopeLocked}</Alert>}
+            <ChangeRequestScopeFields
+              scope={scope}
+              disabled={isSaving || !!scopeLocked}
+              idPrefix="cr-edit"
+              // A saved project can be swapped for another but not removed —
+              // the patch has no way to express "no project".
+              projectClearable={!initialProjectId}
+            />
+            <ChangeRequestCustomerGroupField scope={scope} idPrefix="cr-edit" />
+          </Box>
+          <FormControl fullWidth size="small" disabled={isSaving}>
+            <InputLabel id="cr-edit-category-label" shrink>
+              Category
+            </InputLabel>
+            <Select
+              labelId="cr-edit-category-label"
+              label="Category"
+              value={category}
+              displayEmpty
+              onChange={(e) => setCategory(String(e.target.value))}
+            >
+              <MenuItem value="">
+                <Typography component="span" color="text.secondary">
+                  -- Select --
+                </Typography>
+              </MenuItem>
+              {CHANGE_REQUEST_CATEGORY_OPTIONS.map((o) => (
+                <MenuItem key={o.value} value={o.value}>
+                  {o.label}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          {renderCustomerStepCheckbox(
+            "cr-edit-customer-approval",
+            "Customer Approval",
+            "Adds a customer approval step after internal approval, before scheduling.",
+            customerApprovalRequired,
+            setCustomerApprovalRequired,
+            customerApprovalLocked,
+          )}
+          {renderCustomerStepCheckbox(
+            "cr-edit-customer-review",
+            "Customer Review",
+            "Adds a customer review step after Review, before closing.",
+            customerReviewRequired,
+            setCustomerReviewRequired,
+            customerReviewLocked,
+          )}
           <TextField
             label="Rollback duration"
             value={rollbackDurationText}

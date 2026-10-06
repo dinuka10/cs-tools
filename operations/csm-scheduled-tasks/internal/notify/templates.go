@@ -229,38 +229,3 @@ func humanizeState(state string) string {
 	}
 	return strings.Join(words, " ")
 }
-
-//go:embed templates/outage_notification.html
-var outageNotificationTemplateRaw string
-
-// OutageNotificationData is what RenderOutageNotification substitutes.
-//
-// Subject and Body arrive already rendered by entity-service, which owns the
-// wording so it can be tested against the ServiceNow original in one place.
-// This only wraps them in the house shell.
-type OutageNotificationData struct {
-	// PhaseWord is Declared / Resolved / Update, for the banner.
-	PhaseWord string
-	Number    string
-	// Message is entity-service's body text, verbatim.
-	Message string
-}
-
-// RenderOutageNotification wraps one outage notice in the standard shell.
-//
-// The body it wraps is deliberately thin: the ServiceNow flow this ports sends
-// three fixed sentences carrying no outage detail at all ("Outage {n}
-// declared." and so on), and the port reproduces that rather than inventing
-// content that cannot be checked against the original. See entity-service's
-// renderOutageNotification for the full reasoning. Making these emails useful
-// is a product decision tracked separately.
-func RenderOutageNotification(data OutageNotificationData) string {
-	replacer := strings.NewReplacer(
-		"<!-- [LOGO_SRC] -->", bakeLogo(wso2LogoURL),
-		"<!-- [PHASE_WORD] -->", escapeHTML(data.PhaseWord),
-		"<!-- [NUMBER] -->", escapeHTML(data.Number),
-		"<!-- [MESSAGE] -->", escapeHTML(data.Message),
-		"<!-- [YEAR] -->", strconv.Itoa(time.Now().Year()),
-	)
-	return replacer.Replace(outageNotificationTemplateRaw)
-}

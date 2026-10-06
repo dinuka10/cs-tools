@@ -36,7 +36,7 @@ import {
   toIsoDate,
 } from "../utils/rota";
 import { accentOf } from "../utils/rotaHues";
-import { useTeamColour } from "../utils/teamColourContext";
+import { useTeamColour, useTeamName } from "../utils/teamColourContext";
 
 interface WeekTableProps {
   weekStart: Date;
@@ -179,6 +179,7 @@ export default function WeekTable({
   absenceKinds = [],
 }: WeekTableProps): JSX.Element {
   const teamColourOf = useTeamColour();
+  const teamNameOf = useTeamName();
   const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
 
   const rows = useMemo(() => {
@@ -471,7 +472,7 @@ export default function WeekTable({
                              restated the row heading against every name in it.
                              The tier stays: L1/L2/L3 is the one thing here
                              that nothing else says. */
-                          <div className="nm" key={a.id} title={`${a.engineer.name} · ${a.teamKey}`}>
+                          <div className="nm" key={a.id} title={`${a.engineer.name} · ${teamNameOf(a.teamKey)}`}>
                             <span className="av" style={{ background: teamColourOf(a.teamKey) }}>
                               {initialsOf(a.engineer.name)}
                             </span>
@@ -506,7 +507,7 @@ export default function WeekTable({
                       <span className="none">—</span>
                     ) : (
                       list.map(({ ab, kind }) => (
-                        <div className="nm" key={ab.id} title={`${ab.engineer.name} · ${ab.teamKey} · ${kind.label}`}>
+                        <div className="nm" key={ab.id} title={`${ab.engineer.name} · ${teamNameOf(ab.teamKey)} · ${kind.label}`}>
                           <span className={`chip sm ${kind.colourToken}`}>{kind.shortCode}</span>
                           <span className="who">{ab.engineer.name}</span>
                         </div>

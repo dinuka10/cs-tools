@@ -37,6 +37,22 @@ type searchITServicesFilters struct {
 type ITService struct {
 	ID   string `json:"id"`
 	Name string `json:"name,omitempty"`
+	// SupportGroup is the CMDB group that supports the service; an incident raised against it is assigned there.
+	SupportGroup *ServiceGroup `json:"supportGroup,omitempty"`
+}
+
+// ServiceGroup is entity-service's EntityRef for a group.
+type ServiceGroup struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// SupportGroupID is the support group's id, or "" when the service has none.
+func (s ITService) SupportGroupID() string {
+	if s.SupportGroup == nil {
+		return ""
+	}
+	return s.SupportGroup.ID
 }
 
 type searchITServicesResponse struct {
@@ -50,8 +66,8 @@ const (
 	servicesSearchMaxPages = 20
 )
 
-// SearchServiceID returns a CMDB service UUID by case-insensitive Name match; zero matches returns ("", nil), not an error.
-func (c *Client) SearchServiceID(ctx context.Context, label string) (string, error) {
+// SearchService returns the CMDB service whose Name matches label case-insensitively; zero matches returns found=false, not an error.
+func (c *Client) SearchService(ctx context.Context, label string) (svc ITService, found bool, err error) {
 	offset := 0
 	for page := 0; page < servicesSearchMaxPages; page++ {
 		req := searchITServicesRequest{
@@ -60,29 +76,37 @@ func (c *Client) SearchServiceID(ctx context.Context, label string) (string, err
 		}
 		body, err := json.Marshal(req)
 		if err != nil {
-			return "", fmt.Errorf("csm: marshal SearchITServicesRequest: %w", err)
+			return ITService{}, false, fmt.Errorf("csm: marshal SearchITServicesRequest: %w", err)
 		}
 
 		respBody, err := c.do(ctx, http.MethodPost, "/services/search", body)
 		if err != nil {
-			return "", err
+			return ITService{}, false, err
 		}
 
 		var resp searchITServicesResponse
 		if err := json.Unmarshal(respBody, &resp); err != nil {
-			return "", fmt.Errorf("csm: decode SearchITServices response: %w", err)
+			return ITService{}, false, fmt.Errorf("csm: decode SearchITServices response: %w", err)
 		}
 
-		for _, svc := range resp.Services {
-			if svc.ID != "" && strings.EqualFold(svc.Name, label) {
-				return svc.ID, nil
-			}
+		if svc, ok := matchService(resp.Services, label); ok {
+			return svc, true, nil
 		}
 
 		offset += len(resp.Services)
 		if offset >= resp.Total {
-			return "", nil
+			return ITService{}, false, nil
 		}
 	}
-	return "", nil
+	return ITService{}, false, nil
+}
+
+// matchService picks the hit whose Name equals label ignoring case; the search itself is a substring match.
+func matchService(services []ITService, label string) (ITService, bool) {
+	for _, svc := range services {
+		if svc.ID != "" && strings.EqualFold(svc.Name, label) {
+			return svc, true
+		}
+	}
+	return ITService{}, false
 }
